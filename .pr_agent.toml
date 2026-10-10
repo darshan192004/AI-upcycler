@@ -1,0 +1,13 @@
+[config]
+model = "google/gemini-1.5-flash"
+fallback_models = ["google/gemini-1.5-pro"]
+git_provider = "github"
+
+[pr_reviewer]
+require_score_review = false
+require_tests_review = false
+require_estimate_effort_to_review = true
+inline_annotations = true
+
+[pr_description]
+publish_labels = true
