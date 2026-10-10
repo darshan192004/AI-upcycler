@@ -12,9 +12,31 @@
 
 ---
 
-## 2. Language-Specific Guidelines
+## 2. Git Branching & Pull Request (PR) Policy
 
-### 2.1 Rust (Master Orchestrator Core)
+> [!CAUTION]
+> **DIRECT PUSHES TO THE `main` BRANCH ARE STRICTLY FORBIDDEN.**
+> All code changes, bug fixes, and feature additions MUST follow the PR workflow below.
+
+### 2.1 Branch Naming Conventions
+- Features: `feature/<short-description>` (e.g. `feature/mmap-eviction-engine`)
+- Bug Fixes: `fix/<short-description>` (e.g. `fix/android-rpc-port-conflict`)
+- Documentation: `docs/<short-description>` (e.g. `docs/update-api-schemas`)
+- CI/CD: `ci/<short-description>` (e.g. `ci/add-pr-agent-bot`)
+
+### 2.2 Pull Request Lifecycle & AI Review Bot
+1. **Create Branch**: Developers/Agents create a dedicated feature branch off `main`.
+2. **Push Branch & Open PR**: Push branch to GitHub and create a Pull Request against `main`.
+3. **Automated AI Review**: The automated **PR Agent** workflow (`.github/workflows/pr-agent.yml`) triggers on every PR event. The AI reviewer analyzes code diffs, security risks, performance impacts, and code style compliance.
+4. **Automated Dependabot Security**: Dependabot (`.github/dependabot.yml`) manages dependency vulnerability updates across Cargo, npm, Gradle, and GitHub Actions.
+5. **Review & Approval**: Address any AI PR agent recommendations. Once all status checks pass and code review is approved, merge the PR into `main`.
+6. **Automated Release Trigger**: Merging into `main` automatically triggers `.github/workflows/release.yml` to compile and publish new Windows `.exe` desktop installer binaries and Android `.apk` worker assets.
+
+---
+
+## 3. Language-Specific Guidelines
+
+### 3.1 Rust (Master Orchestrator Core)
 
 - **Style Guide**: Follow official `rustfmt` formatting (`cargo fmt`).
 - **Linter**: Zero warnings policy on `cargo clippy --all-targets -- -D warnings`.
@@ -35,7 +57,7 @@ pub enum SchedulerError {
 pub type Result<T> = std::result::Result<T, SchedulerError>;
 ```
 
-### 2.2 TypeScript & React (Desktop GUI)
+### 3.2 TypeScript & React (Desktop GUI)
 
 - **Style Guide**: ESLint with `prettier` configuration.
 - **Component Pattern**: Use functional components with explicit TypeScript interfaces for props.
@@ -77,7 +99,7 @@ export const NodeCard: React.FC<NodeCardProps> = ({
 };
 ```
 
-### 2.3 C++20 (Embedded `llama.cpp` RPC Engine)
+### 3.3 C++20 (Embedded `llama.cpp` RPC Engine)
 
 - **Standard**: C++20 standard (`-std=c++20`).
 - **Formatting**: `clang-format` using Google or LLVM style.
@@ -85,11 +107,11 @@ export const NodeCard: React.FC<NodeCardProps> = ({
 
 ---
 
-## 3. Git Commit Message Conventions
+## 4. Git Commit Message Conventions
 
 Commit messages must follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
 
 - `feat(scheduler)`: Add bandwidth-aware layer dynamic programming allocator
 - `fix(mmap)`: Fix page eviction bug on Windows file handles
 - `docs(api)`: Update REST API OpenAPI specification
-- `ci(github)`: Add GitHub Actions Windows `.exe` build workflow
+- `ci(github)`: Add PR Agent and Dependabot workflows

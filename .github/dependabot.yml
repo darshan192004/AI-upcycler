@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Maintain Cargo (Rust) dependencies for Host Orchestrator Core
+  - package-ecosystem: "cargo"
+    directory: "/src-tauri"
+    schedule:
+      interval: "weekly"
+
+  # Maintain npm/pnpm dependencies for Desktop GUI
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Maintain Gradle dependencies for Android Worker Agent
+  - package-ecosystem: "gradle"
+    directory: "/mobile-worker/android"
+    schedule:
+      interval: "weekly"
