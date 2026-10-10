@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package aiupcycler.rpc;
+
+service WorkerService {
+  rpc Handshake (HandshakeRequest) returns (HandshakeResponse);
+  rpc LoadLayers (LoadLayersRequest) returns (LoadLayersResponse);
+  rpc ExecuteForward (ExecuteForwardRequest) returns (ExecuteForwardResponse);
+  rpc UnloadLayers (UnloadLayersRequest) returns (UnloadLayersResponse);
+  rpc GetHealthStatus (HealthRequest) returns (HealthResponse);
+}
+
+message HandshakeRequest {
+  string master_id = 1;
+  string protocol_version = 2;
+  int64 timestamp = 3;
+}
+
+message HandshakeResponse {
+  string worker_id = 1;
+  string device_name = 2;
+  int64 total_ram_bytes = 3;
+  int64 free_ram_bytes = 4;
+  int32 cpu_cores = 5;
+  bool has_npu_acceleration = 6;
+}
+
+message LoadLayersRequest {
+  string model_id = 1;
+  int32 start_layer = 2;
+  int32 end_layer = 3;
+  bytes weights_chunk_data = 4;
+}
+
+message LoadLayersResponse {
+  bool success = 1;
+  string error_message = 2;
+  int64 allocated_ram_bytes = 3;
+}
+
+message TensorBuffer {
+  repeated int64 shape = 1;
+  enum DataType {
+    FP32 = 0;
+    FP16 = 1;
+    BF16 = 2;
+  }
+  DataType data_type = 2;
+  bytes raw_data = 3;
+}
+
+message ExecuteForwardRequest {
+  string session_id = 1;
+  int32 start_layer = 2;
+  int32 end_layer = 3;
+  TensorBuffer activation_tensor = 4;
+  int32 sequence_position = 5;
+}
+
+message ExecuteForwardResponse {
+  bool success = 1;
+  TensorBuffer output_activation_tensor = 2;
+  int64 execution_time_us = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  float battery_percentage = 1;
+  float cpu_temp_celsius = 2;
+  int64 free_ram_bytes = 3;
+}
