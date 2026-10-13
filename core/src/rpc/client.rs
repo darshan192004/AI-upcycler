@@ -4,7 +4,7 @@ use crate::rpc::proto::aiupcycler::rpc::{
     HandshakeResponse, HealthRequest, HealthResponse, TensorBuffer,
 };
 use crate::scheduler::planner::LayerAssignment;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 /// Identity this master node presents during a worker handshake.
@@ -12,6 +12,12 @@ pub const MASTER_ID: &str = "ai-upcycler-master";
 
 /// Wire protocol version spoken by this build.
 pub const PROTOCOL_VERSION: &str = "1.0";
+
+/// Maximum time to establish a TCP/gRPC connection to a worker.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time for a single RPC call once connected.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// gRPC client for a single AI Upcycler worker node.
 ///
@@ -34,7 +40,7 @@ pub fn build_execute_request(
         end_layer: assignment.end_layer as i32,
         activation_tensor: Some(TensorBuffer {
             shape: payload.shape.clone(),
-            data_type: 0, // TensorBuffer.DataType.FP32
+            data_type: payload.data_type.proto_value(),
             raw_data: payload.data_bytes.clone(),
         }),
         sequence_position: payload.sequence_index as i32,
@@ -45,7 +51,9 @@ impl WorkerRpcClient {
     /// Connects to a worker at `http://<host>:<port>`.
     pub async fn connect(addr: &str) -> Result<Self, String> {
         let endpoint = tonic::transport::Endpoint::new(addr.to_string())
-            .map_err(|e| format!("invalid RPC endpoint '{addr}': {e}"))?;
+            .map_err(|e| format!("invalid RPC endpoint '{addr}': {e}"))?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
         let inner = WorkerServiceClient::connect(endpoint)
             .await
             .map_err(|e| format!("failed to connect to worker at '{addr}': {e}"))?;
@@ -123,7 +131,7 @@ fn unix_timestamp_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::engine::TensorPayload;
+    use crate::rpc::engine::{ActivationType, TensorPayload};
     use crate::scheduler::planner::LayerAssignment;
 
     fn sample_assignment() -> LayerAssignment {
@@ -145,6 +153,7 @@ mod tests {
             sequence_index: 3,
             shape: vec![1, 4, 4096],
             data_bytes: vec![0u8, 1, 2, 3, 4, 5, 6, 7],
+            data_type: ActivationType::Fp32,
         }
     }
 
@@ -161,6 +170,16 @@ mod tests {
         assert_eq!(tensor.shape, vec![1, 4, 4096]);
         assert_eq!(tensor.raw_data, vec![0u8, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(tensor.data_type, 0, "FP32");
+    }
+
+    #[test]
+    fn preserves_quantized_activation_data_type() {
+        let payload = TensorPayload {
+            data_type: ActivationType::Fp16,
+            ..sample_payload()
+        };
+        let req = build_execute_request(&sample_assignment(), &payload);
+        assert_eq!(req.activation_tensor.unwrap().data_type, 1, "FP16");
     }
 
     #[test]

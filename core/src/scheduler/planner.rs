@@ -64,9 +64,12 @@ impl LayerScheduler {
                 break;
             }
 
-            // Reserve 20% head-room for OS/KV cache safety buffer
-            let usable_ram = (node.free_ram_bytes as f64 * 0.8) as u64;
-            let max_layers_for_node = (usable_ram / model.bytes_per_layer) as usize;
+            // Reserve 20% head-room for OS/KV cache safety buffer, then set
+            // aside the activation/KV working set this node must hold while it
+            // owns a layer range. Only what remains can hold weight pages.
+            let usable_ram = node.free_ram_bytes * 4 / 5;
+            let weights_budget = usable_ram.saturating_sub(model.activation_bytes);
+            let max_layers_for_node = (weights_budget / model.bytes_per_layer) as usize;
 
             if max_layers_for_node > 0 {
                 let layers_to_assign =
@@ -134,7 +137,7 @@ mod tests {
             model_id: "llama-3b".into(),
             total_layers: 28,
             bytes_per_layer: 1024 * 1024 * 128,
-            activation_bytes: 1024 * 1024,
+            activation_bytes: 0,
             quantization: "int4".into(),
         };
         // usable = 80% of free ram -> node1 fits 11 layers, node2 fits 17
@@ -191,6 +194,24 @@ mod tests {
 
         assert_eq!(plan.total_layers_assigned, 6);
         assert_eq!(plan.expected_tokens_per_second, 0.0);
+    }
+
+    #[test]
+    fn activation_working_set_reduces_layer_capacity() {
+        // ~858 MB usable: 3 layers of 256 MiB fit on weights alone, but a
+        // 300 MiB activation budget leaves room for only 2.
+        let model = ModelSpec {
+            model_id: "kv-heavy".into(),
+            total_layers: 10,
+            bytes_per_layer: 256 * 1024 * 1024,
+            activation_bytes: 300 * 1024 * 1024,
+            quantization: "fp16".into(),
+        };
+        let nodes = vec![node("n1", 1024 * 1024 * 1024)];
+
+        let plan = LayerScheduler::compute_plan(&model, &nodes);
+
+        assert_eq!(plan.total_layers_assigned, 2);
     }
 
     #[test]

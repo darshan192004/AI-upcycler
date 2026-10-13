@@ -3,12 +3,34 @@ use crate::scheduler::planner::LayerAssignment;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationType {
+    #[default]
+    Fp32,
+    Fp16,
+    Bf16,
+}
+
+impl ActivationType {
+    /// Numeric value matching `aiupcycler.rpc.TensorBuffer.DataType`.
+    pub fn proto_value(self) -> i32 {
+        match self {
+            ActivationType::Fp32 => 0,
+            ActivationType::Fp16 => 1,
+            ActivationType::Bf16 => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TensorPayload {
     pub session_id: String,
     pub sequence_index: usize,
     pub shape: Vec<i64>,
     pub data_bytes: Vec<u8>,
+    #[serde(default)]
+    pub data_type: ActivationType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

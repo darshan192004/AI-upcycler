@@ -16,3 +16,8 @@
 model = "gemini/gemini-3.8-flash"
 fallback_models = ["groq/openai/gpt-oss-120b", "openrouter/free"]
 custom_model_max_tokens = 20000
+
+# Generated lockfiles add thousands of unreviewable lines to the diff and push
+# reviews into partial mode; keep them out of the review surface.
+[ignore]
+glob = ["Cargo.lock", "**/Cargo.lock"]

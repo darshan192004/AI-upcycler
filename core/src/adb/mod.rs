@@ -93,6 +93,25 @@ impl AdbTunnelManager {
         }
     }
 
+    /// Tears down a previously established port forward.
+    pub fn remove_forward(&self, serial: &str, local_port: u16) -> Result<(), String> {
+        let local = format!("tcp:{local_port}");
+        let output = Command::new("adb")
+            .args(["-s", serial, "forward", "--remove", &local])
+            .output()
+            .map_err(|e| format!("failed to run 'adb forward --remove' for {serial}: {e}"))?;
+
+        if output.status.success() {
+            info!("ADB: removed forward for {serial} on 127.0.0.1:{local_port}");
+            Ok(())
+        } else {
+            Err(format!(
+                "'adb forward --remove' failed for {serial}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
     /// Sets up a port forward for every authorized USB device, giving each
     /// device a distinct loopback port so multiple phones can be bridged at
     /// once. Returns the devices that now have a tunnel alongside their local
@@ -140,6 +159,7 @@ impl AdbTunnelManager {
         }
 
         let mut registered = 0;
+        let manager = Self::new();
         for (device, local_port) in devices {
             match probe_device(local_port).await {
                 Some(handshake) => {
@@ -147,10 +167,15 @@ impl AdbTunnelManager {
                         .register_or_update(node_from_handshake(&device, local_port, handshake));
                     registered += 1;
                 }
-                None => warn!(
-                    "ADB: no handshake from {}; leaving device unregistered",
-                    device.serial
-                ),
+                None => {
+                    warn!(
+                        "ADB: no handshake from {}; leaving device unregistered",
+                        device.serial
+                    );
+                    if let Err(e) = manager.remove_forward(&device.serial, local_port) {
+                        warn!("ADB: cleanup failed for {}: {e}", device.serial);
+                    }
+                }
             }
         }
 
