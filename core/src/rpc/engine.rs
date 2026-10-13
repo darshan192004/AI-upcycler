@@ -1,3 +1,4 @@
+use crate::rpc::client::WorkerRpcClient;
 use crate::scheduler::planner::LayerAssignment;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -18,6 +19,12 @@ pub struct ExecutionResult {
     pub output_bytes: Vec<u8>,
 }
 
+/// Orchestrates pipelined forward steps against the pooled worker cluster.
+///
+/// Each assignment names the device that owns a contiguous layer range; the
+/// engine opens a gRPC connection to that device and dispatches the forward
+/// pass over the wire. Worker endpoints are addressed as `http://<ip>:<port>`
+/// with the port either discovered via mDNS or bridged with ADB.
 pub struct RpcPipelineEngine;
 
 impl RpcPipelineEngine {
@@ -25,23 +32,18 @@ impl RpcPipelineEngine {
         assignment: &LayerAssignment,
         payload: TensorPayload,
     ) -> Result<ExecutionResult, String> {
+        let endpoint = format!("http://{}:{}", assignment.ip_address, assignment.port);
         info!(
-            "RPC Engine: Dispatching sequence {} (layers {}->{}) to node [{}] ({})",
+            "RPC Engine: dispatching sequence {} (layers {}->{}) to node [{}] ({}) via {}",
             payload.sequence_index,
             assignment.start_layer,
             assignment.end_layer,
             assignment.device_name,
-            assignment.node_id
+            assignment.node_id,
+            endpoint
         );
 
-        // Simulated zero-copy RPC forward execution timing
-        let exec_time = 12_500 + (assignment.end_layer - assignment.start_layer + 1) as u64 * 850;
-
-        Ok(ExecutionResult {
-            session_id: payload.session_id,
-            sequence_index: payload.sequence_index,
-            execution_time_us: exec_time,
-            output_bytes: payload.data_bytes,
-        })
+        let mut client = WorkerRpcClient::connect(&endpoint).await?;
+        client.execute_forward(assignment, &payload).await
     }
 }
