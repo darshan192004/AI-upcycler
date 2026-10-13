@@ -32,11 +32,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # litellm reads GEMINI_API_KEY natively for the "gemini/" provider
-          # prefix. GOOGLE_AI_STUDIO.GEMINI_API_KEY is PR-Agent's documented
-          # alias; both are provided so the primary model authenticates however
-          # the action maps provider env vars.
+          # prefix. Kept as the single source of truth for the primary model;
+          # provider aliases that embed dots are not valid POSIX environment
+          # variable names and are not read by litellm.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Fallback providers for the .pr_agent.toml fallback_models chain.
           # Read directly by litellm when the primary Gemini model is
           # quota-blocked. Missing secrets degrade to a failed review, same

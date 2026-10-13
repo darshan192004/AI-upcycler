@@ -98,6 +98,13 @@ impl WorkerRpcClient {
             .map_err(|e| format!("execute_forward failed: {e}"))?
             .into_inner();
 
+        if !response.success {
+            return Err(format!(
+                "worker rejected forward step for session {} (layers {}..={})",
+                payload.session_id, assignment.start_layer, assignment.end_layer
+            ));
+        }
+
         Ok(ExecutionResult {
             session_id: payload.session_id.clone(),
             sequence_index: payload.sequence_index,
