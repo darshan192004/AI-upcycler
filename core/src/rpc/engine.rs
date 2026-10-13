@@ -1,4 +1,4 @@
-use crate::rpc::client::WorkerRpcClient;
+use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
 use crate::scheduler::planner::LayerAssignment;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -44,6 +44,7 @@ impl RpcPipelineEngine {
         );
 
         let mut client = WorkerRpcClient::connect(&endpoint).await?;
+        client.handshake(MASTER_ID, PROTOCOL_VERSION).await?;
         client.execute_forward(assignment, &payload).await
     }
 }

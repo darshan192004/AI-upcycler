@@ -1,6 +1,6 @@
 use crate::discovery::mdns::DiscoveredNode;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
@@ -42,6 +42,19 @@ impl LayerScheduler {
             model.total_layers,
             model.bytes_per_layer / (1024 * 1024)
         );
+
+        if model.bytes_per_layer == 0 {
+            warn!(
+                "LayerScheduler: model {} declares 0 bytes/layer; cannot partition",
+                model.model_id
+            );
+            return PartitioningPlan {
+                model_id: model.model_id.clone(),
+                assignments: Vec::new(),
+                expected_tokens_per_second: 0.0,
+                total_layers_assigned: 0,
+            };
+        }
 
         let mut assignments = Vec::new();
         let mut current_layer = 0;
@@ -177,6 +190,24 @@ mod tests {
         let plan = LayerScheduler::compute_plan(&model, &nodes);
 
         assert_eq!(plan.total_layers_assigned, 6);
+        assert_eq!(plan.expected_tokens_per_second, 0.0);
+    }
+
+    #[test]
+    fn zero_bytes_per_layer_yields_empty_plan_without_panicking() {
+        let model = ModelSpec {
+            model_id: "malformed".into(),
+            total_layers: 10,
+            bytes_per_layer: 0,
+            activation_bytes: 1024,
+            quantization: "fp32".into(),
+        };
+        let nodes = vec![node("n1", 1024 * 1024 * 1024)];
+
+        let plan = LayerScheduler::compute_plan(&model, &nodes);
+
+        assert_eq!(plan.total_layers_assigned, 0);
+        assert!(plan.assignments.is_empty());
         assert_eq!(plan.expected_tokens_per_second, 0.0);
     }
 }
