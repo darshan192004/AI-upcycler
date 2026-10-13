@@ -1,13 +1,23 @@
+# PR-Agent configuration.
+# Docs: https://docs.pr-agent.ai/usage-guide/configuration_options/
+#
+# Read from the repository root on every run. Secrets never live here: the
+# provider keys are injected as env vars in .github/workflows/pr-agent.yml.
+#
+# Model chain: Gemini is primary; on quota exhaustion or provider failure
+# PR-Agent falls back through the list in order. Groq's gpt-oss-120b answers
+# fast on the developer tier, so it is tried first; OpenRouter's "free"
+# router (free-tier models only) is the slow last resort.
+# custom_model_max_tokens caps the output budget: without it, reasoning
+# models on the chain burn the whole budget on thinking and return empty
+# content with finish_reason "length".
+
 [config]
-model = "google/gemini-1.5-flash"
-fallback_models = ["google/gemini-1.5-pro"]
-git_provider = "github"
+model = "gemini/gemini-3.8-flash"
+fallback_models = ["groq/openai/gpt-oss-120b", "openrouter/free"]
+custom_model_max_tokens = 20000
 
-[pr_reviewer]
-require_score_review = false
-require_tests_review = false
-require_estimate_effort_to_review = true
-inline_annotations = true
-
-[pr_description]
-publish_labels = true
+# Generated lockfiles add thousands of unreviewable lines to the diff and push
+# reviews into partial mode; keep them out of the review surface.
+[ignore]
+glob = ["Cargo.lock", "**/Cargo.lock"]

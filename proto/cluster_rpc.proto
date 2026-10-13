@@ -38,6 +38,16 @@ message LoadLayersResponse {
   int64 allocated_ram_bytes = 3;
 }
 
+message UnloadLayersRequest {
+  string model_id = 1;
+}
+
+message UnloadLayersResponse {
+  bool success = 1;
+  string error_message = 2;
+  int64 freed_ram_bytes = 3;
+}
+
 message TensorBuffer {
   repeated int64 shape = 1;
   enum DataType {

@@ -1,0 +1,21 @@
+# Build outputs
+target/
+**/target/
+dist/
+node_modules/
+
+# Env / local config
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/

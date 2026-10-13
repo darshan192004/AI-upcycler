@@ -9,6 +9,13 @@ on:
 jobs:
   pr_agent_job:
     name: AI PR review
+    # Bot senders are excluded so the github-actions bot cannot review its own
+    # comments. issue_comment is restricted to comments on pull requests.
+    # Fork PRs are excluded because GitHub withholds repository secrets from
+    # pull_request workflows triggered by forks, so GEMINI_API_KEY would be
+    # absent and the run would fail noisily instead of skipping. Drafts are
+    # excluded so tokens are not spent on work-in-progress PRs; ready_for_review
+    # covers them once undrafted.
     if: github.event.sender.type != 'Bot' && ((github.event_name == 'issue_comment' && github.event.issue.pull_request) || (github.event_name == 'pull_request' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-latest
     permissions:
@@ -16,11 +23,22 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      # Pinned to a release rather than @main. PR-Agent reads .pr_agent.toml
+      # from the repository root through the GitHub API, so no checkout step is
+      # needed and none is present — see the official GitHub integration docs.
       - name: PR Agent action step
         id: pragent
         uses: the-pr-agent/pr-agent@v0.47.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOOGLE_AI_STUDIO_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENAI_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CONFIG__MODEL: "google/gemini-1.5-flash"
+          # litellm reads GEMINI_API_KEY natively for the "gemini/" provider
+          # prefix. Kept as the single source of truth for the primary model;
+          # provider aliases that embed dots are not valid POSIX environment
+          # variable names and are not read by litellm.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Fallback providers for the .pr_agent.toml fallback_models chain.
+          # Read directly by litellm when the primary Gemini model is
+          # quota-blocked. Missing secrets degrade to a failed review, same
+          # as the pre-fallback behaviour, never a broken workflow.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

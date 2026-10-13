@@ -3,7 +3,7 @@
 ## 1. Project Initialization & Documentation Setup
 - [x] Create core architectural documents in `/docs/` directory (`prd.md`, `architecture.md`, `spec.md`, `api.md`, `memory.md`, `design.md`, `security.md`, `database.md`, `code_style.md`, `plan.md`, `tasks.md`).
 - [x] Create project root `README.md` with overview, download badge placeholders, and architecture diagrams.
-- [ ] Setup repository `.gitignore` for Rust, Node, Tauri, and Android build artifacts.
+- [x] Setup repository `.gitignore` for Rust, Node, Tauri, and Android build artifacts.
 
 ## 2. CI/CD Automated Build Workflows
 - [ ] Create `.github/workflows/ci.yml` for pull request linting and cargo test runs.
@@ -11,11 +11,11 @@
 
 ## 3. Master Orchestrator Engine (Rust + Tauri)
 - [ ] Initialize Tauri 2.0 Rust app in `src-tauri/`.
-- [ ] Implement mDNS Service Browser (`mdns-sd` crate) to discover mobile workers.
-- [ ] Implement ADB USB Tunnel Manager to trigger `adb forward tcp:50052 tcp:50052`.
-- [ ] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
+- [x] Implement mDNS Service Browser (`mdns-sd` crate) to discover mobile workers.
+- [x] Implement ADB USB Tunnel Manager to trigger `adb forward tcp:50052 tcp:50052`.
+- [x] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
 - [ ] Implement SSD `mmap` zero-copy weight pager for Windows/Linux file mapping.
-- [ ] Implement greedy dynamic programming layer scheduler.
+- [x] Implement greedy dynamic programming layer scheduler.
 
 ## 4. Master Desktop UI (React + Tailwind CSS)
 - [ ] Initialize React + TypeScript app in `src/`.
