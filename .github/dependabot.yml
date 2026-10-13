@@ -11,9 +11,24 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Pinned deliberately; the next 0.x release is a breaking API change
+      # (tonic/prost/tonic-build move in lockstep).
+      - dependency-name: "tonic"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "tonic-build"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "prost"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "mdns-sd"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   # Maintain npm/pnpm dependencies for Desktop GUI
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Tailwind v4 is a breaking major rewrite; the app targets v3.
+      - dependency-name: "tailwindcss"
+        update-types: ["version-update:semver-major"]
