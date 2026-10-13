@@ -6,7 +6,7 @@ authors = ["AI Upcycler Contributors"]
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 tauri = { version = "1.5", features = ["shell-open"] }
