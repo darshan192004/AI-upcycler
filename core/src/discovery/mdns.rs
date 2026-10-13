@@ -1,3 +1,4 @@
+use crate::telemetry::{NodeEventData, TelemetryBus, TelemetryEvent};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,34 +52,52 @@ impl DiscoveredNode {
 #[derive(Clone, Default)]
 pub struct NodeRegistry {
     nodes: Arc<Mutex<HashMap<String, DiscoveredNode>>>,
+    /// Optional telemetry fan-out; `None` keeps the registry headless (pure
+    /// state container). Attached via [`NodeRegistry::with_events`].
+    events: Option<TelemetryBus>,
 }
 
 impl NodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
+            events: None,
+        }
+    }
+
+    /// Creates a registry that publishes connect/disconnect events onto `bus`.
+    pub fn with_events(bus: TelemetryBus) -> Self {
+        Self {
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            events: Some(bus),
         }
     }
 
     pub fn register_or_update(&self, node: DiscoveredNode) {
-        let mut map = self.nodes.lock().unwrap();
-        info!(
-            "mDNS Discovery: Registered node [{}] at {}:{}",
-            node.device_name, node.ip_address, node.port
-        );
-        map.insert(node.node_id.clone(), node);
+        {
+            let mut map = self.nodes.lock().unwrap();
+            info!(
+                "mDNS Discovery: Registered node [{}] at {}:{}",
+                node.device_name, node.ip_address, node.port
+            );
+            map.insert(node.node_id.clone(), node.clone());
+        }
+        self.publish_node_event(&node, true);
     }
 
     /// Removes a node that has left the cluster (e.g. an mDNS `ServiceRemoved`
     /// event). Returns the removed entry if it was known.
     pub fn remove(&self, node_id: &str) -> Option<DiscoveredNode> {
-        let mut map = self.nodes.lock().unwrap();
-        let removed = map.remove(node_id);
+        let removed = {
+            let mut map = self.nodes.lock().unwrap();
+            map.remove(node_id)
+        };
         if let Some(node) = &removed {
             warn!(
                 "mDNS Discovery: node [{}] at {}:{} left the cluster",
                 node.device_name, node.ip_address, node.port
             );
+            self.publish_node_event(node, false);
         }
         removed
     }
@@ -91,6 +110,25 @@ impl NodeRegistry {
     pub fn get_node(&self, node_id: &str) -> Option<DiscoveredNode> {
         let map = self.nodes.lock().unwrap();
         map.get(node_id).cloned()
+    }
+
+    fn publish_node_event(&self, node: &DiscoveredNode, connected: bool) {
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let data = NodeEventData {
+            node_id: node.node_id.clone(),
+            device_name: node.device_name.clone(),
+            connection_type: node.connection_type.clone(),
+            total_ram_bytes: node.total_ram_bytes,
+            free_ram_bytes: node.free_ram_bytes,
+        };
+        let event = if connected {
+            TelemetryEvent::node_connected(data)
+        } else {
+            TelemetryEvent::node_disconnected(data)
+        };
+        bus.publish(event);
     }
 }
 
@@ -238,5 +276,36 @@ mod tests {
             registry.remove(&node_id).is_none(),
             "second remove is a no-op"
         );
+    }
+
+    #[test]
+    fn publishes_connect_and_disconnect_telemetry() {
+        let bus = crate::telemetry::TelemetryBus::new(8);
+        let mut rx = bus.subscribe();
+        let registry = NodeRegistry::with_events(bus);
+
+        let node = DiscoveredNode::from_service_info(&sample_service_info()).expect("node built");
+        let node_id = node.node_id.clone();
+
+        registry.register_or_update(node);
+        assert!(matches!(
+            rx.try_recv().expect("connect event"),
+            crate::telemetry::TelemetryEvent::NodeConnected { .. }
+        ));
+
+        registry.remove(&node_id);
+        assert!(matches!(
+            rx.try_recv().expect("disconnect event"),
+            crate::telemetry::TelemetryEvent::NodeDisconnected { .. }
+        ));
+    }
+
+    #[test]
+    fn registry_without_events_publishes_nothing() {
+        let registry = NodeRegistry::new();
+        let node = DiscoveredNode::from_service_info(&sample_service_info()).expect("node built");
+        let node_id = node.node_id.clone();
+        registry.register_or_update(node);
+        registry.remove(&node_id);
     }
 }
