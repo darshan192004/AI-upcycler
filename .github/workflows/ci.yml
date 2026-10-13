@@ -33,6 +33,44 @@ jobs:
       - name: Run tests
         run: cargo test -p ai-upcycler-core
 
+  desktop:
+    name: Desktop shell (Tauri v2, Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Tauri v2 links against webkit2gtk-4.1 (libsoup3) on Linux.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Lint desktop shell (clippy, deny warnings)
+        run: cargo clippy -p ai-upcycler-desktop --all-targets -- -D warnings
+
   frontend:
     name: Frontend (typecheck + build)
     runs-on: ubuntu-latest

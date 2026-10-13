@@ -11,7 +11,7 @@
 - [ ] Package and publish the Android `.apk` worker asset (blocked on the Android worker agent in section 5).
 
 ## 3. Master Orchestrator Engine (Rust + Tauri)
-- [ ] Initialize Tauri 2.0 Rust app in `src-tauri/`.
+- [x] Initialize Tauri 2.0 Rust app in `src-tauri/` (config v2 schema, capability-based permissions).
 - [x] Implement mDNS Service Browser (`mdns-sd` crate) to discover mobile workers.
 - [x] Implement ADB USB Tunnel Manager to trigger `adb forward tcp:50052 tcp:50052`.
 - [x] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
@@ -39,5 +39,8 @@
 
 ## 7. Known Gaps (Deferred)
 - [ ] **mTLS 1.3 + QR/PIN pairing (`docs/security.md`) is not implemented.** Inter-node RPC is currently plaintext local transport. Deferred to a later hardware phase; tracked here so the gap is explicit rather than implicit.
-- [ ] Tauri desktop shell is being upgraded to v2 (config, capabilities, plugin-based permissions).
-- [ ] Local full desktop builds require `webkit2gtk-4.1` (Tauri v2); `ai-upcycler-core` is the locally verifiable unit.
+- [ ] Tauri desktop shell is on v2; remaining plugins/permissions beyond `core:default` will be added as features land.
+- [ ] Full desktop builds need the Tauri v2 Linux stack (`webkit2gtk-4.1`, `libsoup-3.0`); `ai-upcycler-core` remains the fastest locally verifiable unit, while CI's `desktop` job lints the shell.
+- [ ] mDNS discovery is best-effort: a failed browser spawn is logged and the app continues without discovery. Surface this to the UI once the cluster view is wired.
+- [ ] The ADB tunnel background task has no graceful shutdown; add a shutdown signal so `adb forward` state is torn down cleanly on exit.
+- [ ] `shell.open` is intentionally not granted (unused); add a scoped `shell:allow-open` permission if external-link opening is introduced.

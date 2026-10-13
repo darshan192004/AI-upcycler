@@ -4,6 +4,9 @@ target/
 dist/
 node_modules/
 
+# Tauri v2 generated capability/permission schemas
+src-tauri/gen/
+
 # Tooling
 .playwright-mcp/
 
