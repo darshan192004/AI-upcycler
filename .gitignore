@@ -4,6 +4,9 @@ target/
 dist/
 node_modules/
 
+# Tooling
+.playwright-mcp/
+
 # Env / local config
 .env
 .env.*
