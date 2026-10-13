@@ -98,3 +98,34 @@ jobs:
 ### 4.2 Hardware Benchmark & Network Simulation Tests
 - **Latency Emulation**: Test RPC throughput under simulated Wi-Fi packet drops ($5\%$ loss) and latency spikes ($50\text{ ms}$).
 - **Thermal Load Test**: Measure mobile worker temperature over a 1000-token continuous generation run.
+
+---
+
+## 5. Progress Status
+
+Legend: ✅ done · 🟡 partial · ⬜ not started
+
+| Phase | Item | Status |
+|-------|------|--------|
+| 1 | Tauri 2.0 shell + pure-Rust `ai-upcycler-core` workspace | ✅ |
+| 1 | Protobuf RPC client (`cluster_rpc.proto`) | ✅ |
+| 1 | Native `llama.cpp` RPC worker bindings (host) | ⬜ |
+| 2 | mDNS / DNS-SD discovery (`_aiupcycler-worker._tcp.local.`) | ✅ |
+| 2 | ADB USB port-forward bridge | ✅ |
+| 2 | Android Kotlin worker app (+ `.apk` packaging) | ⬜ |
+| 3 | OpenAI-compatible REST API (`/v1/models`, `/v1/chat/completions` + SSE) | ✅ |
+| 3 | Cluster topology + benchmark endpoints | ✅ |
+| 3 | Telemetry WebSocket fan-out (`/api/telemetry`) | ✅ |
+| 3 | Embedded SQLite store (nodes, models, benchmarks, chat) | ✅ |
+| 3 | React dashboard wired to live data (telemetry canvas) | ⬜ |
+| 3 | Streaming chat UI + GGUF / Hugging Face downloader | ⬜ |
+| 4 | Dynamic-programming layer scheduler (+ 20% host RAM headroom) | ✅ |
+| 4 | SSD `mmap` zero-copy weight pager | ⬜ |
+| 5 | CI (fmt/clippy/test, desktop shell, frontend) | ✅ |
+| 5 | Release workflow (Windows/macOS/Linux installers on tag) | ✅ |
+| 5 | Android `.apk` release asset | ⬜ |
+
+**Completed: 11 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md); deliberately deferred work (mTLS/pairing, `mmap`, real inference/benchmark engines, Android/iOS agents) is listed under *Known Gaps* there.
+
+> Stubbed-but-wired: the chat path runs an end-to-end streaming/persistence/telemetry pipeline against a placeholder `StubBackend`, and `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker`. Both sit behind traits (`GenerationBackend`, `HardwareBenchmarker`) so the real engines drop in without API changes.
+
