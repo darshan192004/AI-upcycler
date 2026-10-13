@@ -49,6 +49,19 @@ fn main() {
         .map_err(|e| tracing::warn!("mDNS discovery unavailable: {e}"))
         .ok();
 
+    // Bridge USB-attached Android workers on a background thread.
+    let adb_registry = registry.clone();
+    std::thread::spawn(move || {
+        if !ai_upcycler_core::adb::AdbTunnelManager::is_available() {
+            tracing::warn!("ADB not found; USB device bridging disabled");
+            return;
+        }
+        match ai_upcycler_core::adb::AdbTunnelManager::new().forward_all(&adb_registry) {
+            Ok(count) => tracing::info!("ADB: bridged {count} USB device(s)"),
+            Err(e) => tracing::warn!("ADB forwarding failed: {e}"),
+        }
+    });
+
     tauri::Builder::default()
         .manage(registry)
         .invoke_handler(tauri::generate_handler![
