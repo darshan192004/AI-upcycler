@@ -17,6 +17,10 @@
 - [x] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
 - [ ] Implement SSD `mmap` zero-copy weight pager for Windows/Linux file mapping.
 - [x] Implement greedy dynamic programming layer scheduler.
+- [x] Implement embedded SQLite store (`rusqlite`) for nodes, models, benchmarks and chat history (`docs/database.md`).
+- [x] Implement OpenAI-compatible REST API (`axum`): `GET /v1/models` and `POST /v1/chat/completions` (buffered and SSE streaming).
+- [x] Implement cluster management endpoints: `GET /api/cluster/topology` and `POST /api/cluster/benchmark`.
+- [x] Implement telemetry WebSocket fan-out (`GET /api/telemetry`) over a tokio broadcast bus, wired to mDNS node events.
 
 ## 4. Master Desktop UI (React + Tailwind CSS)
 - [x] Initialize React + TypeScript app in `src/`.
@@ -44,3 +48,8 @@
 - [ ] mDNS discovery is best-effort: a failed browser spawn is logged and the app continues without discovery. Surface this to the UI once the cluster view is wired.
 - [ ] The ADB tunnel background task has no graceful shutdown; add a shutdown signal so `adb forward` state is torn down cleanly on exit.
 - [ ] `shell.open` is intentionally not granted (unused); add a scoped `shell:allow-open` permission if external-link opening is introduced.
+- [ ] The chat generation backend is a deterministic `StubBackend` (no inference engine loaded yet). Streaming, SQLite persistence and telemetry around it are real; swap in the real engine behind the `GenerationBackend` trait.
+- [ ] `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker` (values derived from the node id hash), not on-device probes. Do not schedule on these numbers yet.
+- [ ] The REST API binds to `127.0.0.1:8080` with permissive CORS for the local UI and has no authentication; acceptable under the local-only threat model, revisit if the bind address widens.
+- [ ] `storage_mmap` in the topology response reports `enabled: false` until the SSD mmap pager (section 3) lands.
+- [ ] Worker thermal/battery telemetry is emitted as `0.0` placeholders until the Android/iOS agents publish it (section 5).

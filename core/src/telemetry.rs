@@ -1,0 +1,165 @@
+//! Real-time telemetry fan-out.
+//!
+//! A single [`TelemetryBus`] (a `tokio` broadcast channel) carries cluster
+//! events to every connected WebSocket subscriber. The registry publishes
+//! node lifecycle events into it, and the API publishes per-generation metrics.
+
+use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+
+/// Buffered events retained for slow subscribers before they are dropped.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+
+/// Snapshot of a node used by connect/disconnect events.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeEventData {
+    pub node_id: String,
+    pub device_name: String,
+    pub connection_type: String,
+    pub total_ram_bytes: u64,
+    pub free_ram_bytes: u64,
+}
+
+/// Per-worker telemetry carried inside a [`GenerationMetrics`] event.
+///
+/// Thermal/battery values are placeholders (`0.0`) until the worker telemetry
+/// channel lands; see `docs/tasks.md`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerTelemetry {
+    pub id: String,
+    pub temp_celsius: f64,
+    pub battery_pct: f64,
+}
+
+/// Inference throughput/utilisation event emitted while tokens stream.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationMetrics {
+    pub tokens_per_second: f64,
+    pub current_token: u64,
+    pub master_ram_utilization_pct: f64,
+    pub worker_nodes: Vec<WorkerTelemetry>,
+}
+
+/// A telemetry message, serialised for the wire as
+/// `{"event": "...", "timestamp": <secs>, "data": { ... }}` (see `docs/api.md`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum TelemetryEvent {
+    NodeConnected {
+        timestamp: u64,
+        data: NodeEventData,
+    },
+    NodeDisconnected {
+        timestamp: u64,
+        data: NodeEventData,
+    },
+    GenerationMetrics {
+        timestamp: u64,
+        data: GenerationMetrics,
+    },
+}
+
+impl TelemetryEvent {
+    pub fn node_connected(data: NodeEventData) -> Self {
+        Self::NodeConnected {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn node_disconnected(data: NodeEventData) -> Self {
+        Self::NodeDisconnected {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn generation_metrics(data: GenerationMetrics) -> Self {
+        Self::GenerationMetrics {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+}
+
+/// Broadcast fan-out handle. Cheaply cloneable; cloning keeps the same channel.
+#[derive(Clone)]
+pub struct TelemetryBus {
+    sender: broadcast::Sender<TelemetryEvent>,
+}
+
+impl TelemetryBus {
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _receiver) = broadcast::channel(capacity);
+        Self { sender }
+    }
+
+    /// Publishes an event; returns the number of receivers that received it
+    /// (`0` when nobody is subscribed — never an error).
+    pub fn publish(&self, event: TelemetryEvent) -> usize {
+        self.sender.send(event).unwrap_or(0)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
+        self.sender.subscribe()
+    }
+
+    pub fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+}
+
+impl Default for TelemetryBus {
+    fn default() -> Self {
+        Self::new(DEFAULT_CHANNEL_CAPACITY)
+    }
+}
+
+pub fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> NodeEventData {
+        NodeEventData {
+            node_id: "n1".into(),
+            device_name: "Phone".into(),
+            connection_type: "usb_adb".into(),
+            total_ram_bytes: 1024,
+            free_ram_bytes: 512,
+        }
+    }
+
+    #[test]
+    fn serialises_with_event_tag_and_data() {
+        let event = TelemetryEvent::node_connected(sample());
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["event"], "node_connected");
+        assert_eq!(value["data"]["node_id"], "n1");
+        assert!(value["timestamp"].as_u64().is_some());
+    }
+
+    #[test]
+    fn broadcasts_to_subscribers() {
+        let bus = TelemetryBus::new(4);
+        let mut rx = bus.subscribe();
+        assert_eq!(bus.receiver_count(), 1);
+        assert_eq!(bus.publish(TelemetryEvent::node_connected(sample())), 1);
+
+        let received = rx.try_recv().expect("event delivered");
+        assert!(matches!(received, TelemetryEvent::NodeConnected { .. }));
+    }
+
+    #[test]
+    fn publish_without_subscribers_is_a_noop() {
+        let bus = TelemetryBus::default();
+        assert_eq!(bus.publish(TelemetryEvent::node_connected(sample())), 0);
+    }
+}
