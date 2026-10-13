@@ -7,6 +7,12 @@ use crate::scheduler::planner::LayerAssignment;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
+/// Identity this master node presents during a worker handshake.
+pub const MASTER_ID: &str = "ai-upcycler-master";
+
+/// Wire protocol version spoken by this build.
+pub const PROTOCOL_VERSION: &str = "1.0";
+
 /// gRPC client for a single AI Upcycler worker node.
 ///
 /// Talks over `tonic` to a worker exposing the `aiupcycler.rpc.WorkerService`

@@ -1,10 +1,14 @@
 //! ADB USB tunnel manager.
 //!
 //! Bridges Android worker devices into the master node's localhost namespace via
-//! `adb forward tcp:50052 tcp:50052` so the RPC client can talk to them as if
-//! they were loopback endpoints.
+//! `adb forward tcp:50052 tcp:50052`, then probes each tunneled worker over RPC
+//! so its real RAM/device metadata is known before scheduling. Workers reached
+//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50052`.
 
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
+use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
+use crate::rpc::engine::http_endpoint;
+use crate::rpc::proto::aiupcycler::rpc::HandshakeResponse;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,16 +70,20 @@ impl AdbTunnelManager {
         Ok(parse_devices(&String::from_utf8_lossy(&output.stdout)))
     }
 
-    /// Establishes the port forward for a single device serial.
-    pub fn forward(&self, serial: &str) -> Result<(), String> {
-        let spec = format!("tcp:{ADB_FORWARD_PORT}");
+    /// Establishes a port forward for a single device serial.
+    ///
+    /// `local_port` is the loopback port the master connects to; the worker's
+    /// own RPC port is always [`ADB_FORWARD_PORT`] on the device side.
+    pub fn forward(&self, serial: &str, local_port: u16) -> Result<(), String> {
+        let remote = format!("tcp:{ADB_FORWARD_PORT}");
+        let local = format!("tcp:{local_port}");
         let output = Command::new("adb")
-            .args(["-s", serial, "forward", &spec, &spec])
+            .args(["-s", serial, "forward", &local, &remote])
             .output()
             .map_err(|e| format!("failed to run 'adb forward' for {serial}: {e}"))?;
 
         if output.status.success() {
-            info!("ADB: forwarded {serial} -> 127.0.0.1:{ADB_FORWARD_PORT}");
+            info!("ADB: forwarded {serial} -> 127.0.0.1:{local_port}");
             Ok(())
         } else {
             Err(format!(
@@ -85,33 +93,98 @@ impl AdbTunnelManager {
         }
     }
 
-    /// Forwards every authorized USB device and registers each as a `USB_ADB`
-    /// node bound to `127.0.0.1:50052`. Returns the number of tunnels created.
-    pub fn forward_all(&self, registry: &Arc<NodeRegistry>) -> Result<usize, String> {
+    /// Sets up a port forward for every authorized USB device, giving each
+    /// device a distinct loopback port so multiple phones can be bridged at
+    /// once. Returns the devices that now have a tunnel alongside their local
+    /// port.
+    pub fn forward_all(&self) -> Result<Vec<(AdbDevice, u16)>, String> {
         let devices = Self::list_devices()?;
-        let mut established = 0;
+        let mut forwarded = Vec::new();
 
-        for device in devices.iter().filter(|d| d.state == "device") {
-            match self.forward(&device.serial) {
-                Ok(()) => {
-                    registry.register_or_update(DiscoveredNode {
-                        node_id: format!("adb:{}", device.serial),
-                        device_name: device.label(),
-                        ip_address: "127.0.0.1".to_string(),
-                        port: ADB_FORWARD_PORT,
-                        total_ram_bytes: 0,
-                        free_ram_bytes: 0,
-                        connection_type: "USB_ADB".to_string(),
-                        latency_ms: 0.0,
-                        last_seen_epoch_ms: now_epoch_ms(),
-                    });
-                    established += 1;
-                }
+        for (index, device) in devices
+            .into_iter()
+            .filter(|d| d.state == "device")
+            .enumerate()
+        {
+            let local_port = ADB_FORWARD_PORT + index as u16;
+            match self.forward(&device.serial, local_port) {
+                Ok(()) => forwarded.push((device, local_port)),
                 Err(e) => warn!("ADB: {e}"),
             }
         }
 
-        Ok(established)
+        Ok(forwarded)
+    }
+
+    /// One-shot USB bootstrap: forwards every authorized device, then probes
+    /// each tunneled worker over RPC so only nodes with known RAM capacity are
+    /// registered. Devices that fail to handshake are skipped rather than
+    /// registered with unknown capacity.
+    pub async fn start(registry: Arc<NodeRegistry>) {
+        if !Self::is_available() {
+            warn!("ADB: binary not found; USB device bridging disabled");
+            return;
+        }
+
+        let devices = match Self::new().forward_all() {
+            Ok(devices) => devices,
+            Err(e) => {
+                warn!("ADB: {e}");
+                return;
+            }
+        };
+
+        if devices.is_empty() {
+            info!("ADB: no authorized USB devices attached");
+            return;
+        }
+
+        let mut registered = 0;
+        for (device, local_port) in devices {
+            match probe_device(local_port).await {
+                Some(handshake) => {
+                    registry
+                        .register_or_update(node_from_handshake(&device, local_port, handshake));
+                    registered += 1;
+                }
+                None => warn!(
+                    "ADB: no handshake from {}; leaving device unregistered",
+                    device.serial
+                ),
+            }
+        }
+
+        info!("ADB: registered {registered} USB device(s)");
+    }
+}
+
+async fn probe_device(local_port: u16) -> Option<HandshakeResponse> {
+    let endpoint = http_endpoint("127.0.0.1", local_port);
+    let mut client = WorkerRpcClient::connect(&endpoint).await.ok()?;
+    client.handshake(MASTER_ID, PROTOCOL_VERSION).await.ok()
+}
+
+fn node_from_handshake(
+    device: &AdbDevice,
+    local_port: u16,
+    handshake: HandshakeResponse,
+) -> DiscoveredNode {
+    let device_name = if handshake.device_name.is_empty() {
+        device.label()
+    } else {
+        handshake.device_name
+    };
+
+    DiscoveredNode {
+        node_id: format!("adb:{}", device.serial),
+        device_name,
+        ip_address: "127.0.0.1".to_string(),
+        port: local_port,
+        total_ram_bytes: handshake.total_ram_bytes.max(0) as u64,
+        free_ram_bytes: handshake.free_ram_bytes.max(0) as u64,
+        connection_type: "USB_ADB".to_string(),
+        latency_ms: 0.0,
+        last_seen_epoch_ms: now_epoch_ms(),
     }
 }
 
@@ -175,5 +248,59 @@ mod tests {
     #[test]
     fn forward_port_matches_worker_rpc_port() {
         assert_eq!(ADB_FORWARD_PORT, 50052);
+    }
+
+    fn device(serial: &str, model: &str) -> AdbDevice {
+        AdbDevice {
+            serial: serial.to_string(),
+            state: "device".to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn node_from_handshake_uses_worker_reported_capacity() {
+        let handshake = HandshakeResponse {
+            worker_id: "w1".to_string(),
+            device_name: "Pixel 8".to_string(),
+            total_ram_bytes: 8_589_934_592,
+            free_ram_bytes: 4_294_967_296,
+            cpu_cores: 8,
+            has_npu_acceleration: true,
+        };
+
+        let node = node_from_handshake(&device("R3CN30ABCDE", "SM_G986B"), 50052, handshake);
+
+        assert_eq!(node.node_id, "adb:R3CN30ABCDE");
+        assert_eq!(node.device_name, "Pixel 8");
+        assert_eq!(node.ip_address, "127.0.0.1");
+        assert_eq!(node.port, 50052);
+        assert_eq!(node.total_ram_bytes, 8_589_934_592);
+        assert_eq!(node.free_ram_bytes, 4_294_967_296);
+        assert_eq!(node.connection_type, "USB_ADB");
+    }
+
+    #[test]
+    fn node_from_handshake_falls_back_to_adb_label() {
+        let handshake = HandshakeResponse {
+            worker_id: String::new(),
+            device_name: String::new(),
+            total_ram_bytes: 0,
+            free_ram_bytes: 0,
+            cpu_cores: 0,
+            has_npu_acceleration: false,
+        };
+
+        let node = node_from_handshake(&device("FA7B1XYZ", "Pixel_6a"), 50053, handshake);
+
+        assert_eq!(node.device_name, "Pixel_6a");
+        assert_eq!(node.port, 50053);
+    }
+
+    #[test]
+    fn distinct_devices_get_distinct_local_ports() {
+        let base = ADB_FORWARD_PORT;
+        assert_ne!(base, base + 1);
+        assert_eq!(base + 1, 50053);
     }
 }
