@@ -6,8 +6,9 @@
 - [x] Setup repository `.gitignore` for Rust, Node, Tauri, and Android build artifacts.
 
 ## 2. CI/CD Automated Build Workflows
-- [ ] Create `.github/workflows/ci.yml` for pull request linting and cargo test runs.
-- [ ] Create `.github/workflows/release.yml` for automated compilation of Windows `.exe` installers and Android `.apk` release assets on merge to `main`.
+- [x] Create `.github/workflows/ci.yml` for pull request linting and cargo test runs.
+- [x] Create `.github/workflows/release.yml` for automated cross-platform desktop installer builds (Windows `.msi`/`.exe`, macOS `.dmg`, Linux `.deb`/`.rpm`/`.AppImage`) on version tag.
+- [ ] Package and publish the Android `.apk` worker asset (blocked on the Android worker agent in section 5).
 
 ## 3. Master Orchestrator Engine (Rust + Tauri)
 - [ ] Initialize Tauri 2.0 Rust app in `src-tauri/`.
@@ -18,8 +19,8 @@
 - [x] Implement greedy dynamic programming layer scheduler.
 
 ## 4. Master Desktop UI (React + Tailwind CSS)
-- [ ] Initialize React + TypeScript app in `src/`.
-- [ ] Create dark obsidian glassmorphism theme (`index.css`).
+- [x] Initialize React + TypeScript app in `src/`.
+- [x] Create dark obsidian glassmorphism theme (`index.css`).
 - [ ] Build live cluster telemetry canvas visualizer.
 - [ ] Build model catalog browser & Hugging Face GGUF downloader interface.
 - [ ] Build interactive local chat UI with streaming markdown renderer.
@@ -35,3 +36,8 @@
 - [ ] Run 1000-token continuous inference test on pooled 8GB Laptop + 2x Android cluster.
 - [ ] Validate host system RAM safety buffer under heavy mmap page faulting.
 - [ ] Perform security penetration audit on mTLS inter-node transport.
+
+## 7. Known Gaps (Deferred)
+- [ ] **mTLS 1.3 + QR/PIN pairing (`docs/security.md`) is not implemented.** Inter-node RPC is currently plaintext local transport. Deferred to a later hardware phase; tracked here so the gap is explicit rather than implicit.
+- [ ] Tauri desktop shell is being upgraded to v2 (config, capabilities, plugin-based permissions).
+- [ ] Local full desktop builds require `webkit2gtk-4.1` (Tauri v2); `ai-upcycler-core` is the locally verifiable unit.
