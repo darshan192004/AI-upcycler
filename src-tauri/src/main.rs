@@ -44,6 +44,11 @@ fn main() {
 
     let registry = Arc::new(NodeRegistry::new());
 
+    // Start mDNS discovery; keep the daemon alive for the lifetime of the app.
+    let _mdns_daemon = ai_upcycler_core::discovery::mdns::spawn_mdns_browser(registry.clone())
+        .map_err(|e| tracing::warn!("mDNS discovery unavailable: {e}"))
+        .ok();
+
     tauri::Builder::default()
         .manage(registry)
         .invoke_handler(tauri::generate_handler![
