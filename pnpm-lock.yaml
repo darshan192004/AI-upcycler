@@ -21,8 +21,8 @@ dependencies:
     specifier: ^18.2.0
     version: 18.3.1(react@18.3.1)
   tailwind-merge:
-    specifier: ^2.2.1
-    version: 2.6.1
+    specifier: ^3.7.0
+    version: 3.7.0
   zustand:
     specifier: ^4.5.2
     version: 4.5.7(@types/react@18.3.31)(react@18.3.1)
@@ -1518,8 +1518,8 @@ packages:
     engines: {node: '>= 0.4'}
     dev: true
 
-  /tailwind-merge@2.6.1:
-    resolution: {integrity: sha512-Oo6tHdpZsGpkKG88HJ8RR1rg/RdnEkQEfMoEk2x1XRI3F1AxeU+ijRXpiVUF4UbLfcxxRGw6TbUINKYdWVsQTQ==}
+  /tailwind-merge@3.7.0:
+    resolution: {integrity: sha512-XPPUyAc+cvspz3lHTcR/QgPfW2A0lv/xQNIjX3HGhLR+Nq2lHaLq5MtTesHn8GUr3W3DguT2KT5x3NVgRtYwmA==}
     dev: false
 
   /tailwindcss@3.4.19:
