@@ -1,9 +1,10 @@
 name: Release Build (Windows, macOS, Linux)
 
 on:
+  # Releases are cut from version tags only. Triggering on every push to main
+  # would re-run against the same `v__VERSION__` tag and reuse an existing
+  # release, so main merges are validated by CI instead (see ci.yml).
   push:
-    branches:
-      - main
     tags:
       - 'v*'
   workflow_dispatch:
