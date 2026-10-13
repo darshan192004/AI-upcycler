@@ -4,6 +4,7 @@
 //! `build.rs` with tonic-build.
 pub mod aiupcycler {
     pub mod rpc {
+        #![allow(clippy::result_large_err)]
         tonic::include_proto!("aiupcycler.rpc");
     }
 }

@@ -25,9 +25,7 @@ fn compute_layer_plan(
     registry: tauri::State<'_, Arc<NodeRegistry>>,
 ) -> Result<PartitioningPlan, String> {
     let nodes = registry.list_nodes();
-    Ok(ai_upcycler_core::scheduler::planner::LayerScheduler::compute_plan(
-        &model, &nodes,
-    ))
+    Ok(ai_upcycler_core::scheduler::planner::LayerScheduler::compute_plan(&model, &nodes))
 }
 
 #[tauri::command]

@@ -56,10 +56,8 @@ impl LayerScheduler {
             let max_layers_for_node = (usable_ram / model.bytes_per_layer) as usize;
 
             if max_layers_for_node > 0 {
-                let layers_to_assign = std::cmp::min(
-                    max_layers_for_node,
-                    model.total_layers - current_layer,
-                );
+                let layers_to_assign =
+                    std::cmp::min(max_layers_for_node, model.total_layers - current_layer);
 
                 let start = current_layer;
                 let end = start + layers_to_assign - 1;
@@ -80,8 +78,15 @@ impl LayerScheduler {
             }
         }
 
-        let total_assigned = assignments.iter().map(|a| a.end_layer - a.start_layer + 1).sum();
-        let est_tok_sec = if total_assigned == model.total_layers { 8.5 } else { 0.0 };
+        let total_assigned = assignments
+            .iter()
+            .map(|a| a.end_layer - a.start_layer + 1)
+            .sum();
+        let est_tok_sec = if total_assigned == model.total_layers {
+            8.5
+        } else {
+            0.0
+        };
 
         PartitioningPlan {
             model_id: model.model_id.clone(),
@@ -164,7 +169,10 @@ mod tests {
             quantization: "int8".into(),
         };
         // 1 GiB free -> 3 usable layers per node
-        let nodes = vec![node("n1", 1024 * 1024 * 1024), node("n2", 1024 * 1024 * 1024)];
+        let nodes = vec![
+            node("n1", 1024 * 1024 * 1024),
+            node("n2", 1024 * 1024 * 1024),
+        ];
 
         let plan = LayerScheduler::compute_plan(&model, &nodes);
 

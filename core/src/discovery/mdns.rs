@@ -234,6 +234,9 @@ mod tests {
 
         assert!(registry.remove(&node_id).is_some());
         assert!(registry.get_node(&node_id).is_none());
-        assert!(registry.remove(&node_id).is_none(), "second remove is a no-op");
+        assert!(
+            registry.remove(&node_id).is_none(),
+            "second remove is a no-op"
+        );
     }
 }
