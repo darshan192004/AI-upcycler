@@ -1,0 +1,18 @@
+# PR-Agent configuration.
+# Docs: https://docs.pr-agent.ai/usage-guide/configuration_options/
+#
+# Read from the repository root on every run. Secrets never live here: the
+# provider keys are injected as env vars in .github/workflows/pr-agent.yml.
+#
+# Model chain: Gemini is primary; on quota exhaustion or provider failure
+# PR-Agent falls back through the list in order. Groq's gpt-oss-120b answers
+# fast on the developer tier, so it is tried first; OpenRouter's "free"
+# router (free-tier models only) is the slow last resort.
+# custom_model_max_tokens caps the output budget: without it, reasoning
+# models on the chain burn the whole budget on thinking and return empty
+# content with finish_reason "length".
+
+[config]
+model = "gemini/gemini-3.8-flash"
+fallback_models = ["groq/openai/gpt-oss-120b", "openrouter/free"]
+custom_model_max_tokens = 20000

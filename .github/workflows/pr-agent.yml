@@ -32,3 +32,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Fallback providers for the .pr_agent.toml fallback_models chain.
+          # Read directly by litellm when the primary Gemini model is
+          # quota-blocked. Missing secrets degrade to a failed review, same
+          # as the pre-fallback behaviour, never a broken workflow.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
