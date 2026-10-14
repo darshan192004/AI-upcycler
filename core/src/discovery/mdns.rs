@@ -2,6 +2,7 @@ use crate::telemetry::{NodeEventData, TelemetryBus, TelemetryEvent};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -55,6 +56,10 @@ pub struct NodeRegistry {
     /// Optional telemetry fan-out; `None` keeps the registry headless (pure
     /// state container). Attached via [`NodeRegistry::with_events`].
     events: Option<TelemetryBus>,
+    /// Whether the mDNS browser daemon is currently running. Surfaced on the
+    /// topology endpoint so the UI can say discovery is offline instead of
+    /// silently showing an empty cluster.
+    mdns_active: Arc<AtomicBool>,
 }
 
 impl NodeRegistry {
@@ -62,6 +67,7 @@ impl NodeRegistry {
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             events: None,
+            mdns_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -70,7 +76,18 @@ impl NodeRegistry {
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             events: Some(bus),
+            mdns_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Marks the mDNS browser as running (`true`) or stopped (`false`).
+    pub fn set_mdns_active(&self, active: bool) {
+        self.mdns_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Whether the mDNS browser daemon is currently running.
+    pub fn mdns_active(&self) -> bool {
+        self.mdns_active.load(Ordering::Relaxed)
     }
 
     pub fn register_or_update(&self, node: DiscoveredNode) {
@@ -143,6 +160,7 @@ pub fn spawn_mdns_browser(registry: Arc<NodeRegistry>) -> Result<ServiceDaemon, 
         .browse(SERVICE_TYPE)
         .map_err(|e| format!("failed to browse {SERVICE_TYPE}: {e}"))?;
 
+    registry.set_mdns_active(true);
     std::thread::spawn(move || {
         info!("mDNS Discovery: browsing for {SERVICE_TYPE}");
         while let Ok(event) = receiver.recv() {
@@ -170,6 +188,7 @@ pub fn spawn_mdns_browser(registry: Arc<NodeRegistry>) -> Result<ServiceDaemon, 
                 }
             }
         }
+        registry.set_mdns_active(false);
         info!("mDNS Discovery: browser for {SERVICE_TYPE} stopped");
     });
 
@@ -251,6 +270,22 @@ mod tests {
         let node = DiscoveredNode::from_service_info(&info).expect("node built");
         assert_eq!(node.total_ram_bytes, 0);
         assert_eq!(node.free_ram_bytes, 0);
+    }
+
+    #[test]
+    fn registry_tracks_mdns_browser_status() {
+        let registry = NodeRegistry::new();
+        assert!(!registry.mdns_active(), "no browser has been spawned");
+
+        registry.set_mdns_active(true);
+        assert!(registry.mdns_active());
+        assert!(
+            registry.clone().mdns_active(),
+            "status is shared across clones"
+        );
+
+        registry.set_mdns_active(false);
+        assert!(!registry.mdns_active());
     }
 
     #[test]

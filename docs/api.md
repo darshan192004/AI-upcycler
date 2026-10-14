@@ -126,12 +126,16 @@ data: [DONE]
     }
   ],
   "storage_mmap": {
-    "enabled": true,
-    "path": "E:\\AI Upcycler\\cache\\mmap_tier.bin",
+    "enabled": false,
+    "path": "",
     "mapped_layers_count": 0
+  },
+  "discovery": {
+    "mdns": "active"
   }
 }
 ```
+`discovery.mdns` is `"active"` when the mDNS browser daemon is running and `"unavailable"` when it failed to start (Wi-Fi discovery offline; USB/ADB workers unaffected).
 
 ### 3.2 Trigger Hardware Re-Benchmarking
 - **Endpoint**: `POST /api/cluster/benchmark`

@@ -4,6 +4,10 @@ export interface StorageMmap {
   mapped_layers_count: number;
 }
 
+export interface DiscoveryStatus {
+  mdns: 'active' | 'unavailable';
+}
+
 export interface TopologyNode {
   node_id: string;
   role: string;
@@ -23,6 +27,7 @@ export interface Topology {
   used_pooled_ram_mb: number;
   nodes: TopologyNode[];
   storage_mmap: StorageMmap;
+  discovery?: DiscoveryStatus;
 }
 
 export interface ModelMeta {

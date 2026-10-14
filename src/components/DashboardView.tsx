@@ -32,6 +32,7 @@ export function DashboardView() {
   const usedGb = topology ? topology.used_pooled_ram_mb / 1024 : 0;
   const tokS = latestMetrics?.tokens_per_second ?? 0;
   const ramPct = latestMetrics?.master_ram_utilization_pct ?? 0;
+  const mdnsOffline = topology?.discovery?.mdns === 'unavailable';
 
   if (!apiOnline && !topology) {
     return (
@@ -160,10 +161,17 @@ export function DashboardView() {
       </motion.div>
 
       <motion.div variants={item}>
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-            Cluster topology
-          </h2>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+              Cluster topology
+            </h2>
+            {mdnsOffline && (
+              <span className="flex items-center gap-1.5 rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-300">
+                mDNS unavailable
+              </span>
+            )}
+          </div>
           <span className="text-xs text-slate-500">
             {workerNodes.length} worker{workerNodes.length === 1 ? '' : 's'} connected
           </span>
@@ -177,13 +185,21 @@ export function DashboardView() {
           </div>
         ) : (
           <div className="glass-panel rounded-2xl p-8 text-center">
-            <p className="text-sm text-slate-400">
-              Waiting for{' '}
-              <code className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[12px] text-emerald-300">
-                _aiupcycler-worker._tcp.local.
-              </code>{' '}
-              discoveries…
-            </p>
+            {mdnsOffline ? (
+              <p className="text-sm text-slate-400">
+                mDNS discovery could not start — Wi-Fi worker discovery is offline.
+                USB/ADB workers can still connect. Check that UDP multicast is
+                allowed on this machine.
+              </p>
+            ) : (
+              <p className="text-sm text-slate-400">
+                Waiting for{' '}
+                <code className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[12px] text-emerald-300">
+                  _aiupcycler-worker._tcp.local.
+                </code>{' '}
+                discoveries…
+              </p>
+            )}
           </div>
         )}
 

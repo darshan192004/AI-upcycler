@@ -22,6 +22,13 @@ pub struct Topology {
     pub used_pooled_ram_mb: u64,
     pub nodes: Vec<TopologyNode>,
     pub storage_mmap: StorageMmap,
+    pub discovery: DiscoveryStatus,
+}
+
+/// Whether the mDNS browser behind Wi-Fi discovery is actually running.
+#[derive(Debug, Serialize)]
+pub struct DiscoveryStatus {
+    pub mdns: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +124,13 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
             enabled: false,
             path: String::new(),
             mapped_layers_count: 0,
+        },
+        discovery: DiscoveryStatus {
+            mdns: if state.registry.mdns_active() {
+                "active"
+            } else {
+                "unavailable"
+            },
         },
     }))
 }
@@ -304,6 +318,19 @@ mod tests {
         assert_eq!(topology.nodes[1].connection, "usb_adb");
         assert_eq!(topology.status, "idle");
         assert_eq!(topology.total_pooled_ram_mb, 2048 + 4096);
+        assert_eq!(topology.discovery.mdns, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn topology_reports_active_mdns_discovery() {
+        let registry = Arc::new(NodeRegistry::new());
+        registry.set_mdns_active(true);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let state = state(registry, store);
+
+        let topology = topology_of(state).await;
+
+        assert_eq!(topology.discovery.mdns, "active");
     }
 
     #[tokio::test]
