@@ -21,13 +21,14 @@
 - [x] Implement OpenAI-compatible REST API (`axum`): `GET /v1/models` and `POST /v1/chat/completions` (buffered and SSE streaming).
 - [x] Implement cluster management endpoints: `GET /api/cluster/topology` and `POST /api/cluster/benchmark`.
 - [x] Implement telemetry WebSocket fan-out (`GET /api/telemetry`) over a tokio broadcast bus, wired to mDNS node events.
+- [ ] Implement GGUF download endpoint `POST /api/models/download` (202 + `.gguf` validation) fanning out `model_download_progress` over `/api/telemetry`.
 
 ## 4. Master Desktop UI (React + Tailwind CSS)
 - [x] Initialize React + TypeScript app in `src/`.
 - [x] Create dark obsidian glassmorphism theme (`index.css`).
-- [ ] Build live cluster telemetry canvas visualizer.
-- [ ] Build model catalog browser & Hugging Face GGUF downloader interface.
-- [ ] Build interactive local chat UI with streaming markdown renderer.
+- [x] Build live cluster telemetry canvas visualizer.
+- [x] Build model catalog browser & Hugging Face GGUF downloader interface.
+- [x] Build interactive local chat UI with streaming markdown renderer.
 
 ## 5. Mobile Worker Agent (Android & iOS)
 - [ ] Create Android Kotlin worker app in `mobile-worker/android/`.
