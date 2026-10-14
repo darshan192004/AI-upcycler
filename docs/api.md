@@ -167,6 +167,36 @@ data: [DONE]
 ```
 - **Errors**: `400` when `file_name` does not end with `.gguf`, contains path separators, or `repo_id` is not an `owner/name` Hugging Face repository; `409` when a download for the same file is already in flight.
 
+### 3.4 QR/PIN Worker Pairing (mTLS Enrollment)
+- **Endpoint**: `POST /api/pairing/session`
+- **Response**: `200 OK` — starts a single-use pairing session (5-minute TTL).
+```json
+{
+  "pin": "811896",
+  "qr_payload": "aiupcycler://pair?fp=d872…b4b8&token=811896",
+  "expires_in_secs": 300,
+  "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8"
+}
+```
+- **Endpoint**: `POST /api/pairing/enroll`
+- **Request**:
+```json
+{
+  "pin": "811896",
+  "device_name": "Pixel 8"
+}
+```
+- **Response**: `200 OK` — redeems the PIN and issues a worker client certificate signed by the master's ephemeral CA (PEMs; the worker presents the client cert on the mTLS gRPC channel and validates the server cert against `fingerprint`).
+```json
+{
+  "ca_pem": "-----BEGIN CERTIFICATE-----…",
+  "client_cert_pem": "-----BEGIN CERTIFICATE-----…",
+  "client_key_pem": "-----BEGIN PRIVATE KEY-----…",
+  "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8"
+}
+```
+- **Errors**: `400` when `device_name` is empty or longer than 64 characters; `403` when the PIN is wrong or expired; `409` when the PIN was already redeemed.
+
 ---
 
 ## 4. WebSocket Real-Time Telemetry API

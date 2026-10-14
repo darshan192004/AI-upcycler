@@ -223,6 +223,106 @@ async fn rejects_download_path_traversal() {
 }
 
 #[tokio::test]
+async fn pairing_session_returns_pin_qr_and_fingerprint() {
+    let (status, body) = send(router(state()), "POST", "/api/pairing/session", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let pin = body["pin"].as_str().unwrap();
+    assert_eq!(pin.len(), 6);
+    assert!(pin.chars().all(|c| c.is_ascii_digit()));
+    let qr = body["qr_payload"].as_str().unwrap();
+    assert!(qr.starts_with("aiupcycler://pair?"));
+    assert!(qr.contains(&format!("token={pin}")));
+    let fingerprint = body["fingerprint"].as_str().unwrap();
+    assert_eq!(fingerprint.len(), 64);
+    assert!(qr.contains(&format!("fp={fingerprint}")));
+    assert!(body["expires_in_secs"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn enrolling_with_pin_issues_ca_signed_credentials() {
+    let app = router(state());
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["ca_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+    assert!(body["client_cert_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+    assert!(body["client_key_pem"]
+        .as_str()
+        .unwrap()
+        .contains("PRIVATE KEY"));
+    assert_eq!(
+        body["fingerprint"].as_str().unwrap(),
+        session["fingerprint"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn enrolling_rejects_wrong_reused_and_invalid_pins() {
+    let app = router(state());
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap();
+
+    // Wrong PIN → 403.
+    let wrong = if pin == "111111" { "222222" } else { "111111" };
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": wrong, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Valid PIN → 200, then reuse → 409.
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Empty device name → 400 (fresh session so PIN state is irrelevant).
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": session["pin"], "device_name": "  " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn download_conflicts_while_in_flight() {
     let state = state();
     state
@@ -304,4 +404,16 @@ async fn accepts_download_and_registers_model_on_completion() {
     let dest = state.models_dir.join(file_name);
     assert!(dest.is_file(), "downloaded file exists");
     let _ = std::fs::remove_file(dest);
+}
+
+/// Manual harness: serves the full API on 127.0.0.1:18081 until the process is
+/// killed. Run with `cargo test --test api pairing_manual_server -- --ignored`
+/// to exercise the pairing endpoints from a browser (Playwright).
+#[tokio::test]
+#[ignore = "manual harness: serves the API on 127.0.0.1:18081 until killed"]
+async fn pairing_manual_server() {
+    let addr: std::net::SocketAddr = "127.0.0.1:18081".parse().unwrap();
+    ai_upcycler_core::api::serve(addr, state())
+        .await
+        .expect("serve");
 }

@@ -4,5 +4,6 @@ pub mod discovery;
 pub mod mmap;
 pub mod rpc;
 pub mod scheduler;
+pub mod security;
 pub mod store;
 pub mod telemetry;

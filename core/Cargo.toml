@@ -10,7 +10,7 @@ edition = "2021"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 prost = "0.13"
-tonic = { version = "0.13", features = ["transport"] }
+tonic = { version = "0.13", features = ["transport", "tls-ring"] }
 mdns-sd = "0.11"
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
@@ -24,6 +24,8 @@ futures = "0.3"
 async-stream = "0.3"
 memmap2 = "0.9"
 bytes = "1"
+rcgen = "0.13"
+sha2 = "0.10"
 
 [build-dependencies]
 tonic-build = "0.13"
@@ -31,4 +33,5 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { version = "1.36", features = ["full"] }
+tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }

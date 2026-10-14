@@ -43,7 +43,7 @@
 - [ ] Perform security penetration audit on mTLS inter-node transport.
 
 ## 7. Known Gaps (Deferred)
-- [ ] **mTLS 1.3 + QR/PIN pairing (`docs/security.md`) is not implemented.** Inter-node RPC is currently plaintext local transport. Deferred to a later hardware phase; tracked here so the gap is explicit rather than implicit.
+- [ ] **mTLS 1.3 + QR/PIN pairing (`docs/security.md`) — master side is implemented** (`core/src/security.rs`: ephemeral CA, single-use 6-digit PIN sessions, `POST /api/pairing/session` + `/api/pairing/enroll`, `WorkerRpcClient::connect_tls`, mTLS handshake covered end-to-end in `core/tests/mtls.rs` against a CA-enforcing test server). The worker half (Android mTLS server, QR display, cert trust of the master fingerprint) is deferred to the hardware phase §5 — no Android device/toolchain is available to build or test it.
 - [ ] Tauri desktop shell is on v2; remaining plugins/permissions beyond `core:default` will be added as features land.
 - [ ] Full desktop builds need the Tauri v2 Linux stack (`webkit2gtk-4.1`, `libsoup-3.0`); `ai-upcycler-core` remains the fastest locally verifiable unit, while CI's `desktop` job lints the shell.
 - [x] ~~mDNS discovery is best-effort: a failed browser spawn is logged and the app continues without discovery. Surface this to the UI once the cluster view is wired.~~ — fixed: `NodeRegistry` tracks browser liveness, `/api/cluster/topology` exposes `discovery.mdns: "active"|"unavailable"`, and the dashboard shows an amber chip + offline copy when the browser is down.

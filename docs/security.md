@@ -34,6 +34,8 @@ sequenceDiagram
     note over Master, Worker: Establish Encrypted mTLS 1.3 RPC Channel (Port 50052)
 ```
 
+**Implementation status (master side):** the ephemeral CA, 6-digit single-use PIN sessions, QR payload (`aiupcycler://pair?fp=…&token=…`), enrollment REST endpoints (`/api/pairing/session`, `/api/pairing/enroll` — `docs/api.md` §3.4), and the mTLS gRPC client (`WorkerRpcClient::connect_tls`) are implemented in `ai-upcycler-core` and covered by end-to-end handshake tests. The worker half (Android mTLS server, QR display UI, server-fingerprint validation on-device) awaits the §5 hardware phase.
+
 ---
 
 ## 4. Mobile Agent Sandboxing & Permissions

@@ -11,6 +11,7 @@ pub mod downloads;
 mod error;
 pub mod llama;
 pub mod models;
+pub mod pairing;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
@@ -18,6 +19,7 @@ pub use error::{ApiError, ApiResult};
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::NodeRegistry;
+use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
 use axum::routing::{get, post};
@@ -44,6 +46,8 @@ pub struct AppState {
     /// File names with a download currently in flight (guards against two
     /// runners writing the same path).
     pub active_downloads: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Ephemeral CA + QR/PIN pairing state for mTLS worker enrollment.
+    pub security: Arc<SecurityState>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -87,6 +91,7 @@ impl AppState {
             host,
             models_dir: default_models_dir(),
             active_downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            security: Arc::new(SecurityState::default()),
         }
     }
 
@@ -158,6 +163,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cluster/topology", get(cluster::topology))
         .route("/api/cluster/benchmark", post(cluster::benchmark))
         .route("/api/models/download", post(downloads::download))
+        .route("/api/pairing/session", post(pairing::create_session))
+        .route("/api/pairing/enroll", post(pairing::enroll))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
