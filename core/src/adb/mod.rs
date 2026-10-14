@@ -135,11 +135,17 @@ impl AdbTunnelManager {
         Ok(forwarded)
     }
 
-    /// One-shot USB bootstrap: forwards every authorized device, then probes
-    /// each tunneled worker over RPC so only nodes with known RAM capacity are
-    /// registered. Devices that fail to handshake are skipped rather than
-    /// registered with unknown capacity.
-    pub async fn start(registry: Arc<NodeRegistry>) {
+    /// USB bootstrap: forwards every authorized device, probes each tunneled
+    /// worker over RPC so only nodes with known RAM capacity are registered,
+    /// then stays alive until `shutdown` flips to `true`, at which point every
+    /// forward this task established is removed again.
+    ///
+    /// Devices that fail to handshake are skipped rather than registered with
+    /// unknown capacity; their forwards are removed immediately.
+    pub async fn start(
+        registry: Arc<NodeRegistry>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         if !Self::is_available() {
             warn!("ADB: binary not found; USB device bridging disabled");
             return;
@@ -160,12 +166,14 @@ impl AdbTunnelManager {
 
         let mut registered = 0;
         let manager = Self::new();
+        let mut established: Vec<(AdbDevice, u16)> = Vec::new();
         for (device, local_port) in devices {
             match probe_device(local_port).await {
                 Some(handshake) => {
                     registry
                         .register_or_update(node_from_handshake(&device, local_port, handshake));
                     registered += 1;
+                    established.push((device, local_port));
                 }
                 None => {
                     warn!(
@@ -179,7 +187,23 @@ impl AdbTunnelManager {
             }
         }
 
-        info!("ADB: registered {registered} USB device(s)");
+        info!(
+            "ADB: registered {registered} USB device(s); waiting for shutdown to tear down {} tunnel(s)",
+            established.len()
+        );
+
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+
+        for (device, local_port) in &established {
+            if let Err(e) = manager.remove_forward(&device.serial, *local_port) {
+                warn!("ADB: shutdown cleanup failed for {}: {e}", device.serial);
+            }
+        }
+        info!("ADB: removed {} tunnel(s) on shutdown", established.len());
     }
 }
 

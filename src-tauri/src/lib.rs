@@ -54,14 +54,16 @@ pub fn run() {
         .map_err(|e| tracing::warn!("mDNS discovery unavailable: {e}"))
         .ok();
 
-    // Bridge USB-attached Android workers on a background task.
+    // Bridge USB-attached Android workers on a background task. The task stays
+    // alive after bootstrap so it can remove `adb forward` tunnels on shutdown.
+    let (adb_shutdown_tx, adb_shutdown_rx) = tokio::sync::watch::channel(false);
     let adb_registry = registry.clone();
     tauri::async_runtime::spawn(async move {
-        ai_upcycler_core::adb::AdbTunnelManager::start(adb_registry).await;
+        ai_upcycler_core::adb::AdbTunnelManager::start(adb_registry, adb_shutdown_rx).await;
     });
 
     let server_registry = registry.clone();
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(registry)
         .setup(move |app| {
             let data_dir = app
@@ -99,6 +101,15 @@ pub fn run() {
             compute_layer_plan,
             dispatch_rpc_step
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    app.run(move |_app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            let _ = adb_shutdown_tx.send(true);
+            // Brief grace window so the ADB task can remove its port forwards
+            // before the runtime tears down.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
 }

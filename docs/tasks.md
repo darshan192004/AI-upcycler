@@ -47,7 +47,7 @@
 - [ ] Tauri desktop shell is on v2; remaining plugins/permissions beyond `core:default` will be added as features land.
 - [ ] Full desktop builds need the Tauri v2 Linux stack (`webkit2gtk-4.1`, `libsoup-3.0`); `ai-upcycler-core` remains the fastest locally verifiable unit, while CI's `desktop` job lints the shell.
 - [ ] mDNS discovery is best-effort: a failed browser spawn is logged and the app continues without discovery. Surface this to the UI once the cluster view is wired.
-- [ ] The ADB tunnel background task has no graceful shutdown; add a shutdown signal so `adb forward` state is torn down cleanly on exit.
+- [x] ~~The ADB tunnel background task has no graceful shutdown~~ — fixed: `AdbTunnelManager::start` now waits on a shutdown signal and removes every `adb forward` it created before the app exits.
 - [ ] `shell.open` is intentionally not granted (unused); add a scoped `shell:allow-open` permission if external-link opening is introduced.
 - [ ] The chat generation backend is a deterministic `StubBackend` (no inference engine loaded yet). Streaming, SQLite persistence and telemetry around it are real; swap in the real engine behind the `GenerationBackend` trait.
 - [ ] `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker` (values derived from the node id hash), not on-device probes. Do not schedule on these numbers yet.
