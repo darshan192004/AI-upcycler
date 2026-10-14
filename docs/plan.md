@@ -120,12 +120,12 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | 3 | React dashboard wired to live data (telemetry canvas) | ✅ |
 | 3 | Streaming chat UI + GGUF / Hugging Face downloader | ✅ |
 | 4 | Dynamic-programming layer scheduler (+ 20% host RAM headroom) | ✅ |
-| 4 | SSD `mmap` zero-copy weight pager | ⬜ |
+| 4 | SSD `mmap` zero-copy weight pager | ✅ |
 | 5 | CI (fmt/clippy/test, desktop shell, frontend) | ✅ |
 | 5 | Release workflow (Windows/macOS/Linux installers on tag) | ✅ |
 | 5 | Android `.apk` release asset | ⬜ |
 
-**Completed: 13 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md); deliberately deferred work (mTLS/pairing, `mmap`, real inference/benchmark engines, Android/iOS agents) is listed under *Known Gaps* there.
+**Completed: 14 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md). The remaining unbuilt rows need physical Android hardware, an Android SDK/NDK toolchain, and host `llama.cpp` RPC binaries; deliberately deferred work (mTLS/pairing, real inference/benchmark engines) is listed under *Known Gaps* there.
 
 > Stubbed-but-wired: the chat path runs an end-to-end streaming/persistence/telemetry pipeline against a placeholder `StubBackend`, and `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker`. Both sit behind traits (`GenerationBackend`, `HardwareBenchmarker`) so the real engines drop in without API changes.
 
