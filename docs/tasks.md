@@ -21,7 +21,7 @@
 - [x] Implement OpenAI-compatible REST API (`axum`): `GET /v1/models` and `POST /v1/chat/completions` (buffered and SSE streaming).
 - [x] Implement cluster management endpoints: `GET /api/cluster/topology` and `POST /api/cluster/benchmark`.
 - [x] Implement telemetry WebSocket fan-out (`GET /api/telemetry`) over a tokio broadcast bus, wired to mDNS node events.
-- [ ] Implement GGUF download endpoint `POST /api/models/download` (202 + `.gguf` validation) fanning out `model_download_progress` over `/api/telemetry`.
+- [x] Implement GGUF download endpoint `POST /api/models/download` (202 + `.gguf` validation) fanning out `model_download_progress` over `/api/telemetry`.
 
 ## 4. Master Desktop UI (React + Tailwind CSS)
 - [x] Initialize React + TypeScript app in `src/`.

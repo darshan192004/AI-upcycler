@@ -333,6 +333,7 @@ mod tests {
             Arc::new(NodeRegistry::new()),
             store,
             TelemetryBus::new(8),
+            std::env::temp_dir().join("ai-upcycler-chat-test"),
         )
     }
 

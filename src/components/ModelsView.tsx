@@ -104,7 +104,7 @@ export function ModelsView() {
                         layers
                       </dt>
                       <dd className="font-mono text-xs text-slate-200">
-                        {model.meta.layers}
+                        {model.meta.layers > 0 ? model.meta.layers : '—'}
                       </dd>
                     </div>
                     <div>

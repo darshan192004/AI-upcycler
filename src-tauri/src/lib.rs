@@ -81,6 +81,7 @@ pub fn run() {
                 server_registry.clone(),
                 store,
                 telemetry.clone(),
+                data_dir.join("models"),
             );
 
             tauri::async_runtime::spawn(async move {

@@ -16,8 +16,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!resp.ok) {
     let detail = `${resp.status}`;
     try {
-      const body = (await resp.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body = (await resp.json()) as {
+        detail?: string;
+        error?: { message?: string };
+      };
+      detail = body.detail ?? body.error?.message ?? detail;
     } catch {
       // keep status code as the error detail
     }

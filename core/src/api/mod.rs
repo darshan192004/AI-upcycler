@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod chat;
 pub mod cluster;
+pub mod downloads;
 mod error;
 pub mod models;
 pub mod ws;
@@ -14,12 +15,15 @@ pub mod ws;
 pub use error::{ApiError, ApiResult};
 
 use crate::api::backend::{GenerationBackend, StubBackend};
+use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::NodeRegistry;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
 use axum::routing::{get, post};
 use axum::Router;
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -31,8 +35,14 @@ pub struct AppState {
     pub registry: Arc<NodeRegistry>,
     pub store: Arc<Store>,
     pub backend: Arc<dyn GenerationBackend>,
+    pub fetcher: Arc<dyn ModelFetcher>,
     pub telemetry: TelemetryBus,
     pub host: HostInfo,
+    /// Destination directory for GGUF downloads.
+    pub models_dir: PathBuf,
+    /// File names with a download currently in flight (guards against two
+    /// runners writing the same path).
+    pub active_downloads: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -71,9 +81,24 @@ impl AppState {
             registry,
             store,
             backend,
+            fetcher: Arc::new(HfFetcher::default()),
             telemetry,
             host,
+            models_dir: default_models_dir(),
+            active_downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Overrides the GGUF fetcher (tests inject [`downloads::StubFetcher`]).
+    pub fn with_fetcher(mut self, fetcher: Arc<dyn ModelFetcher>) -> Self {
+        self.fetcher = fetcher;
+        self
+    }
+
+    /// Overrides the GGUF download directory.
+    pub fn with_models_dir(mut self, models_dir: PathBuf) -> Self {
+        self.models_dir = models_dir;
+        self
     }
 
     /// Standard wiring for the desktop shell: real registry/store/telemetry and
@@ -83,6 +108,7 @@ impl AppState {
         registry: Arc<NodeRegistry>,
         store: Arc<Store>,
         telemetry: TelemetryBus,
+        models_dir: PathBuf,
     ) -> Self {
         Self::new(
             cluster_id,
@@ -92,7 +118,16 @@ impl AppState {
             telemetry,
             HostInfo::default(),
         )
+        .with_models_dir(models_dir)
     }
+}
+
+/// Download destination when no explicit directory was configured: `models/`
+/// under the current working directory.
+fn default_models_dir() -> PathBuf {
+    std::env::current_dir()
+        .map(|dir| dir.join("models"))
+        .unwrap_or_else(|_| PathBuf::from("models"))
 }
 
 /// Builds the application router (used by the server and by integration tests).
@@ -102,6 +137,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/api/cluster/topology", get(cluster::topology))
         .route("/api/cluster/benchmark", post(cluster::benchmark))
+        .route("/api/models/download", post(downloads::download))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

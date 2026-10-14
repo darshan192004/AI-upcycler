@@ -145,6 +145,24 @@ data: [DONE]
 }
 ```
 
+### 3.3 Start a GGUF Model Download
+- **Endpoint**: `POST /api/models/download`
+- **Request**:
+```json
+{
+  "repo_id": "bartowski/Llama-3.1-8B-Instruct-GGUF",
+  "file_name": "llama-3.1-8b-instruct-q4_k_m.gguf"
+}
+```
+- **Response**: `202 Accepted` — the download runs in the background; progress is streamed as `model_download_progress` telemetry events (section 4) and the model is registered in `/v1/models` on completion.
+```json
+{
+  "status": "accepted",
+  "file_name": "llama-3.1-8b-instruct-q4_k_m.gguf"
+}
+```
+- **Errors**: `400` when `file_name` does not end with `.gguf`, contains path separators, or `repo_id` is not an `owner/name` Hugging Face repository; `409` when a download for the same file is already in flight.
+
 ---
 
 ## 4. WebSocket Real-Time Telemetry API
@@ -154,6 +172,7 @@ data: [DONE]
   - `node_connected`: Broadcast when a new mobile device connects.
   - `node_disconnected`: Broadcast when a device loses connection.
   - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference.
+  - `model_download_progress`: Emits GGUF download progress (`running` / `complete` / `error`) with received and total bytes.
 
 ```json
 {
@@ -167,6 +186,20 @@ data: [DONE]
       {"id": "worker-android-01", "temp_celsius": 38.5, "battery_pct": 92.0},
       {"id": "worker-android-02", "temp_celsius": 41.2, "battery_pct": 84.0}
     ]
+  }
+}
+```
+
+```json
+{
+  "event": "model_download_progress",
+  "timestamp": 1743457100,
+  "data": {
+    "model_id": "llama-3.1-8b-instruct-q4_k_m",
+    "file_name": "llama-3.1-8b-instruct-q4_k_m.gguf",
+    "received_bytes": 536870912,
+    "total_bytes": 4928308224,
+    "status": "running"
   }
 }
 ```
