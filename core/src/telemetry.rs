@@ -41,6 +41,25 @@ pub struct GenerationMetrics {
     pub worker_nodes: Vec<WorkerTelemetry>,
 }
 
+/// Lifecycle of a GGUF download started via `POST /api/models/download`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadStatus {
+    Running,
+    Complete,
+    Error,
+}
+
+/// Progress carried inside a [`ModelDownloadProgress`] event.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadProgressData {
+    pub model_id: String,
+    pub file_name: String,
+    pub received_bytes: u64,
+    pub total_bytes: u64,
+    pub status: DownloadStatus,
+}
+
 /// A telemetry message, serialised for the wire as
 /// `{"event": "...", "timestamp": <secs>, "data": { ... }}` (see `docs/api.md`).
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +76,10 @@ pub enum TelemetryEvent {
     GenerationMetrics {
         timestamp: u64,
         data: GenerationMetrics,
+    },
+    ModelDownloadProgress {
+        timestamp: u64,
+        data: DownloadProgressData,
     },
 }
 
@@ -77,6 +100,13 @@ impl TelemetryEvent {
 
     pub fn generation_metrics(data: GenerationMetrics) -> Self {
         Self::GenerationMetrics {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn model_download_progress(data: DownloadProgressData) -> Self {
+        Self::ModelDownloadProgress {
             timestamp: now_epoch_secs(),
             data,
         }
@@ -161,5 +191,32 @@ mod tests {
     fn publish_without_subscribers_is_a_noop() {
         let bus = TelemetryBus::default();
         assert_eq!(bus.publish(TelemetryEvent::node_connected(sample())), 0);
+    }
+
+    #[test]
+    fn serialises_download_progress_with_tagged_status() {
+        let event = TelemetryEvent::model_download_progress(DownloadProgressData {
+            model_id: "tiny-model".into(),
+            file_name: "tiny-model-q4_k_m.gguf".into(),
+            received_bytes: 512,
+            total_bytes: 1024,
+            status: DownloadStatus::Running,
+        });
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["event"], "model_download_progress");
+        assert_eq!(value["data"]["status"], "running");
+        assert_eq!(value["data"]["received_bytes"], 512);
+
+        let done = TelemetryEvent::model_download_progress(DownloadProgressData {
+            model_id: "tiny-model".into(),
+            file_name: "tiny-model-q4_k_m.gguf".into(),
+            received_bytes: 1024,
+            total_bytes: 1024,
+            status: DownloadStatus::Complete,
+        });
+        assert_eq!(
+            serde_json::to_value(&done).unwrap()["data"]["status"],
+            "complete"
+        );
     }
 }

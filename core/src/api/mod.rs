@@ -7,19 +7,26 @@
 pub mod backend;
 pub mod chat;
 pub mod cluster;
+pub mod downloads;
 mod error;
+pub mod llama;
 pub mod models;
+pub mod pairing;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
 
 use crate::api::backend::{GenerationBackend, StubBackend};
+use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::NodeRegistry;
+use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
 use axum::routing::{get, post};
 use axum::Router;
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -31,8 +38,16 @@ pub struct AppState {
     pub registry: Arc<NodeRegistry>,
     pub store: Arc<Store>,
     pub backend: Arc<dyn GenerationBackend>,
+    pub fetcher: Arc<dyn ModelFetcher>,
     pub telemetry: TelemetryBus,
     pub host: HostInfo,
+    /// Destination directory for GGUF downloads.
+    pub models_dir: PathBuf,
+    /// File names with a download currently in flight (guards against two
+    /// runners writing the same path).
+    pub active_downloads: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Ephemeral CA + QR/PIN pairing state for mTLS worker enrollment.
+    pub security: Arc<SecurityState>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -71,28 +86,73 @@ impl AppState {
             registry,
             store,
             backend,
+            fetcher: Arc::new(HfFetcher::default()),
             telemetry,
             host,
+            models_dir: default_models_dir(),
+            active_downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            security: Arc::new(SecurityState::default()),
         }
     }
 
-    /// Standard wiring for the desktop shell: real registry/store/telemetry and
-    /// the placeholder generation backend.
+    /// Overrides the GGUF fetcher (tests inject [`downloads::StubFetcher`]).
+    pub fn with_fetcher(mut self, fetcher: Arc<dyn ModelFetcher>) -> Self {
+        self.fetcher = fetcher;
+        self
+    }
+
+    /// Overrides the GGUF download directory.
+    pub fn with_models_dir(mut self, models_dir: PathBuf) -> Self {
+        self.models_dir = models_dir;
+        self
+    }
+
+    /// Standard wiring for the desktop shell: real registry/store/telemetry.
+    ///
+    /// Uses the real llama.cpp engine when [`llama::LlamaCppBackend::discover`]
+    /// finds a server binary + GGUF; otherwise falls back to the clearly
+    /// labelled [`StubBackend`] placeholder.
     pub fn bootstrap(
         cluster_id: String,
         registry: Arc<NodeRegistry>,
         store: Arc<Store>,
         telemetry: TelemetryBus,
+        models_dir: PathBuf,
     ) -> Self {
+        let backend: Arc<dyn GenerationBackend> =
+            match llama::LlamaCppBackend::discover(&models_dir) {
+                Some(engine) => {
+                    tracing::info!("generation backend: {}", engine.describe());
+                    Arc::new(engine)
+                }
+                None => {
+                    tracing::warn!(
+                        "llama.cpp engine not found (set AI_UPCYCLER_LLAMA_SERVER and \
+                         AI_UPCYCLER_MODEL, or place llama-server + {model} under the data \
+                         dir); chat will use the stub backend",
+                        model = llama::DEFAULT_MODEL_FILE,
+                    );
+                    Arc::new(StubBackend::new())
+                }
+            };
         Self::new(
             cluster_id,
             registry,
             store,
-            Arc::new(StubBackend::new()),
+            backend,
             telemetry,
             HostInfo::default(),
         )
+        .with_models_dir(models_dir)
     }
+}
+
+/// Download destination when no explicit directory was configured: `models/`
+/// under the current working directory.
+fn default_models_dir() -> PathBuf {
+    std::env::current_dir()
+        .map(|dir| dir.join("models"))
+        .unwrap_or_else(|_| PathBuf::from("models"))
 }
 
 /// Builds the application router (used by the server and by integration tests).
@@ -102,6 +162,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/api/cluster/topology", get(cluster::topology))
         .route("/api/cluster/benchmark", post(cluster::benchmark))
+        .route("/api/models/download", post(downloads::download))
+        .route("/api/pairing/session", post(pairing::create_session))
+        .route("/api/pairing/enroll", post(pairing::enroll))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

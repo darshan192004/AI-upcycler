@@ -1,15 +1,17 @@
 //! End-to-end tests exercising the HTTP router in-process (no sockets).
 
 use ai_upcycler_core::api::backend::StubBackend;
+use ai_upcycler_core::api::downloads::StubFetcher;
 use ai_upcycler_core::api::{router, AppState, HostInfo};
 use ai_upcycler_core::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use ai_upcycler_core::store::{NewModel, Store};
-use ai_upcycler_core::telemetry::TelemetryBus;
+use ai_upcycler_core::telemetry::{DownloadStatus, TelemetryBus, TelemetryEvent};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 
 fn state() -> AppState {
@@ -50,6 +52,10 @@ fn state() -> AppState {
             total_ram_mb: 2048,
             cpu_cores: 4,
         },
+    )
+    .with_fetcher(Arc::new(StubFetcher::new()))
+    .with_models_dir(
+        std::env::temp_dir().join(format!("ai-upcycler-test-{}", uuid::Uuid::new_v4())),
     )
 }
 
@@ -179,4 +185,235 @@ async fn runs_benchmark() {
     assert_eq!(body["status"], "success");
     assert_eq!(body["nodes_tested"], 1);
     assert_eq!(body["rebalancing_triggered"], true);
+}
+
+#[tokio::test]
+async fn rejects_non_gguf_download_requests() {
+    let (status, body) = send(
+        router(state()),
+        "POST",
+        "/api/models/download",
+        Some(json!({ "repo_id": "owner/repo", "file_name": "model.safetensors" })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().contains(".gguf"));
+}
+
+#[tokio::test]
+async fn rejects_download_path_traversal() {
+    let (status, _) = send(
+        router(state()),
+        "POST",
+        "/api/models/download",
+        Some(json!({ "repo_id": "owner/repo", "file_name": "../evil.gguf" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = send(
+        router(state()),
+        "POST",
+        "/api/models/download",
+        Some(json!({ "repo_id": "owner/../repo", "file_name": "model.gguf" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pairing_session_returns_pin_qr_and_fingerprint() {
+    let (status, body) = send(router(state()), "POST", "/api/pairing/session", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let pin = body["pin"].as_str().unwrap();
+    assert_eq!(pin.len(), 6);
+    assert!(pin.chars().all(|c| c.is_ascii_digit()));
+    let qr = body["qr_payload"].as_str().unwrap();
+    assert!(qr.starts_with("aiupcycler://pair?"));
+    assert!(qr.contains(&format!("token={pin}")));
+    let fingerprint = body["fingerprint"].as_str().unwrap();
+    assert_eq!(fingerprint.len(), 64);
+    assert!(qr.contains(&format!("fp={fingerprint}")));
+    assert!(body["expires_in_secs"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn enrolling_with_pin_issues_ca_signed_credentials() {
+    let app = router(state());
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["ca_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+    assert!(body["client_cert_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+    assert!(body["client_key_pem"]
+        .as_str()
+        .unwrap()
+        .contains("PRIVATE KEY"));
+    assert_eq!(
+        body["fingerprint"].as_str().unwrap(),
+        session["fingerprint"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn enrolling_rejects_wrong_reused_and_invalid_pins() {
+    let app = router(state());
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap();
+
+    // Wrong PIN → 403.
+    let wrong = if pin == "111111" { "222222" } else { "111111" };
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": wrong, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Valid PIN → 200, then reuse → 409.
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Empty device name → 400 (fresh session so PIN state is irrelevant).
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": session["pin"], "device_name": "  " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn download_conflicts_while_in_flight() {
+    let state = state();
+    state
+        .active_downloads
+        .lock()
+        .await
+        .insert("busy-model.gguf".to_string());
+
+    let (status, body) = send(
+        router(state),
+        "POST",
+        "/api/models/download",
+        Some(json!({ "repo_id": "owner/repo", "file_name": "busy-model.gguf" })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("already in progress"));
+}
+
+#[tokio::test]
+async fn accepts_download_and_registers_model_on_completion() {
+    let state = state();
+    let mut receiver = state.telemetry.subscribe();
+    let file_name = "tiny-model-q4_k_m.gguf";
+
+    let (status, body) = send(
+        router(state.clone()),
+        "POST",
+        "/api/models/download",
+        Some(json!({ "repo_id": "owner/stub", "file_name": file_name })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "accepted");
+    assert_eq!(body["file_name"], file_name);
+
+    // Progress flows through the telemetry bus: running → complete.
+    let complete = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_running = false;
+        loop {
+            let event = receiver.recv().await.expect("telemetry bus open");
+            if let TelemetryEvent::ModelDownloadProgress { data, .. } = event {
+                match data.status {
+                    DownloadStatus::Running => saw_running = true,
+                    DownloadStatus::Complete => {
+                        assert!(saw_running, "complete must follow a running event");
+                        break data;
+                    }
+                    DownloadStatus::Error => panic!("download reported an error"),
+                }
+            }
+        }
+    })
+    .await
+    .expect("download completes");
+
+    assert_eq!(complete.file_name, file_name);
+    assert_eq!(complete.model_id, "tiny-model-q4_k_m");
+    assert!(complete.total_bytes > 0);
+    assert_eq!(complete.received_bytes, complete.total_bytes);
+
+    // The downloaded file is registered in the store for /v1/models.
+    let (status, models) = send(router(state.clone()), "GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "tiny-model-q4_k_m")
+        .expect("downloaded model listed");
+    assert_eq!(entry["meta"]["quantization"], "Q4_K_M");
+    assert_eq!(entry["meta"]["layers"], 16);
+
+    // The GGUF payload actually landed on disk.
+    let dest = state.models_dir.join(file_name);
+    assert!(dest.is_file(), "downloaded file exists");
+    let _ = std::fs::remove_file(dest);
+}
+
+/// Manual harness: serves the full API on 127.0.0.1:18081 until the process is
+/// killed. Run with `cargo test --test api pairing_manual_server -- --ignored`
+/// to exercise the pairing endpoints from a browser (Playwright).
+#[tokio::test]
+#[ignore = "manual harness: serves the API on 127.0.0.1:18081 until killed"]
+async fn pairing_manual_server() {
+    let addr: std::net::SocketAddr = "127.0.0.1:18081".parse().unwrap();
+    ai_upcycler_core::api::serve(addr, state())
+        .await
+        .expect("serve");
 }

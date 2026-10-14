@@ -126,12 +126,16 @@ data: [DONE]
     }
   ],
   "storage_mmap": {
-    "enabled": true,
-    "path": "E:\\AI Upcycler\\cache\\mmap_tier.bin",
+    "enabled": false,
+    "path": "",
     "mapped_layers_count": 0
+  },
+  "discovery": {
+    "mdns": "active"
   }
 }
 ```
+`discovery.mdns` is `"active"` when the mDNS browser daemon is running and `"unavailable"` when it failed to start (Wi-Fi discovery offline; USB/ADB workers unaffected).
 
 ### 3.2 Trigger Hardware Re-Benchmarking
 - **Endpoint**: `POST /api/cluster/benchmark`
@@ -145,6 +149,54 @@ data: [DONE]
 }
 ```
 
+### 3.3 Start a GGUF Model Download
+- **Endpoint**: `POST /api/models/download`
+- **Request**:
+```json
+{
+  "repo_id": "bartowski/Llama-3.1-8B-Instruct-GGUF",
+  "file_name": "llama-3.1-8b-instruct-q4_k_m.gguf"
+}
+```
+- **Response**: `202 Accepted` — the download runs in the background; progress is streamed as `model_download_progress` telemetry events (section 4) and the model is registered in `/v1/models` on completion.
+```json
+{
+  "status": "accepted",
+  "file_name": "llama-3.1-8b-instruct-q4_k_m.gguf"
+}
+```
+- **Errors**: `400` when `file_name` does not end with `.gguf`, contains path separators, or `repo_id` is not an `owner/name` Hugging Face repository; `409` when a download for the same file is already in flight.
+
+### 3.4 QR/PIN Worker Pairing (mTLS Enrollment)
+- **Endpoint**: `POST /api/pairing/session`
+- **Response**: `200 OK` — starts a single-use pairing session (5-minute TTL).
+```json
+{
+  "pin": "811896",
+  "qr_payload": "aiupcycler://pair?fp=d872…b4b8&token=811896",
+  "expires_in_secs": 300,
+  "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8"
+}
+```
+- **Endpoint**: `POST /api/pairing/enroll`
+- **Request**:
+```json
+{
+  "pin": "811896",
+  "device_name": "Pixel 8"
+}
+```
+- **Response**: `200 OK` — redeems the PIN and issues a worker client certificate signed by the master's ephemeral CA (PEMs; the worker presents the client cert on the mTLS gRPC channel and validates the server cert against `fingerprint`).
+```json
+{
+  "ca_pem": "-----BEGIN CERTIFICATE-----…",
+  "client_cert_pem": "-----BEGIN CERTIFICATE-----…",
+  "client_key_pem": "-----BEGIN PRIVATE KEY-----…",
+  "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8"
+}
+```
+- **Errors**: `400` when `device_name` is empty or longer than 64 characters; `403` when the PIN is wrong or expired; `409` when the PIN was already redeemed.
+
 ---
 
 ## 4. WebSocket Real-Time Telemetry API
@@ -154,6 +206,7 @@ data: [DONE]
   - `node_connected`: Broadcast when a new mobile device connects.
   - `node_disconnected`: Broadcast when a device loses connection.
   - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference.
+  - `model_download_progress`: Emits GGUF download progress (`running` / `complete` / `error`) with received and total bytes.
 
 ```json
 {
@@ -167,6 +220,20 @@ data: [DONE]
       {"id": "worker-android-01", "temp_celsius": 38.5, "battery_pct": 92.0},
       {"id": "worker-android-02", "temp_celsius": 41.2, "battery_pct": 84.0}
     ]
+  }
+}
+```
+
+```json
+{
+  "event": "model_download_progress",
+  "timestamp": 1743457100,
+  "data": {
+    "model_id": "llama-3.1-8b-instruct-q4_k_m",
+    "file_name": "llama-3.1-8b-instruct-q4_k_m.gguf",
+    "received_bytes": 536870912,
+    "total_bytes": 4928308224,
+    "status": "running"
   }
 }
 ```

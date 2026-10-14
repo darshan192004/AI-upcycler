@@ -10,6 +10,10 @@ pub enum ApiError {
     BadRequest(String),
     #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
     #[error("{0}")]
@@ -21,6 +25,8 @@ impl IntoResponse for ApiError {
         let status = match &self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Store(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(json!({
@@ -47,5 +53,11 @@ mod tests {
 
         let response = ApiError::BadRequest("nope".into()).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = ApiError::Conflict("busy".into()).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = ApiError::Forbidden("bad pin".into()).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

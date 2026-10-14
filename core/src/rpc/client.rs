@@ -48,7 +48,8 @@ pub fn build_execute_request(
 }
 
 impl WorkerRpcClient {
-    /// Connects to a worker at `http://<host>:<port>`.
+    /// Connects to a worker at `http://<host>:<port>` over plaintext
+    /// (loopback/ADB-tunneled transports only).
     pub async fn connect(addr: &str) -> Result<Self, String> {
         let endpoint = tonic::transport::Endpoint::new(addr.to_string())
             .map_err(|e| format!("invalid RPC endpoint '{addr}': {e}"))?
@@ -57,6 +58,39 @@ impl WorkerRpcClient {
         let inner = WorkerServiceClient::connect(endpoint)
             .await
             .map_err(|e| format!("failed to connect to worker at '{addr}': {e}"))?;
+        Ok(Self { inner })
+    }
+
+    /// Connects to a worker at `https://<host>:<port>` over mutual TLS.
+    ///
+    /// `ca_pem` anchors the worker's server certificate (the master validates
+    /// the worker's fingerprint out-of-band via the pairing QR payload);
+    /// `client_cert_pem`/`client_key_pem` are the credentials issued by
+    /// [`crate::api::pairing`] during PIN enrollment. `domain` must match a
+    /// SAN on the worker's server certificate (use `"localhost"` in tests).
+    pub async fn connect_tls(
+        addr: &str,
+        ca_pem: &str,
+        client_cert_pem: &str,
+        client_key_pem: &str,
+        domain: &str,
+    ) -> Result<Self, String> {
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(ca_pem))
+            .identity(tonic::transport::Identity::from_pem(
+                client_cert_pem,
+                client_key_pem,
+            ))
+            .domain_name(domain);
+        let endpoint = tonic::transport::Endpoint::new(addr.to_string())
+            .map_err(|e| format!("invalid RPC endpoint '{addr}': {e}"))?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .tls_config(tls)
+            .map_err(|e| format!("invalid TLS config for '{addr}': {e}"))?;
+        let inner = WorkerServiceClient::connect(endpoint)
+            .await
+            .map_err(|e| format!("failed to connect to worker at '{addr}' over mTLS: {e}"))?;
         Ok(Self { inner })
     }
 
