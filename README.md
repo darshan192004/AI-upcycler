@@ -104,6 +104,15 @@ pnpm install
 pnpm tauri dev
 ```
 
+### 3. Enable Real Inference (optional)
+
+Chat runs on a clearly-labelled stub backend until a llama.cpp engine is present. For real model output:
+
+1. Download a CPU build of [`llama.cpp`](https://github.com/ggml-org/llama.cpp/releases) (e.g. `llama-b*-bin-win-cpu-x64.zip`) and extract it so `llama-server[.exe]` sits in `<app-data>/engine/`, or set `AI_UPCYCLER_LLAMA_SERVER` to the binary path.
+2. Place a small GGUF such as [`qwen2.5-0.5b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) in `<app-data>/models/`, or set `AI_UPCYCLER_MODEL`.
+
+When both files exist, the desktop app spawns `llama-server` on a loopback port at the first chat request and streams real tokens through the OpenAI-compatible API. With either file missing, behaviour is unchanged (stub backend + warning log).
+
 ---
 
 ## 🤝 Contributing

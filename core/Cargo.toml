@@ -12,8 +12,8 @@ serde_json = "1.0"
 prost = "0.13"
 tonic = { version = "0.13", features = ["transport"] }
 mdns-sd = "0.11"
-tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 tracing = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -23,6 +23,7 @@ uuid = { version = "1.8", features = ["v4"] }
 futures = "0.3"
 async-stream = "0.3"
 memmap2 = "0.9"
+bytes = "1"
 
 [build-dependencies]
 tonic-build = "0.13"

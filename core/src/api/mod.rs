@@ -9,6 +9,7 @@ pub mod chat;
 pub mod cluster;
 pub mod downloads;
 mod error;
+pub mod llama;
 pub mod models;
 pub mod ws;
 
@@ -101,8 +102,11 @@ impl AppState {
         self
     }
 
-    /// Standard wiring for the desktop shell: real registry/store/telemetry and
-    /// the placeholder generation backend.
+    /// Standard wiring for the desktop shell: real registry/store/telemetry.
+    ///
+    /// Uses the real llama.cpp engine when [`llama::LlamaCppBackend::discover`]
+    /// finds a server binary + GGUF; otherwise falls back to the clearly
+    /// labelled [`StubBackend`] placeholder.
     pub fn bootstrap(
         cluster_id: String,
         registry: Arc<NodeRegistry>,
@@ -110,11 +114,27 @@ impl AppState {
         telemetry: TelemetryBus,
         models_dir: PathBuf,
     ) -> Self {
+        let backend: Arc<dyn GenerationBackend> =
+            match llama::LlamaCppBackend::discover(&models_dir) {
+                Some(engine) => {
+                    tracing::info!("generation backend: {}", engine.describe());
+                    Arc::new(engine)
+                }
+                None => {
+                    tracing::warn!(
+                        "llama.cpp engine not found (set AI_UPCYCLER_LLAMA_SERVER and \
+                         AI_UPCYCLER_MODEL, or place llama-server + {model} under the data \
+                         dir); chat will use the stub backend",
+                        model = llama::DEFAULT_MODEL_FILE,
+                    );
+                    Arc::new(StubBackend::new())
+                }
+            };
         Self::new(
             cluster_id,
             registry,
             store,
-            Arc::new(StubBackend::new()),
+            backend,
             telemetry,
             HostInfo::default(),
         )

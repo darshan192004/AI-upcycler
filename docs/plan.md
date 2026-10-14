@@ -125,7 +125,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | 5 | Release workflow (Windows/macOS/Linux installers on tag) | ✅ |
 | 5 | Android `.apk` release asset | ⬜ |
 
-**Completed: 14 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md). The remaining unbuilt rows need physical Android hardware, an Android SDK/NDK toolchain, and host `llama.cpp` RPC binaries; deliberately deferred work (mTLS/pairing, real inference/benchmark engines) is listed under *Known Gaps* there.
+**Completed: 14 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md). Host-side real inference (llama.cpp `llama-server` behind `GenerationBackend`) is live; the remaining unbuilt rows need physical Android hardware, an Android SDK/NDK toolchain, and host `llama.cpp` RPC bindings for the cluster split. Deliberately deferred work (mTLS/pairing, on-device benchmark probes) is listed under *Known Gaps* there.
 
 > Stubbed-but-wired: the chat path runs an end-to-end streaming/persistence/telemetry pipeline against a placeholder `StubBackend`, and `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker`. Both sit behind traits (`GenerationBackend`, `HardwareBenchmarker`) so the real engines drop in without API changes.
 
