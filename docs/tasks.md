@@ -15,7 +15,7 @@
 - [x] Implement mDNS Service Browser (`mdns-sd` crate) to discover mobile workers.
 - [x] Implement ADB USB Tunnel Manager to trigger `adb forward tcp:50052 tcp:50052`.
 - [x] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
-- [ ] Implement SSD `mmap` zero-copy weight pager for Windows/Linux file mapping.
+- [x] Implement SSD `mmap` zero-copy weight pager for Windows/Linux file mapping (`core::mmap::MmapPager`, memmap2-backed; consumed by the inference engine when it lands).
 - [x] Implement greedy dynamic programming layer scheduler.
 - [x] Implement embedded SQLite store (`rusqlite`) for nodes, models, benchmarks and chat history (`docs/database.md`).
 - [x] Implement OpenAI-compatible REST API (`axum`): `GET /v1/models` and `POST /v1/chat/completions` (buffered and SSE streaming).
@@ -52,5 +52,5 @@
 - [ ] The chat generation backend is a deterministic `StubBackend` (no inference engine loaded yet). Streaming, SQLite persistence and telemetry around it are real; swap in the real engine behind the `GenerationBackend` trait.
 - [ ] `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker` (values derived from the node id hash), not on-device probes. Do not schedule on these numbers yet.
 - [ ] The REST API binds to `127.0.0.1:8080` with permissive CORS for the local UI and has no authentication; acceptable under the local-only threat model, revisit if the bind address widens.
-- [ ] `storage_mmap` in the topology response reports `enabled: false` until the SSD mmap pager (section 3) lands.
+- [ ] `storage_mmap` in the topology response reports `enabled: false`: the `MmapPager` module exists but the serving path does not map files until the real inference engine is wired in.
 - [ ] Worker thermal/battery telemetry is emitted as `0.0` placeholders until the Android/iOS agents publish it (section 5).

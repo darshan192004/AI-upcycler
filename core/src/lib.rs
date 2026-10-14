@@ -1,6 +1,7 @@
 pub mod adb;
 pub mod api;
 pub mod discovery;
+pub mod mmap;
 pub mod rpc;
 pub mod scheduler;
 pub mod store;
