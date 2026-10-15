@@ -1,51 +1,67 @@
 package org.aiupcycler.worker
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
-import java.util.concurrent.Executors
+import org.aiupcycler.worker.identity.WorkerIdentity
 
 /**
- * Minimal control surface: shows the worker's identity and starts the runtime.
+ * Minimal control surface: shows the worker's identity and starts/stops the
+ * foreground service that actually owns the runtime.
  *
- * A foreground service (so the worker survives the UI being backgrounded) is a
- * follow-up slice; today the runtime lives for the lifetime of this activity.
+ * The service — not this activity — owns the gRPC server and mDNS advert, so
+ * closing the UI no longer takes the worker out of the cluster.
  */
 class MainActivity : Activity() {
-    private lateinit var runtime: WorkerRuntime
-    private val executor = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        runtime = WorkerRuntime(applicationContext)
+        requestNotificationPermissionIfNeeded()
 
+        val identity = WorkerIdentity.from(applicationContext)
         val status = TextView(this).apply {
-            text = "Starting worker…"
+            text = getString(
+                R.string.status_running,
+                identity.workerId,
+                identity.deviceName,
+            )
             textSize = 16f
-            setPadding(48, 96, 48, 48)
         }
-        setContentView(status)
-
-        executor.execute {
-            val result = runCatching { runtime.start() }
-            runOnUiThread {
-                status.text = result.fold(
-                    onSuccess = {
-                        "AI Upcycler worker running\n\n" +
-                            "id:    ${runtime.workerId}\n" +
-                            "name:  ${runtime.deviceName}\n" +
-                            "gRPC:  0.0.0.0:${runtime.port}\n" +
-                            "mDNS:  _aiupcycler-worker._tcp"
-                    },
-                    onFailure = { "Worker failed to start: ${it.message}" },
-                )
+        val stop = Button(this).apply {
+            text = getString(R.string.action_stop)
+            setOnClickListener {
+                WorkerForegroundService.stop(applicationContext)
+                finish()
             }
+        }
+        setContentView(
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(48, 96, 48, 48)
+                addView(status)
+                addView(stop)
+            },
+        )
+
+        WorkerForegroundService.start(applicationContext)
+    }
+
+    /** Notification is informational; the service still runs if this is denied. */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_REQUEST)
         }
     }
 
-    override fun onDestroy() {
-        executor.execute { runtime.stop() }
-        executor.shutdown()
-        super.onDestroy()
+    private companion object {
+        const val NOTIFICATION_REQUEST = 1
     }
 }
