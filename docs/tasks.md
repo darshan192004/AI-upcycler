@@ -45,7 +45,7 @@
 > ⛔ Blocked in this environment: requires a physical 8 GB host plus 2× Android worker devices.
 - [ ] Run 1000-token continuous inference test on pooled 8GB Laptop + 2x Android cluster.
 - [ ] Validate host system RAM safety buffer under heavy mmap page faulting.
-- [ ] Perform security penetration audit on mTLS inter-node transport.
+- [ ] Perform security penetration audit on mTLS inter-node transport — **master side audited**: found and fixed the certificate role-confusion (no `extendedKeyUsage`; a `serverAuth` certificate authenticated as a client). Added `ServerAuth`/`ClientAuth` EKU pinning in `NodeCa` plus adversarial tests (`server_cert_is_not_accepted_as_a_client_cert`, `client_rejects_server_cert_from_untrusted_ca`). Remaining: the transport itself is test-only until the worker's mTLS server exists (§5), so a full audit is hardware-gated.
 
 ## 7. Known Gaps (Deferred)
 - [ ] **mTLS 1.3 + QR/PIN pairing (`docs/security.md`) — master side is implemented** (`core/src/security.rs`: ephemeral CA, single-use 6-digit PIN sessions, `POST /api/pairing/session` + `/api/pairing/enroll`, `WorkerRpcClient::connect_tls`, mTLS handshake covered end-to-end in `core/tests/mtls.rs` against a CA-enforcing test server). The worker half (Android mTLS server, QR display, cert trust of the master fingerprint) is deferred to the hardware phase §5 — no Android device/toolchain is available to build or test it.
