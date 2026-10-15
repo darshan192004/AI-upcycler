@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.BatteryManager
 import java.io.File
+import org.aiupcycler.worker.rpc.DeviceMetricsSource
 
 /**
  * Reads the device telemetry the master uses for scheduling and health checks.
@@ -14,7 +15,7 @@ import java.io.File
  * privileged apps — when it is unavailable the metric reports `-1f` rather than
  * inventing a value.
  */
-class DeviceMetrics(private val context: Context) {
+class DeviceMetrics(private val context: Context) : DeviceMetricsSource {
 
     data class Snapshot(
         val totalRamBytes: Long,
@@ -23,7 +24,7 @@ class DeviceMetrics(private val context: Context) {
         val cpuTempCelsius: Float,
     )
 
-    fun snapshot(): Snapshot {
+    override fun snapshot(): Snapshot {
         val activityManager =
             context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memoryInfo = ActivityManager.MemoryInfo().also { activityManager.getMemoryInfo(it) }

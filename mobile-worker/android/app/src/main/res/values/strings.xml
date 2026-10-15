@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">AI Upcycler Worker</string>
+    <string name="notification_channel_name">Worker status</string>
+    <string name="notification_text">gRPC :%1$d · worker %2$s</string>
+    <string name="status_running">AI Upcycler worker running\n\nid:    %1$s\nname:  %2$s\ngRPC:  0.0.0.0:50052\nmDNS:  _aiupcycler-worker._tcp</string>
+    <string name="action_stop">Stop worker</string>
 </resources>

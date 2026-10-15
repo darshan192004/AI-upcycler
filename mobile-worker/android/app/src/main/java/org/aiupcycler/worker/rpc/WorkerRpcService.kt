@@ -6,22 +6,37 @@ import aiupcycler.rpc.ClusterRpc.HealthRequest
 import aiupcycler.rpc.ClusterRpc.HealthResponse
 import aiupcycler.rpc.WorkerServiceGrpc
 import io.grpc.stub.StreamObserver
-import org.aiupcycler.worker.identity.WorkerIdentity
 import org.aiupcycler.worker.metrics.DeviceMetrics
+
+/** Identity + capability fields the `Handshake` reply is built from. */
+interface WorkerIdentitySource {
+    val workerId: String
+    val deviceName: String
+    val hasNpuAcceleration: Boolean
+}
+
+/** Telemetry the `Handshake` and `GetHealthStatus` replies are built from. */
+interface DeviceMetricsSource {
+    fun snapshot(): DeviceMetrics.Snapshot
+}
 
 /**
  * Server implementation of `aiupcycler.rpc.WorkerService`.
  *
- * Slice 1 answers the two metadata RPCs the master needs to *discover and place*
- * this node — `Handshake` and `GetHealthStatus`. The compute RPCs
- * (`LoadLayers`, `ExecuteForward`, `UnloadLayers`) intentionally remain
- * unimplemented and surface `UNIMPLEMENTED` until the on-device inference engine
- * (llama.cpp RPC) is wired in, so the master never schedules work this node
- * cannot honour.
+ * The two metadata RPCs the master needs to *discover and place* this node —
+ * `Handshake` and `GetHealthStatus` — are answered from [identity]/[metrics].
+ * The compute RPCs (`LoadLayers`, `ExecuteForward`, `UnloadLayers`) intentionally
+ * remain unimplemented and surface `UNIMPLEMENTED` until the on-device inference
+ * engine (llama.cpp RPC) is wired in, so the master never schedules work this
+ * node cannot honour.
+ *
+ * Depending on the two small interfaces (rather than Android types) keeps this
+ * class runnable on the plain JVM, which is what the in-process contract test
+ * exercises.
  */
 class WorkerRpcService(
-    private val identity: WorkerIdentity,
-    private val metrics: DeviceMetrics,
+    private val identity: WorkerIdentitySource,
+    private val metrics: DeviceMetricsSource,
 ) : WorkerServiceGrpc.WorkerServiceImplBase() {
 
     override fun handshake(
