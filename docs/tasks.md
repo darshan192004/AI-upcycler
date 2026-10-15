@@ -35,8 +35,9 @@
 - [x] Create Android Kotlin worker app in `mobile-worker/android/` — Gradle project + gRPC `WorkerService` + `NsdManager` advert; builds a debug APK locally and in the `android-worker` CI job.
 - [x] Implement mDNS service registration (`_aiupcycler-worker._tcp` via `NsdManager`, publishing the TXT records the master parses) — implemented; needs a device to verify on-LAN.
 - [x] Implement battery and temperature telemetry monitor — `Handshake`/`GetHealthStatus` return real RAM/battery/thermal readings; needs a device to verify sysfs values.
+- [x] Verify the worker wire contract without a device — in-process gRPC test (`WorkerRpcContractTest`) runs the real `WorkerRpcService` through the generated stub, asserting the metadata replies and that the compute RPCs stay `UNIMPLEMENTED`.
 - [ ] Serve the compute RPCs: cross-compile native C++ `llama.cpp` RPC worker server for ARM64 (`libllama-rpc.so`) and implement `LoadLayers`/`ExecuteForward`/`UnloadLayers` (currently `UNIMPLEMENTED`).
-- [ ] Add a foreground service so the worker survives backgrounding (Android 13+ `POST_NOTIFICATIONS`).
+- [x] Add a foreground service so the worker survives backgrounding (Android 13+ `POST_NOTIFICATIONS`) — `WorkerForegroundService` (`foregroundServiceType="dataSync"`) owns the runtime so the gRPC server + mDNS advert outlive the UI; needs a device to verify survival across backgrounding.
 - [ ] Implement the worker half of mTLS/QR pairing (on-device mTLS server, QR display, trust of the master fingerprint).
 - [ ] Create iOS Swift agent in `mobile-worker/ios/`.
 

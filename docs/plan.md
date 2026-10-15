@@ -112,7 +112,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | 1 | Native `llama.cpp` RPC worker bindings (host) | ⬜ |
 | 2 | mDNS / DNS-SD discovery (`_aiupcycler-worker._tcp.local.`) | ✅ |
 | 2 | ADB USB port-forward bridge | ✅ |
-| 2 | Android Kotlin worker app (builds debug APK; discovery + metadata RPCs live) | 🟡 |
+| 2 | Android Kotlin worker app (builds debug APK; discovery + metadata RPCs live; foreground service; contract-tested) | 🟡 |
 | 3 | OpenAI-compatible REST API (`/v1/models`, `/v1/chat/completions` + SSE) | ✅ |
 | 3 | Cluster topology + benchmark endpoints | ✅ |
 | 3 | Telemetry WebSocket fan-out (`/api/telemetry`) | ✅ |
@@ -125,14 +125,14 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | 5 | Release workflow (Windows/macOS/Linux installers on tag) | ✅ |
 | 5 | Android `.apk` release asset | ⬜ |
 
-**Completed: 14 / 17 tracked items, 1 partial.** The Android worker app now builds a real debug APK (`mobile-worker/android/`, CI job `android-worker`) and serves the discovery + metadata RPCs (`Handshake`, `GetHealthStatus`); its compute RPCs remain `UNIMPLEMENTED`. Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md).
+**Completed: 14 / 17 tracked items, 1 partial.** The Android worker app now builds a real debug APK (`mobile-worker/android/`, CI job `android-worker`), serves the discovery + metadata RPCs (`Handshake`, `GetHealthStatus`) from a foreground service so it survives backgrounding, and has its wire contract covered by a device-free in-process gRPC test; its compute RPCs remain `UNIMPLEMENTED`. Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md).
 
 ### 5.1 Remaining work & blockers
 
 | Item | Blocked on |
 |------|------------|
 | Native `llama.cpp` RPC worker bindings (host) for the distributed cluster split | The worker agent's RPC server must exist to target |
-| Android worker compute engine: native `llama.cpp` RPC server for ARM64 + `LoadLayers`/`ExecuteForward`/`UnloadLayers` + foreground service | Needs the NDK toolchain and a physical device to verify |
+| Android worker compute engine: native `llama.cpp` RPC server for ARM64 + `LoadLayers`/`ExecuteForward`/`UnloadLayers` | Needs the NDK toolchain and a physical device to verify (foreground service landed) |
 | iOS Swift agent | Same — needs a macOS/Xcode toolchain |
 | mTLS worker half (Android mTLS server, QR display, fingerprint trust) | Needs the worker agent (master half is done and covered by `core/tests/mtls.rs`) |
 | `.apk` release asset | Needs the Android worker app + toolchain |
