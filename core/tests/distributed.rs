@@ -386,3 +386,58 @@ async fn refuses_a_plan_with_no_assignments() {
     let error = expect_load_error(LoadedPipeline::load("llama-3-8b", &[]).await);
     assert!(error.contains("no layer assignments"), "got: {error}");
 }
+
+#[tokio::test]
+async fn rejects_an_overlapping_plan_before_contacting_any_worker() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) = serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone())).await;
+    let (port_b, server_b) = serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone())).await;
+
+    // phone-a owns 0..3 and phone-b claims 2..7: layers 2 and 3 would be
+    // executed twice, so the split would produce wrong activations.
+    let plan = [
+        assignment("phone-a", port_a, 0, 3),
+        assignment("phone-b", port_b, 2, 7),
+    ];
+    let error = expect_load_error(LoadedPipeline::load("llama-3-8b", &plan).await);
+    assert!(error.contains("overlap"), "got: {error}");
+    assert!(
+        events(&log).is_empty(),
+        "an invalid plan must be rejected before any worker is dialed"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
+async fn rejects_a_plan_with_a_layer_gap_before_contacting_any_worker() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) = serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone())).await;
+    let (port_b, server_b) = serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone())).await;
+
+    // Layers 4 and 5 are owned by nobody: the pipeline would silently skip
+    // them and hand the next stage the wrong activation.
+    let plan = [
+        assignment("phone-a", port_a, 0, 3),
+        assignment("phone-b", port_b, 6, 9),
+    ];
+    let error = expect_load_error(LoadedPipeline::load("llama-3-8b", &plan).await);
+    assert!(error.contains("not assigned"), "got: {error}");
+    assert!(
+        events(&log).is_empty(),
+        "an invalid plan must be rejected before any worker is dialed"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
+async fn rejects_an_inverted_layer_range() {
+    // Port 1 is never bound, so reaching the network at all would surface as a
+    // connection error instead of the validation error asserted below.
+    let plan = [assignment("phone-a", 1, 5, 2)];
+    let error = expect_load_error(LoadedPipeline::load("llama-3-8b", &plan).await);
+    assert!(error.contains("inverted"), "got: {error}");
+}

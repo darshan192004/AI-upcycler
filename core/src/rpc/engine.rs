@@ -86,8 +86,10 @@ impl LoadedPipeline {
     /// with no stages would silently pass activations through unmodified.
     ///
     /// The driver — not the caller — owns activation order, so the assignments
-    /// are sorted by `start_layer` before anything is connected. An
-    /// out-of-order plan therefore cannot silently mis-route the split.
+    /// are sorted by `start_layer` before anything is connected. The plan is
+    /// then validated (see [`validate_plan`]) *before* any worker is dialed, so
+    /// an out-of-order, overlapping, gapped or inverted plan fails fast instead
+    /// of silently duplicating or skipping layers.
     pub async fn load(model_id: &str, assignments: &[LayerAssignment]) -> Result<Self, String> {
         if assignments.is_empty() {
             return Err("cannot load a pipeline with no layer assignments".into());
@@ -95,6 +97,7 @@ impl LoadedPipeline {
 
         let mut ordered: Vec<&LayerAssignment> = assignments.iter().collect();
         ordered.sort_by_key(|assignment| assignment.start_layer);
+        validate_plan(&ordered)?;
 
         let mut stages = Vec::with_capacity(ordered.len());
         for assignment in ordered {
@@ -165,6 +168,54 @@ impl LoadedPipeline {
     pub async fn unload(mut self) -> Result<(), String> {
         unload_all(&mut self.stages, &self.model_id).await
     }
+}
+
+/// Rejects a plan that cannot describe a sound layer split.
+///
+/// Expects `ordered` sorted by `start_layer` (as [`LoadedPipeline::load`]
+/// guarantees). Each range must be well-formed (`start <= end`) and each
+/// adjacent pair must tile exactly — no overlap (which would run a layer twice)
+/// and no gap (which would skip a layer). A single range is only checked for
+/// being well-formed, so a partial hand-off such as `8..15` is still allowed.
+fn validate_plan(ordered: &[&LayerAssignment]) -> Result<(), String> {
+    for assignment in ordered {
+        if assignment.start_layer > assignment.end_layer {
+            return Err(format!(
+                "inverted layer range {}..={} for worker {}",
+                assignment.start_layer, assignment.end_layer, assignment.node_id
+            ));
+        }
+    }
+
+    for pair in ordered.windows(2) {
+        let (previous, current) = (pair[0], pair[1]);
+        match previous.end_layer.checked_add(1) {
+            Some(expected) if current.start_layer == expected => {}
+            Some(expected) if current.start_layer > expected => {
+                return Err(format!(
+                    "layer(s) {expected}..={} are not assigned to any worker (between {} and {})",
+                    current.start_layer - 1,
+                    previous.node_id,
+                    current.node_id
+                ));
+            }
+            // `current.start_layer <= previous.end_layer`, or `previous.end_layer`
+            // is `usize::MAX` (so no range can start above it).
+            _ => {
+                return Err(format!(
+                    "overlap between {} layers {}..={} and {} layers {}..={}",
+                    previous.node_id,
+                    previous.start_layer,
+                    previous.end_layer,
+                    current.node_id,
+                    current.start_layer,
+                    current.end_layer
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn load_stage(model_id: &str, assignment: &LayerAssignment) -> Result<PipelineStage, String> {
