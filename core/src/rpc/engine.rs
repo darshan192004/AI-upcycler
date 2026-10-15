@@ -59,6 +59,46 @@ pub struct ExecutionResult {
     pub output_data_type: ActivationType,
 }
 
+/// TLS material the driver presents to, and requires from, one worker.
+pub struct WorkerTlsConfig {
+    /// PEM of the cluster CA that must have signed the worker's server
+    /// certificate — anchored by the out-of-band pairing fingerprint.
+    pub ca_pem: String,
+    /// PEM client certificate the master presents to the worker.
+    pub client_cert_pem: String,
+    /// PEM private key belonging to `client_cert_pem`.
+    pub client_key_pem: String,
+    /// Name the worker's server certificate must be valid for.
+    pub domain: String,
+}
+
+/// How the driver reaches one worker.
+pub enum WorkerTransport {
+    /// Mutual TLS, with the worker's certificate pinned to the cluster CA.
+    MutualTls(WorkerTlsConfig),
+    /// Unauthenticated plaintext; only acceptable on loopback or an ADB tunnel.
+    Plaintext,
+}
+
+/// Resolves the transport to use for each worker.
+///
+/// Implemented by the caller (backed by the pairing store) so the driver stays
+/// free of any particular credential store. Returning `Err` fails the load
+/// *before* any worker is dialed, so an unknown worker is never a downgrade to
+/// plaintext.
+pub trait WorkerTransportSource: Send + Sync {
+    fn transport_for(&self, node_id: &str) -> Result<WorkerTransport, String>;
+}
+
+/// The transport source behind [`LoadedPipeline::load`]: every worker plaintext.
+struct PlaintextTransports;
+
+impl WorkerTransportSource for PlaintextTransports {
+    fn transport_for(&self, _node_id: &str) -> Result<WorkerTransport, String> {
+        Ok(WorkerTransport::Plaintext)
+    }
+}
+
 /// One worker holding a layer range for the lifetime of a pipeline session.
 struct PipelineStage {
     assignment: LayerAssignment,
@@ -82,15 +122,44 @@ pub struct LoadedPipeline {
 }
 
 impl LoadedPipeline {
-    /// Loads `assignments` in layer order. Rejects an empty plan: a pipeline
-    /// with no stages would silently pass activations through unmodified.
+    /// Loads `assignments` in layer order over plaintext.
     ///
-    /// The driver — not the caller — owns activation order, so the assignments
-    /// are sorted by `start_layer` before anything is connected. The plan is
-    /// then validated (see [`validate_plan`]) *before* any worker is dialed, so
-    /// an out-of-order, overlapping, gapped or inverted plan fails fast instead
-    /// of silently duplicating or skipping layers.
+    /// Plaintext is only acceptable on a loopback or ADB-tunneled link; use
+    /// [`LoadedPipeline::load_secure`] to reach workers across the network.
+    ///
+    /// Rejects an empty plan: a pipeline with no stages would silently pass
+    /// activations through unmodified. The driver — not the caller — owns
+    /// activation order, so the assignments are sorted by `start_layer` before
+    /// anything is connected, and the plan is validated (see [`validate_plan`])
+    /// *before* any worker is dialed, so an out-of-order, overlapping, gapped or
+    /// inverted plan fails fast instead of silently duplicating or skipping
+    /// layers.
     pub async fn load(model_id: &str, assignments: &[LayerAssignment]) -> Result<Self, String> {
+        Self::load_with(model_id, assignments, &PlaintextTransports).await
+    }
+
+    /// Loads `assignments`, dialing each worker with the transport that
+    /// `transports` resolves for it.
+    ///
+    /// Every transport is resolved *before* the first dial, so an incomplete or
+    /// misconfigured credential store fails the load without contacting any
+    /// worker — the same fail-fast property the plan validation has. There is
+    /// deliberately no fallback path: a worker the source reports as
+    /// [`WorkerTransport::MutualTls`] is never reached over plaintext, and a
+    /// worker the source cannot resolve is an error rather than a downgrade.
+    pub async fn load_secure(
+        model_id: &str,
+        assignments: &[LayerAssignment],
+        transports: &dyn WorkerTransportSource,
+    ) -> Result<Self, String> {
+        Self::load_with(model_id, assignments, transports).await
+    }
+
+    async fn load_with(
+        model_id: &str,
+        assignments: &[LayerAssignment],
+        transports: &dyn WorkerTransportSource,
+    ) -> Result<Self, String> {
         if assignments.is_empty() {
             return Err("cannot load a pipeline with no layer assignments".into());
         }
@@ -99,9 +168,22 @@ impl LoadedPipeline {
         ordered.sort_by_key(|assignment| assignment.start_layer);
         validate_plan(&ordered)?;
 
-        let mut stages = Vec::with_capacity(ordered.len());
-        for assignment in ordered {
-            match load_stage(model_id, assignment).await {
+        let mut resolved = Vec::with_capacity(ordered.len());
+        for assignment in &ordered {
+            let transport = transports
+                .transport_for(&assignment.node_id)
+                .map_err(|error| {
+                    format!(
+                        "cannot load pipeline: worker {}: {error}",
+                        assignment.node_id
+                    )
+                })?;
+            resolved.push(((*assignment).clone(), transport));
+        }
+
+        let mut stages = Vec::with_capacity(resolved.len());
+        for (assignment, transport) in resolved {
+            match load_stage(model_id, &assignment, &transport).await {
                 Ok(stage) => stages.push(stage),
                 Err(error) => {
                     // Best-effort rollback so a failed load does not pin RAM on
@@ -234,9 +316,28 @@ fn validate_plan(ordered: &[&LayerAssignment]) -> Result<(), String> {
     Ok(())
 }
 
-async fn load_stage(model_id: &str, assignment: &LayerAssignment) -> Result<PipelineStage, String> {
-    let endpoint = http_endpoint(&assignment.ip_address, assignment.port);
-    let mut client = WorkerRpcClient::connect(&endpoint).await?;
+async fn load_stage(
+    model_id: &str,
+    assignment: &LayerAssignment,
+    transport: &WorkerTransport,
+) -> Result<PipelineStage, String> {
+    let mut client = match transport {
+        WorkerTransport::MutualTls(config) => {
+            let endpoint = https_endpoint(&assignment.ip_address, assignment.port);
+            WorkerRpcClient::connect_tls(
+                &endpoint,
+                &config.ca_pem,
+                &config.client_cert_pem,
+                &config.client_key_pem,
+                &config.domain,
+            )
+            .await?
+        }
+        WorkerTransport::Plaintext => {
+            let endpoint = http_endpoint(&assignment.ip_address, assignment.port);
+            WorkerRpcClient::connect(&endpoint).await?
+        }
+    };
     client.handshake(MASTER_ID, PROTOCOL_VERSION).await?;
     let response = client.load_layers(model_id, assignment).await?;
     if !response.success {
@@ -317,11 +418,20 @@ impl RpcPipelineEngine {
 /// Builds an `http://host:port` worker endpoint, bracketing IPv6 literals so
 /// they parse as a valid URI authority (e.g. `http://[fe80::1]:50052`).
 pub fn http_endpoint(ip_address: &str, port: u16) -> String {
+    endpoint(ip_address, port, "http")
+}
+
+/// Builds the `https://host:port` endpoint used by the mTLS transport.
+pub fn https_endpoint(ip_address: &str, port: u16) -> String {
+    endpoint(ip_address, port, "https")
+}
+
+fn endpoint(ip_address: &str, port: u16, scheme: &str) -> String {
     let host = ip_address.trim_start_matches('[').trim_end_matches(']');
     if host.contains(':') {
-        format!("http://[{host}]:{port}")
+        format!("{scheme}://[{host}]:{port}")
     } else {
-        format!("http://{host}:{port}")
+        format!("{scheme}://{host}:{port}")
     }
 }
 
@@ -346,6 +456,16 @@ mod tests {
     #[test]
     fn does_not_double_bracket_ipv6() {
         assert_eq!(http_endpoint("[::1]", 50052), "http://[::1]:50052");
+    }
+
+    #[test]
+    fn formats_https_endpoint_and_brackets_ipv6() {
+        assert_eq!(
+            https_endpoint("192.168.1.50", 50052),
+            "https://192.168.1.50:50052"
+        );
+        assert_eq!(https_endpoint("fe80::1", 50052), "https://[fe80::1]:50052");
+        assert_eq!(https_endpoint("[::1]", 50052), "https://[::1]:50052");
     }
 
     #[test]

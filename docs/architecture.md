@@ -152,8 +152,9 @@ The phases, precisely:
    **inclusive** of both `start_layer` and `end_layer`, and the scheduler reserves 20% of
    each node's free RAM as head-room before assigning weights.
 2. **Load** — `LoadedPipeline::load(model_id, &assignments)` sorts the assignments by
-   `start_layer` and validates the plan (§3.1.1), then for each stage in order: connect →
-   `Handshake` → `LoadLayers`. If a worker reports `success = false` the load aborts with
+   `start_layer` and validates the plan (§3.1.1), then for each stage in order: connect
+   (plaintext, or mTLS when the transport source says so) → `Handshake` → `LoadLayers`. If a
+   worker reports `success = false` the load aborts with
    that worker's `error_message`, and the stages already loaded are released via
    `UnloadLayers` so a partial load does not pin RAM on the cluster.
 3. **Forward** — `LoadedPipeline::forward(payload)` threads **one** activation through
@@ -236,11 +237,17 @@ contract it must satisfy:
 Limits the driver applies to every call: 5 s to establish the connection
 (`CONNECT_TIMEOUT`) and 30 s per RPC (`REQUEST_TIMEOUT`).
 
-> **Transport gap.** `LoadedPipeline` currently dials workers with the plaintext `connect`
-> (`http://<host>:<port>`), which is only acceptable on a loopback or ADB-tunneled link.
-> The mTLS client (`WorkerRpcClient::connect_tls`, certificate pinning in
-> `core/src/security.rs`, adversarial tests in `core/tests/mtls.rs`) exists but is **not yet
-> wired into the split driver** — that belongs to the mTLS worker half (§5.1 of the plan).
+> **Transport.** The driver dials each worker with the transport a `WorkerTransportSource`
+> resolves for it. `LoadedPipeline::load_secure` takes that source, so the caller — backed by
+> the pairing store — decides per worker; `LoadedPipeline::load` is the plaintext shorthand,
+> acceptable only on a loopback or ADB-tunneled link. A worker reported as
+> `WorkerTransport::MutualTls` is reached over mTLS with its server certificate **pinned to
+> the cluster CA** (`WorkerRpcClient::connect_tls`; pinning in `core/src/security.rs`,
+> adversarial TLS tests in `core/tests/mtls.rs`). There is deliberately **no fallback to
+> plaintext**, and every transport is resolved *before* the first dial, so a misconfigured or
+> incomplete credential store fails the load without contacting any worker. Still
+> hardware-gated: the worker-side mTLS server and a pairing-store-backed
+> `WorkerTransportSource` implementation (§5.1 of the plan).
 
 ---
 
