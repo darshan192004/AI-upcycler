@@ -181,3 +181,64 @@ async fn client_without_identity_is_rejected() {
 
     server.abort();
 }
+
+/// The CA signs both server and worker certificates, so without extended key
+/// usage they are interchangeable. A certificate issued for `serverAuth` must
+/// not authenticate a client: possessing the master's server identity must not
+/// grant cluster membership.
+#[tokio::test]
+async fn server_cert_is_not_accepted_as_a_client_cert() {
+    let ca = NodeCa::generate().expect("ca");
+    let (addr, server) = serve_test_worker(&ca).await;
+
+    let result = WorkerRpcClient::connect_tls(
+        &format!("https://localhost:{}", addr.port()),
+        &ca.ca_pem(),
+        ca.server_cert_pem(),
+        ca.server_key_pem(),
+        "localhost",
+    )
+    .await;
+    // TLS 1.3 defers the server's client-cert verdict past the client's
+    // Finished, so the rejection may surface on the first RPC instead of
+    // `connect`.
+    if let Ok(mut client) = result {
+        let handshake = client.handshake(MASTER_ID, PROTOCOL_VERSION).await;
+        assert!(
+            handshake.is_err(),
+            "server must reject a certificate without the clientAuth EKU, got: {handshake:?}"
+        );
+    }
+
+    server.abort();
+}
+
+/// The master anchors on the CA fingerprint delivered out-of-band (QR), so a
+/// server presenting a certificate from any other CA must not be trusted.
+#[tokio::test]
+async fn client_rejects_server_cert_from_untrusted_ca() {
+    let trusted_ca = NodeCa::generate().expect("trusted ca");
+    let impostor_ca = NodeCa::generate().expect("impostor ca");
+    let identity = trusted_ca.issue_client_cert("client").expect("client cert");
+
+    // Server speaks TLS with the impostor CA's identity.
+    let (addr, server) = serve_test_worker(&impostor_ca).await;
+
+    let result = WorkerRpcClient::connect_tls(
+        &format!("https://localhost:{}", addr.port()),
+        &trusted_ca.ca_pem(),
+        &identity.cert_pem,
+        &identity.key_pem,
+        "localhost",
+    )
+    .await;
+    if let Ok(mut client) = result {
+        let handshake = client.handshake(MASTER_ID, PROTOCOL_VERSION).await;
+        assert!(
+            handshake.is_err(),
+            "client must reject a server cert from an untrusted CA, got: {handshake:?}"
+        );
+    }
+
+    server.abort();
+}
