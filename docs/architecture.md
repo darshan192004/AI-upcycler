@@ -239,7 +239,7 @@ Limits the driver applies to every call: 5 s to establish the connection
 
 > **Transport.** The driver dials each worker with the transport a `WorkerTransportSource`
 > resolves for it. `LoadedPipeline::load_secure` takes that source, so the caller — backed by
-> the pairing store — decides per worker; `LoadedPipeline::load` is the plaintext shorthand,
+> the pairing store; `EnrolledWorkerSource` is the implementation today — decides per worker; `LoadedPipeline::load` is the plaintext shorthand,
 > acceptable only on a loopback or ADB-tunneled link. A worker reported as
 > `WorkerTransport::MutualTls` is reached over mTLS with its server certificate **pinned to
 > the cluster CA** (`WorkerRpcClient::connect_tls`; pinning in `core/src/security.rs`,
