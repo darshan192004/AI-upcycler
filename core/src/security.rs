@@ -9,7 +9,7 @@
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, SanType,
+    ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -61,6 +61,11 @@ impl NodeCa {
         let mut server_params = CertificateParams::default();
         // Server and worker certificates share one CA; pin the role so a
         // certificate issued for one direction cannot authenticate the other.
+        server_params.is_ca = IsCa::ExplicitNoCa;
+        server_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         server_params.subject_alt_names = vec![
             SanType::DnsName(Ia5String::try_from("localhost").map_err(cred_err)?),
@@ -100,6 +105,8 @@ impl NodeCa {
     /// Issues a worker client certificate signed by this CA.
     pub fn issue_client_cert(&self, device_name: &str) -> Result<ClientIdentity, PairingError> {
         let mut params = CertificateParams::default();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, device_name);
