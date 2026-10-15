@@ -53,8 +53,13 @@ class MdnsAdvertiser(
 
     fun stop() {
         val registered = listener ?: return
-        (context.getSystemService(Context.NSD_SERVICE) as NsdManager).unregisterService(registered)
         listener = null
+        val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+        // `unregisterService` throws IllegalArgumentException when the
+        // registration never completed (or already failed); swallow teardown
+        // races so destroying the activity can't crash the process.
+        runCatching { nsdManager.unregisterService(registered) }
+            .onFailure { Log.w(TAG, "mDNS: unregister failed: ${it.message}") }
     }
 
     private companion object {
