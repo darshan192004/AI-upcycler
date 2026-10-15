@@ -1,7 +1,8 @@
-use crate::rpc::engine::{ExecutionResult, TensorPayload};
+use crate::rpc::engine::{ActivationType, ExecutionResult, TensorPayload};
 use crate::rpc::proto::aiupcycler::rpc::{
     worker_service_client::WorkerServiceClient, ExecuteForwardRequest, HandshakeRequest,
-    HandshakeResponse, HealthRequest, HealthResponse, TensorBuffer,
+    HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse,
+    TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::scheduler::planner::LayerAssignment;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +45,18 @@ pub fn build_execute_request(
             raw_data: payload.data_bytes.clone(),
         }),
         sequence_position: payload.sequence_index as i32,
+    }
+}
+
+/// Maps a layer-range assignment onto the wire `LoadLayersRequest`. The weight
+/// bytes are resolved worker-side for now; `weights_chunk_data` stays empty
+/// until the GGUF slicer can push a contiguous chunk.
+pub fn build_load_request(model_id: &str, assignment: &LayerAssignment) -> LoadLayersRequest {
+    LoadLayersRequest {
+        model_id: model_id.to_string(),
+        start_layer: assignment.start_layer as i32,
+        end_layer: assignment.end_layer as i32,
+        weights_chunk_data: Vec::new(),
     }
 }
 
@@ -139,15 +152,56 @@ impl WorkerRpcClient {
             ));
         }
 
+        let output = response.output_activation_tensor.unwrap_or_default();
         Ok(ExecutionResult {
             session_id: payload.session_id.clone(),
             sequence_index: payload.sequence_index,
             execution_time_us: response.execution_time_us as u64,
-            output_bytes: response
-                .output_activation_tensor
-                .map(|t| t.raw_data)
-                .unwrap_or_default(),
+            output_bytes: output.raw_data,
+            // An absent/empty tensor means the worker echoed nothing useful;
+            // fall back to the request's shape and dtype rather than emit a
+            // zero-dimensional tensor.
+            output_shape: if output.shape.is_empty() {
+                payload.shape.clone()
+            } else {
+                output.shape
+            },
+            output_data_type: ActivationType::from_proto_value(output.data_type)
+                .unwrap_or(payload.data_type),
         })
+    }
+
+    /// Instructs the worker to load the layer range owned by `assignment` for
+    /// `model_id`. Returns the raw response so callers can read the allocated
+    /// RAM figure or a rejection message.
+    pub async fn load_layers(
+        &mut self,
+        model_id: &str,
+        assignment: &LayerAssignment,
+    ) -> Result<LoadLayersResponse, String> {
+        let request = build_load_request(model_id, assignment);
+        info!(
+            "RPC client: load_layers model {} layers {}..={}",
+            model_id, request.start_layer, request.end_layer
+        );
+        self.inner
+            .load_layers(request)
+            .await
+            .map_err(|e| format!("load_layers failed: {e}"))
+            .map(|r| r.into_inner())
+    }
+
+    /// Releases the worker's copy of `model_id`, freeing the RAM it held.
+    pub async fn unload_layers(&mut self, model_id: &str) -> Result<UnloadLayersResponse, String> {
+        let request = UnloadLayersRequest {
+            model_id: model_id.to_string(),
+        };
+        info!("RPC client: unload_layers model {model_id}");
+        self.inner
+            .unload_layers(request)
+            .await
+            .map_err(|e| format!("unload_layers failed: {e}"))
+            .map(|r| r.into_inner())
     }
 
     /// Polls the worker's battery/thermal/RAM health snapshot.
@@ -233,5 +287,17 @@ mod tests {
         let req = build_execute_request(&a, &sample_payload());
         assert_eq!(req.start_layer, 0);
         assert_eq!(req.end_layer, 11);
+    }
+
+    #[test]
+    fn maps_assignment_to_load_request() {
+        let req = build_load_request("llama-3-8b", &sample_assignment());
+        assert_eq!(req.model_id, "llama-3-8b");
+        assert_eq!(req.start_layer, 8);
+        assert_eq!(req.end_layer, 15);
+        assert!(
+            req.weights_chunk_data.is_empty(),
+            "weights are resolved worker-side until the GGUF slicer pushes chunks"
+        );
     }
 }
