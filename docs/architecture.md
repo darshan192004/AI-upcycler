@@ -84,7 +84,7 @@ sequenceDiagram
         Master->>Master: Compute Embeddings & Layers 0..15 Activations
     end
 
-    Master->>Worker: RPC ExecuteLayers(Layers 16..31, ActivationTensor)
+    Master->>Worker: RPC ExecuteForward(Layers 16..31, ActivationTensor)
     
     rect rgb(255, 240, 245)
         note over Worker: Layer 16 -> Layer 31 (Worker Phone RAM)
@@ -98,6 +98,149 @@ sequenceDiagram
     
     Master->>Master: Append Token to KV-Cache & Repeat Loop
 ```
+
+### 3.1 Distributed Split Lifecycle: Load → Forward → Unload
+
+The diagram above traces a single *token*. A **session** loads the cluster once and then
+pushes many tokens through it. That is what `LoadedPipeline` (`core/src/rpc/engine.rs`)
+implements, and it is verified device-free against two in-process mock workers in
+`core/tests/distributed.rs` — each mock appends a unique tag byte to the activation it
+receives, so the resulting byte order is proof the stages ran in ascending layer order.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sched as LayerScheduler
+    participant Driver as LoadedPipeline (Master)
+    participant Wa as Worker A (layers 0..15)
+    participant Wb as Worker B (layers 16..31)
+
+    Sched->>Driver: PartitioningPlan (list of LayerAssignment)
+
+    rect rgb(240, 255, 240)
+        note over Driver: load() - sort by start_layer, then validate the plan
+        note over Driver: an unsound plan is rejected here, before any TCP connection
+        Driver->>Wa: Handshake(master_id, protocol_version, timestamp)
+        Wa-->>Driver: worker_id, free_ram_bytes, cpu_cores, has_npu_acceleration
+        Driver->>Wa: LoadLayers(model_id, 0..15)
+        Wa-->>Driver: success, allocated_ram_bytes
+        Driver->>Wb: Handshake(master_id, protocol_version, timestamp)
+        Wb-->>Driver: worker_id, free_ram_bytes, cpu_cores, has_npu_acceleration
+        Driver->>Wb: LoadLayers(model_id, 16..31)
+        Wb-->>Driver: success, allocated_ram_bytes
+        note over Driver: a failure here rolls back the stages already loaded
+    end
+
+    loop one activation per generated token
+        Driver->>Wa: ExecuteForward(session_id, 0..15, activation_tensor, sequence_position)
+        Wa-->>Driver: output_activation_tensor (shape, data_type, raw_data)
+        Driver->>Wb: ExecuteForward(session_id, 16..31, A output tensor)
+        Wb-->>Driver: output_activation_tensor
+        note over Driver: execution_time_us is summed across the stages
+    end
+
+    rect rgb(255, 245, 240)
+        note over Driver: unload() consumes the pipeline - use-after-unload is a compile error
+        Driver->>Wa: UnloadLayers(model_id)
+        Driver->>Wb: UnloadLayers(model_id)
+    end
+```
+
+The phases, precisely:
+
+1. **Plan** — `LayerScheduler::compute_plan` produces the `LayerAssignment`s. Ranges are
+   **inclusive** of both `start_layer` and `end_layer`, and the scheduler reserves 20% of
+   each node's free RAM as head-room before assigning weights.
+2. **Load** — `LoadedPipeline::load(model_id, &assignments)` sorts the assignments by
+   `start_layer` and validates the plan (§3.1.1), then for each stage in order: connect →
+   `Handshake` → `LoadLayers`. If a worker reports `success = false` the load aborts with
+   that worker's `error_message`, and the stages already loaded are released via
+   `UnloadLayers` so a partial load does not pin RAM on the cluster.
+3. **Forward** — `LoadedPipeline::forward(payload)` threads **one** activation through
+   every stage in ascending layer order via `ExecuteForward`, feeding each stage's output
+   tensor into the next (§3.1.2), and sums each stage's `execution_time_us`. A worker
+   returning `success = false` fails the whole forward.
+4. **Unload** — `LoadedPipeline::unload(self)` **consumes** the pipeline, so using it after
+   its workers have dropped the weights is a compile error. Every stage is released even if
+   an earlier release failed; the first error is returned after the loop.
+
+A session is deliberately distinct from `RpcPipelineEngine::dispatch_forward_step`, the
+connectionless one-shot used by the desktop debug command: that connects, handshakes and
+runs exactly one step, whereas `LoadedPipeline` keeps the workers loaded and connected
+across many forward passes.
+
+#### 3.1.1 Plan validity — the split contract
+
+`load` validates the plan **before dialing any worker**, so an unsound split fails fast
+(the tests assert the mock event log is still empty) instead of silently producing wrong
+activations. A plan is rejected when it is:
+
+| Rejected | Why it is unsound |
+|---|---|
+| empty | a pipeline with no stages would pass activations through unmodified |
+| inverted (`start > end`) | the range is meaningless |
+| not anchored at layer 0 | a plan partitions the model, so starting later silently skips the model head |
+| overlapping (`next.start <= prev.end`) | those layers would execute twice |
+| gapped (`next.start > prev.end + 1`) | those layers would be skipped |
+
+The **tail is deliberately not checked**: the driver is not told how many layers the model
+has, and `LayerScheduler::compute_plan` may legitimately return a plan that the available
+cluster is too small to finish — it always starts at layer 0, but may stop short of the
+last layer. `LoadedPipeline` is intentionally not `Debug`, so a load result cannot be
+`expect_err`ed into a panic on the error path.
+
+#### 3.1.2 Activation handoff
+
+One `TensorBuffer` threads through the stages: `shape`, `data_type` and `raw_data`. The
+driver carries each stage's **output** shape and dtype into the next stage rather than
+assuming they are unchanged, so a stage may legally reshape or requantise the tensor.
+
+Two fallbacks keep a silent worker from corrupting the pipeline: an empty output shape
+falls back to the request's shape, and an unknown `data_type` falls back to the request's
+dtype (`ActivationType`: `FP32 = 0`, `FP16 = 1`, `BF16 = 2`, matching
+`TensorBuffer.DataType`). Both fallbacks are only correct for a shape- and
+dtype-preserving stage, so a real engine must populate both fields rather than rely on
+them.
+
+#### 3.1.3 Wire contract
+
+`proto/cluster_rpc.proto` (`aiupcycler.rpc.WorkerService`) is canonical; the Android worker
+vendors a copy and its `checkProtoInSync` task fails the build on drift.
+
+| RPC | Kind | Master side | Worker side |
+|---|---|---|---|
+| `Handshake` | metadata | used by `load` | live |
+| `GetHealthStatus` | metadata | `WorkerRpcClient::health` | live |
+| `LoadLayers` | compute | used by `load` | `UNIMPLEMENTED` |
+| `ExecuteForward` | compute | used by `forward` | `UNIMPLEMENTED` |
+| `UnloadLayers` | compute | used by `unload` and load rollback | `UNIMPLEMENTED` |
+
+`LoadLayersRequest.weights_chunk_data` is left empty: weights are resolved worker-side for
+now, and pushing a contiguous GGUF chunk is future work.
+
+#### 3.1.4 What the worker engine must implement
+
+The master half is done and mock-verified, so the remaining half is the engine. This is the
+contract it must satisfy:
+
+- **`LoadLayers`** — retain the weights for `[start_layer, end_layer]` of `model_id` (both
+  bounds inclusive); return `success = false` with a human-readable `error_message` when it
+  cannot, e.g. insufficient free RAM; report `allocated_ram_bytes`.
+- **`ExecuteForward`** — run the owned range over the incoming activation and return the
+  output tensor with **shape and dtype populated** (§3.1.2); return `success = false` to
+  reject; report `execution_time_us`.
+- **`UnloadLayers`** — free the RAM held for `model_id` and report `freed_ram_bytes`. It
+  must tolerate being called for a model it never loaded: the driver unloads after a failed
+  forward, and after a partial load it rolls back only the stages that succeeded.
+
+Limits the driver applies to every call: 5 s to establish the connection
+(`CONNECT_TIMEOUT`) and 30 s per RPC (`REQUEST_TIMEOUT`).
+
+> **Transport gap.** `LoadedPipeline` currently dials workers with the plaintext `connect`
+> (`http://<host>:<port>`), which is only acceptable on a loopback or ADB-tunneled link.
+> The mTLS client (`WorkerRpcClient::connect_tls`, certificate pinning in
+> `core/src/security.rs`, adversarial tests in `core/tests/mtls.rs`) exists but is **not yet
+> wired into the split driver** — that belongs to the mTLS worker half (§5.1 of the plan).
 
 ---
 
