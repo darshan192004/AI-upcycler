@@ -68,8 +68,6 @@ pub struct WorkerTlsConfig {
     pub client_cert_pem: String,
     /// PEM private key belonging to `client_cert_pem`.
     pub client_key_pem: String,
-    /// Name the worker's server certificate must be valid for.
-    pub domain: String,
 }
 
 /// How the driver reaches one worker.
@@ -324,12 +322,15 @@ async fn load_stage(
     let mut client = match transport {
         WorkerTransport::MutualTls(config) => {
             let endpoint = https_endpoint(&assignment.ip_address, assignment.port);
+            // The certificate is verified against the address actually dialed,
+            // which is the only name the source cannot know: it resolves a
+            // transport from the node id alone.
             WorkerRpcClient::connect_tls(
                 &endpoint,
                 &config.ca_pem,
                 &config.client_cert_pem,
                 &config.client_key_pem,
-                &config.domain,
+                &assignment.ip_address,
             )
             .await?
         }

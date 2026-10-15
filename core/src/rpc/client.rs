@@ -78,9 +78,10 @@ impl WorkerRpcClient {
     ///
     /// `ca_pem` anchors the worker's server certificate (the master validates
     /// the worker's fingerprint out-of-band via the pairing QR payload);
-    /// `client_cert_pem`/`client_key_pem` are the credentials issued by
-    /// [`crate::api::pairing`] during PIN enrollment. `domain` must match a
-    /// SAN on the worker's server certificate (use `"localhost"` in tests).
+    /// `client_cert_pem`/`client_key_pem` are the master's client credentials.
+    /// `domain` must match a SAN on the worker's server certificate: the split
+    /// driver passes the address it dials (`LayerAssignment::ip_address`), which
+    /// is the SAN the worker was issued during pairing.
     pub async fn connect_tls(
         addr: &str,
         ca_pem: &str,

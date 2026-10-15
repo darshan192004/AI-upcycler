@@ -243,11 +243,14 @@ Limits the driver applies to every call: 5 s to establish the connection
 > acceptable only on a loopback or ADB-tunneled link. A worker reported as
 > `WorkerTransport::MutualTls` is reached over mTLS with its server certificate **pinned to
 > the cluster CA** (`WorkerRpcClient::connect_tls`; pinning in `core/src/security.rs`,
-> adversarial TLS tests in `core/tests/mtls.rs`). There is deliberately **no fallback to
-> plaintext**, and every transport is resolved *before* the first dial, so a misconfigured or
-> incomplete credential store fails the load without contacting any worker. Still
-> hardware-gated: the worker-side mTLS server and a pairing-store-backed
-> `WorkerTransportSource` implementation (§5.1 of the plan).
+> adversarial TLS tests in `core/tests/mtls.rs`). Certificate verification uses the address
+> actually dialed (`LayerAssignment::ip_address`), which is the SAN the worker was issued
+> during pairing — a `WorkerTransportSource` resolves from the node id alone and so cannot
+> know that name. There is deliberately **no fallback to plaintext**, and every transport is
+> resolved *before* the first dial, so a misconfigured or incomplete credential store fails
+> the load without contacting any worker. `EnrolledWorkerSource` is the production source: it
+> resolves a transport only for a worker that completed pairing, and errors otherwise. Still
+> hardware-gated: the worker-side mTLS server (§5.1 of the plan).
 
 ---
 
