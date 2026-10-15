@@ -231,4 +231,113 @@ mod tests {
         assert!(plan.assignments.is_empty());
         assert_eq!(plan.expected_tokens_per_second, 0.0);
     }
+
+    /// The 20% head-room the scheduler reserves for the OS/KV cache safety
+    /// buffer is a budget, not a suggestion: no assignment may exceed it. This
+    /// sweeps node capacity, layer size and activation working set rather than
+    /// asserting one hand-picked case, and reports the RAM figure must match
+    /// the owned range (the dashboard surfaces it).
+    #[test]
+    fn never_breaches_the_eighty_percent_head_room_budget() {
+        let free_ram_values = [0u64, 1, 1024, 1 << 20, 1 << 30, 8 << 30];
+        let layer_bytes = [1u64, 1024, 1 << 20, 128 << 20];
+        let activation_values = [0u64, 1 << 20, 300 << 20];
+
+        let mut plans_with_assignments = 0usize;
+        let mut plans_without_assignments = 0usize;
+
+        for &free_ram in &free_ram_values {
+            for &bytes_per_layer in &layer_bytes {
+                for &activation_bytes in &activation_values {
+                    for total_layers in [1usize, 7, 28] {
+                        let model = ModelSpec {
+                            model_id: "sweep".into(),
+                            total_layers,
+                            bytes_per_layer,
+                            activation_bytes,
+                            quantization: "int4".into(),
+                        };
+                        let nodes = vec![node("n1", free_ram), node("n2", free_ram)];
+                        let plan = LayerScheduler::compute_plan(&model, &nodes);
+                        let budget = free_ram * 4 / 5;
+
+                        if plan.assignments.is_empty() {
+                            plans_without_assignments += 1;
+                        } else {
+                            plans_with_assignments += 1;
+                        }
+
+                        for assignment in &plan.assignments {
+                            let owned_layers = assignment.end_layer - assignment.start_layer + 1;
+                            assert_eq!(
+                                assignment.total_ram_used_bytes,
+                                owned_layers as u64 * bytes_per_layer,
+                                "reported RAM must match the owned range: {assignment:?}"
+                            );
+                            assert!(
+                                assignment.total_ram_used_bytes <= budget,
+                                "free={free_ram} layer={bytes_per_layer} act={activation_bytes}: \
+                                 {} bytes exceeds the 80% budget of {budget}",
+                                assignment.total_ram_used_bytes
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Guard against a sweep that silently stopped exercising the logic.
+        assert!(
+            plans_with_assignments > 0,
+            "sweep was vacuous: no plan ever assigned a layer"
+        );
+        assert!(
+            plans_without_assignments > 0,
+            "sweep never exercised the zero-capacity path"
+        );
+    }
+
+    /// `LoadedPipeline` refuses any plan that is not anchored at layer 0 and
+    /// tiled without gaps or overlaps. That is only safe if the scheduler
+    /// always emits such a plan, so lock the producer side down too.
+    #[test]
+    fn plan_is_anchored_and_contiguous_for_the_split_driver() {
+        let free_ram_values = [0u64, 1024, 3 * 1024 * 1024, 1 << 30, 96 << 30];
+
+        for &free_ram in &free_ram_values {
+            let model = ModelSpec {
+                model_id: "split".into(),
+                total_layers: 32,
+                bytes_per_layer: 1024 * 1024,
+                activation_bytes: 4096,
+                quantization: "int4".into(),
+            };
+            let nodes = vec![
+                node("n1", free_ram),
+                node("n2", free_ram),
+                node("n3", free_ram),
+            ];
+            let plan = LayerScheduler::compute_plan(&model, &nodes);
+
+            if let Some(first) = plan.assignments.first() {
+                assert_eq!(
+                    first.start_layer, 0,
+                    "free={free_ram}: the plan must be anchored at layer 0"
+                );
+            }
+
+            let mut next_expected = 0usize;
+            for assignment in &plan.assignments {
+                assert_eq!(
+                    assignment.start_layer, next_expected,
+                    "free={free_ram}: ranges must tile without a gap or overlap: {assignment:?}"
+                );
+                assert!(assignment.end_layer >= assignment.start_layer);
+                next_expected = assignment.end_layer + 1;
+            }
+
+            assert_eq!(plan.total_layers_assigned, next_expected);
+            assert!(plan.total_layers_assigned <= model.total_layers);
+        }
+    }
 }
