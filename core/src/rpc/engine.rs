@@ -330,7 +330,7 @@ async fn load_stage(
                 &config.ca_pem,
                 &config.client_cert_pem,
                 &config.client_key_pem,
-                &assignment.ip_address,
+                host(&assignment.ip_address),
             )
             .await?
         }
@@ -427,8 +427,17 @@ pub fn https_endpoint(ip_address: &str, port: u16) -> String {
     endpoint(ip_address, port, "https")
 }
 
+/// The bare host of `ip_address`, without IPv6 brackets.
+///
+/// The URL builder and the TLS verifier must agree on this: one is compared
+/// against the URI authority, the other against a certificate SAN, and a
+/// bracketed literal like `[::1]` would match neither as written.
+pub fn host(ip_address: &str) -> &str {
+    ip_address.trim_start_matches('[').trim_end_matches(']')
+}
+
 fn endpoint(ip_address: &str, port: u16, scheme: &str) -> String {
-    let host = ip_address.trim_start_matches('[').trim_end_matches(']');
+    let host = host(ip_address);
     if host.contains(':') {
         format!("{scheme}://[{host}]:{port}")
     } else {
@@ -457,6 +466,29 @@ mod tests {
     #[test]
     fn does_not_double_bracket_ipv6() {
         assert_eq!(http_endpoint("[::1]", 50052), "http://[::1]:50052");
+    }
+
+    #[test]
+    fn tls_domain_is_the_bare_host_the_url_uses() {
+        // `connect_tls` verifies the certificate against this name, so it has to
+        // be the same host the URI authority carries: the bracketed spelling of
+        // an IPv6 literal matches no SAN. Both consumers share `host`, so a
+        // bracketed assignment cannot verify against `"[::1]"`.
+        for (address, expected) in [
+            ("192.168.1.50", "192.168.1.50"),
+            ("fe80::1", "fe80::1"),
+            ("[fe80::1]", "fe80::1"),
+            ("::1", "::1"),
+            ("[::1]", "::1"),
+        ] {
+            assert_eq!(host(address), expected, "for {address}");
+            // The URL brackets an IPv6 authority while the verifier sees the
+            // bare host, so both spell the same name.
+            let url = https_endpoint(address, 50052);
+            if expected.contains(':') {
+                assert!(url.contains(&format!("[{expected}]")), "for {address}");
+            }
+        }
     }
 
     #[test]

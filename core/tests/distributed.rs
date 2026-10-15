@@ -361,6 +361,36 @@ async fn loads_runs_and_unloads_over_mtls() {
     server_b.abort();
 }
 
+/// A worker address may be spelled with the brackets an IPv6 literal needs in a
+/// URL authority. The driver builds `https://[host]:port` from it and verifies
+/// the certificate against `host`, so both consumers must strip the brackets —
+/// otherwise the SAN check runs against a name the worker was never issued and
+/// a correctly-provisioned worker becomes undialable.
+#[tokio::test]
+async fn verifies_a_bracketed_address_against_its_unbracketed_san() {
+    let ca = NodeCa::generate().expect("ca");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port, server) =
+        serve_mock_tls(MockWorker::new("phone-a", 0xA1, 100, log.clone()), &ca).await;
+
+    // The certificate's SAN is the bare `127.0.0.1`.
+    let mut plan = [assignment("phone-a", port, 0, 3)];
+    plan[0].ip_address = "[127.0.0.1]".into();
+    let transports = EnrolledTransports::new(&ca, &["phone-a"]);
+
+    let mut pipeline = LoadedPipeline::load_secure("llama-3-8b", &plan, &transports)
+        .await
+        .expect("a bracketed address must verify against its unbracketed SAN");
+    let result = pipeline
+        .forward(sample_payload())
+        .await
+        .expect("forward over mTLS");
+    assert_eq!(result.output_bytes, vec![0x10, 0x20, 0xA1]);
+    pipeline.unload().await.expect("unload over mTLS");
+
+    server.abort();
+}
+
 /// The worker's certificate is pinned to the cluster CA from the out-of-band
 /// pairing payload, so a worker presenting a certificate from any other CA must
 /// be refused. Here the impostor happily accepts our client certificate (it is
