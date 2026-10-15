@@ -45,7 +45,7 @@
 ## 6. End-to-End Testing & Optimization
 > ⛔ Blocked in this environment: requires a physical 8 GB host plus 2× Android worker devices.
 - [ ] Run 1000-token continuous inference test on pooled 8GB Laptop + 2x Android cluster.
-- [ ] Validate host system RAM safety buffer under heavy mmap page faulting.
+- [ ] Validate host system RAM safety buffer under heavy mmap page faulting — **budgeting half covered device-free**: `never_breaches_the_eighty_percent_head_room_budget` sweeps node capacity × layer size × activation working set and asserts no assignment exceeds the 20% head-room (and that the reported RAM matches the owned range), while `plan_is_anchored_and_contiguous_for_the_split_driver` locks the plan shape the split driver requires. Both were mutation-checked. The page-faulting half still needs the physical 8 GB host.
 - [ ] Perform security penetration audit on mTLS inter-node transport — **master side audited**: found and fixed the certificate role-confusion (no `extendedKeyUsage`; a `serverAuth` certificate authenticated as a client). Added `ServerAuth`/`ClientAuth` EKU pinning in `NodeCa` plus adversarial tests (`server_cert_is_not_accepted_as_a_client_cert`, `client_rejects_server_cert_from_untrusted_ca`). Remaining: the transport itself is test-only until the worker's mTLS server exists (§5), so a full audit is hardware-gated.
 
 ## 7. Known Gaps (Deferred)
