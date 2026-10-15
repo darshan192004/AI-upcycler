@@ -15,7 +15,7 @@
 - [x] Implement mDNS Service Browser (`mdns-sd` crate) to discover mobile workers.
 - [x] Implement ADB USB Tunnel Manager to trigger `adb forward tcp:50052 tcp:50052`.
 - [x] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
-- [x] Implement SSD `mmap` zero-copy weight pager for Windows/Linux file mapping (`core::mmap::MmapPager`, memmap2-backed; consumed by the inference engine when it lands).
+- [x] Implement SSD `mmap` zero-copy weight pager for Windows/Linux file mapping (`core::mmap::MmapPager`, memmap2-backed, bounds-checked, unit-tested). Note: the host inference path shells out to `llama-server`, which maps the GGUF itself; `MmapPager` remains the tested primitive for the future in-process worker RPC path.
 - [x] Implement greedy dynamic programming layer scheduler.
 - [x] Implement embedded SQLite store (`rusqlite`) for nodes, models, benchmarks and chat history (`docs/database.md`).
 - [x] Implement OpenAI-compatible REST API (`axum`): `GET /v1/models` and `POST /v1/chat/completions` (buffered and SSE streaming).
@@ -31,6 +31,7 @@
 - [x] Build interactive local chat UI with streaming markdown renderer.
 
 ## 5. Mobile Worker Agent (Android & iOS)
+> ⛔ Blocked in this environment: no Android SDK/NDK or device (nor macOS/Xcode for iOS). These are the documented next hardware-phase tasks.
 - [ ] Create Android Kotlin worker app in `mobile-worker/android/`.
 - [ ] Cross-compile native C++ `llama.cpp` RPC worker server for ARM64 (`libllama-rpc.so`).
 - [ ] Implement mDNS service registration (`_aiupcycler-worker._tcp.local.`).
@@ -38,6 +39,7 @@
 - [ ] Create iOS Swift agent in `mobile-worker/ios/`.
 
 ## 6. End-to-End Testing & Optimization
+> ⛔ Blocked in this environment: requires a physical 8 GB host plus 2× Android worker devices.
 - [ ] Run 1000-token continuous inference test on pooled 8GB Laptop + 2x Android cluster.
 - [ ] Validate host system RAM safety buffer under heavy mmap page faulting.
 - [ ] Perform security penetration audit on mTLS inter-node transport.
@@ -52,5 +54,5 @@
 - [x] ~~The chat generation backend is a deterministic `StubBackend` (no inference engine loaded yet). Streaming, SQLite persistence and telemetry around it are real; swap in the real engine behind the `GenerationBackend` trait.~~ — fixed (host-only): bootstrap discovers llama.cpp (`AI_UPCYCLER_LLAMA_SERVER`/`AI_UPCYCLER_MODEL` or `engine/` + `models/qwen2.5-0.5b-instruct-q4_k_m.gguf` under the data dir), spawns `llama-server` lazily and proxies streaming chat; the stub remains the honest fallback when assets are missing. The distributed cluster RPC split across workers is still future work.
 - [ ] `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker` (values derived from the node id hash), not on-device probes. Do not schedule on these numbers yet.
 - [ ] The REST API binds to `127.0.0.1:8080` with permissive CORS for the local UI and has no authentication; acceptable under the local-only threat model, revisit if the bind address widens.
-- [ ] `storage_mmap` in the topology response reports `enabled: false`: the `MmapPager` module exists but the serving path does not map files until the real inference engine is wired in.
+- [ ] `storage_mmap` in the topology response reports `enabled: false`: the host inference path delegates weight loading to `llama-server` (which maps the GGUF itself), so `MmapPager` is a tested primitive that is not yet on our serving path. Revisit when the in-process worker RPC path consumes it.
 - [ ] Worker thermal/battery telemetry is emitted as `0.0` placeholders until the Android/iOS agents publish it (section 5).

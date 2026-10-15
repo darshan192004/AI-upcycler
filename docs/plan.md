@@ -125,7 +125,19 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | 5 | Release workflow (Windows/macOS/Linux installers on tag) | ✅ |
 | 5 | Android `.apk` release asset | ⬜ |
 
-**Completed: 14 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md). Host-side real inference (llama.cpp `llama-server` behind `GenerationBackend`) is live; the remaining unbuilt rows need physical Android hardware, an Android SDK/NDK toolchain, and host `llama.cpp` RPC bindings for the cluster split. Deliberately deferred work (mTLS/pairing, on-device benchmark probes) is listed under *Known Gaps* there.
+**Completed: 14 / 17 tracked items.** Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md).
 
-> Stubbed-but-wired: the chat path runs an end-to-end streaming/persistence/telemetry pipeline against a placeholder `StubBackend`, and `POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker`. Both sit behind traits (`GenerationBackend`, `HardwareBenchmarker`) so the real engines drop in without API changes.
+### 5.1 Remaining work & blockers
+
+| Item | Blocked on |
+|------|------------|
+| Native `llama.cpp` RPC worker bindings (host) for the distributed cluster split | The worker agent's RPC server must exist to target |
+| Android Kotlin worker app (mDNS registration, battery/temperature telemetry) | No Android SDK/NDK or device in this environment |
+| iOS Swift agent | Same — needs a macOS/Xcode toolchain |
+| mTLS worker half (Android mTLS server, QR display, fingerprint trust) | Needs the worker agent (master half is done and covered by `core/tests/mtls.rs`) |
+| `.apk` release asset | Needs the Android worker app + toolchain |
+| On-device benchmark probes (replace `StubBenchmarker`) | Needs the worker agent to accept a probe |
+| §4.2 / §6 end-to-end hardware tests | Needs a physical 8 GB host + 2× Android cluster |
+
+> Stubbed-but-wired: the **host** chat path runs a real llama.cpp `llama-server` behind `GenerationBackend` (streaming, SQLite persistence and telemetry are all live), with the deterministic `StubBackend` as the honest fallback when no model/server is present. `POST /api/cluster/benchmark` still uses the deterministic `StubBenchmarker`. Both sit behind traits (`GenerationBackend`, `HardwareBenchmarker`) so the real engines drop in without API changes.
 
