@@ -84,13 +84,20 @@ pub struct LoadedPipeline {
 impl LoadedPipeline {
     /// Loads `assignments` in layer order. Rejects an empty plan: a pipeline
     /// with no stages would silently pass activations through unmodified.
+    ///
+    /// The driver — not the caller — owns activation order, so the assignments
+    /// are sorted by `start_layer` before anything is connected. An
+    /// out-of-order plan therefore cannot silently mis-route the split.
     pub async fn load(model_id: &str, assignments: &[LayerAssignment]) -> Result<Self, String> {
         if assignments.is_empty() {
             return Err("cannot load a pipeline with no layer assignments".into());
         }
 
-        let mut stages = Vec::with_capacity(assignments.len());
-        for assignment in assignments {
+        let mut ordered: Vec<&LayerAssignment> = assignments.iter().collect();
+        ordered.sort_by_key(|assignment| assignment.start_layer);
+
+        let mut stages = Vec::with_capacity(ordered.len());
+        for assignment in ordered {
             match load_stage(model_id, assignment).await {
                 Ok(stage) => stages.push(stage),
                 Err(error) => {

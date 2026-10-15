@@ -268,6 +268,48 @@ async fn loads_runs_and_unloads_in_layer_order_across_workers() {
 }
 
 #[tokio::test]
+async fn establishes_layer_order_from_an_out_of_order_plan() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) = serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone())).await;
+    let (port_b, server_b) = serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone())).await;
+
+    // phone-b's range (layers 4..7) is listed first, but the driver must still
+    // load and run phone-a (layers 0..3) ahead of it.
+    let plan = [
+        assignment("phone-b", port_b, 4, 7),
+        assignment("phone-a", port_a, 0, 3),
+    ];
+
+    let mut pipeline = LoadedPipeline::load("llama-3-8b", &plan)
+        .await
+        .expect("load pipeline");
+    let result = pipeline.forward(sample_payload()).await.expect("forward");
+    assert_eq!(
+        result.output_bytes,
+        vec![0x10, 0x20, 0xA1, 0xB2],
+        "phone-a's tag must precede phone-b's regardless of input order"
+    );
+    pipeline.unload().await.expect("unload");
+
+    let log = events(&log);
+    let handshake_a = log
+        .iter()
+        .position(|event| event == "handshake:phone-a")
+        .expect("phone-a handshake recorded");
+    let handshake_b = log
+        .iter()
+        .position(|event| event == "handshake:phone-b")
+        .expect("phone-b handshake recorded");
+    assert!(
+        handshake_a < handshake_b,
+        "stages must connect in ascending layer order, log: {log:?}"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
 async fn load_failure_on_a_later_stage_unloads_the_earlier_stages() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (port_a, server_a) = serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone())).await;
