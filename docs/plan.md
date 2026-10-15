@@ -125,14 +125,14 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | 5 | Release workflow (Windows/macOS/Linux installers on tag) | ✅ |
 | 5 | Android `.apk` release asset | ⬜ |
 
-**Completed: 14 / 17 tracked items, 1 partial.** The Android worker app now builds a real debug APK (`mobile-worker/android/`, CI job `android-worker`), serves the discovery + metadata RPCs (`Handshake`, `GetHealthStatus`) from a foreground service so it survives backgrounding, and has its wire contract covered by a device-free in-process gRPC test; its compute RPCs remain `UNIMPLEMENTED`. Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md).
+**Completed: 14 / 17 tracked items, 1 partial.** The Android worker app now builds a real debug APK (`mobile-worker/android/`, CI job `android-worker`), serves the discovery + metadata RPCs (`Handshake`, `GetHealthStatus`) from a foreground service so it survives backgrounding, and has its wire contract covered by a device-free in-process gRPC test; its compute RPCs remain `UNIMPLEMENTED`. The **host-side distributed split driver** now runs end-to-end: `LoadedPipeline` (`core/src/rpc/engine.rs`) connects and handshakes with each worker, issues `LoadLayers`, threads one activation through every stage in layer order via `ExecuteForward`, and releases the cluster with `UnloadLayers` — including load rollback on a partial failure. It is verified device-free against in-process mock workers in `core/tests/distributed.rs`. Detailed, continuously-updated tracking lives in [`tasks.md`](./tasks.md).
 
 ### 5.1 Remaining work & blockers
 
 | Item | Blocked on |
 |------|------------|
-| Native `llama.cpp` RPC worker bindings (host) for the distributed cluster split | The worker agent's RPC server must exist to target |
-| Android worker compute engine: native `llama.cpp` RPC server for ARM64 + `LoadLayers`/`ExecuteForward`/`UnloadLayers` | Needs the NDK toolchain and a physical device to verify (foreground service landed) |
+| Native `llama.cpp` RPC worker bindings (host) for the distributed cluster split | Master-side orchestration driver is done (`LoadedPipeline`, `core/tests/distributed.rs`); what remains is the engine it drives — real GGUF layer slicing/weight push and the worker-side `LoadLayers`/`ExecuteForward` implementation |
+| Android worker compute engine: native `llama.cpp` RPC server for ARM64 + `LoadLayers`/`ExecuteForward`/`UnloadLayers` | Needs the NDK toolchain and a physical device to verify (foreground service landed). The RPC contract and header/handshake path it must satisfy are now exercised by `core/tests/distributed.rs` |
 | iOS Swift agent | Same — needs a macOS/Xcode toolchain |
 | mTLS worker half (Android mTLS server, QR display, fingerprint trust) | Needs the worker agent (master half is done and covered by `core/tests/mtls.rs`) |
 | `.apk` release asset | Needs the Android worker app + toolchain |
