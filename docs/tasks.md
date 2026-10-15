@@ -31,11 +31,13 @@
 - [x] Build interactive local chat UI with streaming markdown renderer.
 
 ## 5. Mobile Worker Agent (Android & iOS)
-> ⛔ Blocked in this environment: no Android SDK/NDK or device (nor macOS/Xcode for iOS). These are the documented next hardware-phase tasks.
-- [ ] Create Android Kotlin worker app in `mobile-worker/android/`.
-- [ ] Cross-compile native C++ `llama.cpp` RPC worker server for ARM64 (`libllama-rpc.so`).
-- [ ] Implement mDNS service registration (`_aiupcycler-worker._tcp.local.`).
-- [ ] Implement battery and temperature telemetry monitor.
+> The Android worker app now builds toolchain-only (no device required). Running and verifying it on-LAN, the native compute engine, and the iOS agent still need hardware — see per-item notes.
+- [x] Create Android Kotlin worker app in `mobile-worker/android/` — Gradle project + gRPC `WorkerService` + `NsdManager` advert; builds a debug APK locally and in the `android-worker` CI job.
+- [x] Implement mDNS service registration (`_aiupcycler-worker._tcp` via `NsdManager`, publishing the TXT records the master parses) — implemented; needs a device to verify on-LAN.
+- [x] Implement battery and temperature telemetry monitor — `Handshake`/`GetHealthStatus` return real RAM/battery/thermal readings; needs a device to verify sysfs values.
+- [ ] Serve the compute RPCs: cross-compile native C++ `llama.cpp` RPC worker server for ARM64 (`libllama-rpc.so`) and implement `LoadLayers`/`ExecuteForward`/`UnloadLayers` (currently `UNIMPLEMENTED`).
+- [ ] Add a foreground service so the worker survives backgrounding (Android 13+ `POST_NOTIFICATIONS`).
+- [ ] Implement the worker half of mTLS/QR pairing (on-device mTLS server, QR display, trust of the master fingerprint).
 - [ ] Create iOS Swift agent in `mobile-worker/ios/`.
 
 ## 6. End-to-End Testing & Optimization
