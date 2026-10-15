@@ -92,4 +92,7 @@ dependencies {
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
 
     testImplementation("junit:junit:4.13.2")
+    // In-process gRPC transport (split out of grpc-core in 1.60) so the service
+    // can be exercised on the JVM without a device or a real socket.
+    testImplementation("io.grpc:grpc-inprocess:1.63.0")
 }

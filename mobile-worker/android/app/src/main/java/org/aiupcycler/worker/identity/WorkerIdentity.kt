@@ -3,6 +3,7 @@ package org.aiupcycler.worker.identity
 import android.content.Context
 import android.os.Build
 import java.util.UUID
+import org.aiupcycler.worker.rpc.WorkerIdentitySource
 
 /**
  * Stable identity for this device as a cluster worker.
@@ -12,10 +13,10 @@ import java.util.UUID
  * hardware model.
  */
 class WorkerIdentity private constructor(
-    val workerId: String,
-    val deviceName: String,
-    val hasNpuAcceleration: Boolean,
-) {
+    override val workerId: String,
+    override val deviceName: String,
+    override val hasNpuAcceleration: Boolean,
+) : WorkerIdentitySource {
     companion object {
         private const val PREFS = "ai-upcycler-worker"
         private const val KEY_WORKER_ID = "worker_id"

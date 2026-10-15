@@ -2,8 +2,6 @@ package org.aiupcycler.worker.rpc
 
 import io.grpc.Server
 import io.grpc.ServerBuilder
-import org.aiupcycler.worker.identity.WorkerIdentity
-import org.aiupcycler.worker.metrics.DeviceMetrics
 import java.util.concurrent.TimeUnit
 
 /**
@@ -13,8 +11,8 @@ import java.util.concurrent.TimeUnit
  * and USB (`adb forward`) reach the same socket.
  */
 class WorkerRpcServer(
-    private val identity: WorkerIdentity,
-    private val metrics: DeviceMetrics,
+    private val identity: WorkerIdentitySource,
+    private val metrics: DeviceMetricsSource,
     private val port: Int = WorkerProtocol.RPC_PORT,
 ) {
     private var server: Server? = null
