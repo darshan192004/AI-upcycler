@@ -36,6 +36,10 @@ sequenceDiagram
 
 **Implementation status (master side):** the ephemeral CA, 6-digit single-use PIN sessions, QR payload (`aiupcycler://pair?fp=…&token=…`), enrollment REST endpoints (`/api/pairing/session`, `/api/pairing/enroll` — `docs/api.md` §3.4), and the mTLS gRPC client (`WorkerRpcClient::connect_tls`) are implemented in `ai-upcycler-core` and covered by end-to-end handshake tests. The worker half (Android mTLS server, QR display UI, server-fingerprint validation on-device) awaits the §5 hardware phase.
 
+**Certificate role separation (audit, §6):** one CA signs both the master's server certificate and the worker client certificates, so without an `extendedKeyUsage` pin the two are interchangeable — a certificate issued for `serverAuth` was accepted as a *client* credential, letting the holder of the master's server identity join the cluster as a worker. `NodeCa` now pins `ServerAuth` on the server certificate and `ClientAuth` on issued client certificates, and `core/tests/mtls.rs` covers both directions (`server_cert_is_not_accepted_as_a_client_cert`, `client_rejects_server_cert_from_untrusted_ca`). Client certificates also carry no `subjectAltName`, so they cannot satisfy the hostname check the client enforces on a server certificate — a second, independent barrier.
+
+**Known, accepted gap:** `WorkerRpcClient::connect_tls` is currently exercised only by tests; the running master still dials workers over plaintext (`WorkerRpcClient::connect`, loopback/ADB only). mTLS must be the default once the worker's mTLS server exists (§5).
+
 ---
 
 ## 4. Mobile Agent Sandboxing & Permissions
