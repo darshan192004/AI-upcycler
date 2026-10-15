@@ -434,6 +434,29 @@ async fn rejects_a_plan_with_a_layer_gap_before_contacting_any_worker() {
 }
 
 #[tokio::test]
+async fn rejects_a_plan_that_does_not_start_at_layer_zero() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) = serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone())).await;
+    let (port_b, server_b) = serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone())).await;
+
+    // A plan partitions the model, so beginning at layer 4 would silently skip
+    // the model head — the same silent-wrong-output class as an internal gap.
+    let plan = [
+        assignment("phone-a", port_a, 4, 7),
+        assignment("phone-b", port_b, 8, 11),
+    ];
+    let error = expect_load_error(LoadedPipeline::load("llama-3-8b", &plan).await);
+    assert!(error.contains("layer 0"), "got: {error}");
+    assert!(
+        events(&log).is_empty(),
+        "an invalid plan must be rejected before any worker is dialed"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
 async fn rejects_an_inverted_layer_range() {
     // Port 1 is never bound, so reaching the network at all would surface as a
     // connection error instead of the validation error asserted below.

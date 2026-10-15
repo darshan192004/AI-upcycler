@@ -173,16 +173,32 @@ impl LoadedPipeline {
 /// Rejects a plan that cannot describe a sound layer split.
 ///
 /// Expects `ordered` sorted by `start_layer` (as [`LoadedPipeline::load`]
-/// guarantees). Each range must be well-formed (`start <= end`) and each
-/// adjacent pair must tile exactly — no overlap (which would run a layer twice)
-/// and no gap (which would skip a layer). A single range is only checked for
-/// being well-formed, so a partial hand-off such as `8..15` is still allowed.
+/// guarantees), then enforces three things:
+///
+/// * every range is well-formed (`start <= end`);
+/// * the plan is anchored at layer 0 — a plan is a partition of the model, so
+///   starting later would silently skip the model head;
+/// * adjacent ranges tile exactly — no overlap (a layer would run twice) and no
+///   gap (a layer would be skipped).
+///
+/// The *tail* is deliberately not checked: the driver is not told how many
+/// layers the model has, and `LayerScheduler::compute_plan` may legitimately
+/// return a plan the available cluster is too small to finish.
 fn validate_plan(ordered: &[&LayerAssignment]) -> Result<(), String> {
     for assignment in ordered {
         if assignment.start_layer > assignment.end_layer {
             return Err(format!(
                 "inverted layer range {}..={} for worker {}",
                 assignment.start_layer, assignment.end_layer, assignment.node_id
+            ));
+        }
+    }
+
+    if let Some(first) = ordered.first() {
+        if first.start_layer != 0 {
+            return Err(format!(
+                "plan must start at layer 0, but the lowest range starts at {} (worker {})",
+                first.start_layer, first.node_id
             ));
         }
     }
