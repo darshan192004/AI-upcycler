@@ -14,6 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+mod common;
+
+use ai_upcycler_core::rpc::engine::LoadedPipeline;
+use ai_upcycler_core::security::{EnrolledWorkerSource, ServerIdentity};
+use common::{assignment, events, sample_payload, serve_mock_identity, MockWorker};
+
 fn state() -> AppState {
     let store = Arc::new(Store::open_in_memory().expect("store"));
     store
@@ -241,7 +247,8 @@ async fn pairing_session_returns_pin_qr_and_fingerprint() {
 
 #[tokio::test]
 async fn enrolling_with_pin_issues_ca_signed_credentials() {
-    let app = router(state());
+    let state = state();
+    let app = router(state.clone());
     let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
     assert_eq!(status, StatusCode::OK);
     let pin = session["pin"].as_str().unwrap().to_string();
@@ -250,7 +257,12 @@ async fn enrolling_with_pin_issues_ca_signed_credentials() {
         app,
         "POST",
         "/api/pairing/enroll",
-        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+        Some(json!({
+            "pin": pin,
+            "device_name": "Pixel 8",
+            "node_id": "phone-a",
+            "addresses": ["192.168.1.50"],
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -266,9 +278,99 @@ async fn enrolling_with_pin_issues_ca_signed_credentials() {
         .as_str()
         .unwrap()
         .contains("PRIVATE KEY"));
+    // The worker's server identity: what the split driver dials it behind.
+    assert!(body["server_cert_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+    assert!(body["server_key_pem"]
+        .as_str()
+        .unwrap()
+        .contains("PRIVATE KEY"));
+    assert_ne!(
+        body["server_cert_pem"].as_str().unwrap(),
+        body["client_cert_pem"].as_str().unwrap(),
+        "role separation: the two directions must not share a certificate"
+    );
     assert_eq!(
         body["fingerprint"].as_str().unwrap(),
         session["fingerprint"].as_str().unwrap()
+    );
+
+    // The enrollment is recorded against the declared node id, carrying the
+    // declared addresses — that is exactly what the driver's lookup is keyed by.
+    let enrolled = state
+        .security
+        .enrollments
+        .get("phone-a")
+        .expect("enrollment recorded");
+    assert_eq!(enrolled.device_name, "Pixel 8");
+    assert_eq!(enrolled.addresses, vec!["192.168.1.50".to_string()]);
+    assert!(!state.security.enrollments.is_enrolled("phone-b"));
+}
+
+#[tokio::test]
+async fn enrolling_rejects_an_invalid_node_id_or_addresses() {
+    let state = state();
+    let app = router(state.clone());
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap().to_string();
+
+    let enroll =
+        |body: serde_json::Value| send(app.clone(), "POST", "/api/pairing/enroll", Some(body));
+
+    // Blank node_id: without it the master cannot know which worker this is.
+    let (status, _) = enroll(json!({
+        "pin": pin, "device_name": "Pixel 8", "node_id": "  "
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // An address that can be neither an IP literal nor a DNS name.
+    let (status, _) = enroll(json!({
+        "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a",
+        "addresses": ["not/valid"],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // An explicit empty list is rejected rather than silently defaulted.
+    let (status, _) = enroll(json!({
+        "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a",
+        "addresses": [],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // More addresses than the cap allows.
+    let many: Vec<String> = (0..9).map(|i| format!("10.0.0.{i}")).collect();
+    let (status, _) = enroll(json!({
+        "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a",
+        "addresses": many,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A rejected request must not have spent the single-use PIN, and an omitted
+    // address list falls back to the ADB-tunnel loopback pair.
+    let (status, _) = enroll(json!({
+        "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a"
+    }))
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rejected request must not burn the PIN"
+    );
+    assert_eq!(
+        state
+            .security
+            .enrollments
+            .get("phone-a")
+            .expect("enrolled")
+            .addresses,
+        vec!["127.0.0.1".to_string(), "localhost".to_string()]
     );
 }
 
@@ -285,7 +387,7 @@ async fn enrolling_rejects_wrong_reused_and_invalid_pins() {
         app.clone(),
         "POST",
         "/api/pairing/enroll",
-        Some(json!({ "pin": wrong, "device_name": "Pixel 8" })),
+        Some(json!({ "pin": wrong, "device_name": "Pixel 8", "node_id": "phone-a" })),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -295,7 +397,7 @@ async fn enrolling_rejects_wrong_reused_and_invalid_pins() {
         app.clone(),
         "POST",
         "/api/pairing/enroll",
-        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+        Some(json!({ "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -304,7 +406,7 @@ async fn enrolling_rejects_wrong_reused_and_invalid_pins() {
         app.clone(),
         "POST",
         "/api/pairing/enroll",
-        Some(json!({ "pin": pin, "device_name": "Pixel 8" })),
+        Some(json!({ "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a" })),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -416,4 +518,164 @@ async fn pairing_manual_server() {
     ai_upcycler_core::api::serve(addr, state())
         .await
         .expect("serve");
+}
+
+/// The full provisioning loop: a worker pairs over the real HTTP API, and the
+/// server certificate it is handed is the one the split driver dials it behind.
+///
+/// This is where the two halves meet — the endpoint issues and records the
+/// identity, `EnrolledWorkerSource` resolves it from the declared node id, and
+/// the driver completes an mTLS lifecycle using the PEM strings from the
+/// response body.
+#[tokio::test]
+async fn an_enrolled_worker_is_driven_over_the_certificate_pairing_issued() {
+    let state = state();
+    let app = router(state.clone());
+
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap().to_string();
+
+    let (status, enrolled) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({
+            "pin": pin,
+            "device_name": "Pixel 8",
+            "node_id": "phone-a",
+            "addresses": ["127.0.0.1"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The worker gets its *own* key pair. Handing out the master's server
+    // identity would leak the key the master serves its own API with.
+    assert_ne!(
+        enrolled["server_cert_pem"].as_str().unwrap(),
+        state.security.ca.server_cert_pem(),
+        "the master must never hand its own server identity to a worker"
+    );
+
+    // The worker serves gRPC behind exactly the identity it was handed, and
+    // trusts only the CA from that same response.
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = ServerIdentity {
+        cert_pem: enrolled["server_cert_pem"].as_str().unwrap().to_string(),
+        key_pem: enrolled["server_key_pem"].as_str().unwrap().to_string(),
+    };
+    let (port, handle) = serve_mock_identity(
+        MockWorker::new("phone-a", 0xA1, 100, log.clone()),
+        &server,
+        enrolled["ca_pem"].as_str().unwrap(),
+    )
+    .await;
+
+    let mut pipeline = LoadedPipeline::load_secure(
+        "llama-3-8b",
+        &[assignment("phone-a", port, 0, 3)],
+        &EnrolledWorkerSource::new(state.security.clone()),
+    )
+    .await
+    .expect("load over the paired certificate");
+    assert_eq!(pipeline.stage_count(), 1);
+
+    let result = pipeline.forward(sample_payload()).await.expect("forward");
+    assert_eq!(result.output_bytes, vec![0x10, 0x20, 0xA1]);
+    pipeline.unload().await.expect("unload pipeline");
+
+    assert_eq!(
+        events(&log),
+        vec![
+            "handshake:phone-a",
+            "load:phone-a:0..3",
+            "forward:phone-a",
+            "unload:phone-a:llama-3-8b",
+        ]
+    );
+
+    handle.abort();
+}
+
+/// A worker the master never paired is refused before the network is touched:
+/// port 1 is never bound, so a silent downgrade to plaintext would surface as a
+/// connection error instead of the enrollment error asserted here.
+#[tokio::test]
+async fn an_unpaired_worker_is_never_dialed() {
+    let state = state();
+    let error = match LoadedPipeline::load_secure(
+        "llama-3-8b",
+        &[assignment("phone-a", 1, 0, 3)],
+        &EnrolledWorkerSource::new(state.security.clone()),
+    )
+    .await
+    {
+        Ok(_) => panic!("an unpaired worker must not be reachable"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("no completed pairing enrollment"),
+        "got: {error}"
+    );
+}
+
+/// The declared addresses are what bind the certificate to a dial target: a
+/// worker that enrolled for some other address cannot be reached at this one.
+///
+/// Nothing else catches this — the load fails at the SAN check even though the
+/// transport is otherwise perfectly configured, which is the whole point of
+/// letting workers declare their addresses.
+#[tokio::test]
+async fn a_certificate_that_does_not_cover_the_dialed_address_is_refused() {
+    let state = state();
+    let app = router(state.clone());
+    let (_, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    let pin = session["pin"].as_str().unwrap().to_string();
+
+    let (status, enrolled) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({
+            "pin": pin, "device_name": "Pixel 8", "node_id": "phone-a",
+            // Not the loopback address the driver is about to dial.
+            "addresses": ["10.9.9.9"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = ServerIdentity {
+        cert_pem: enrolled["server_cert_pem"].as_str().unwrap().to_string(),
+        key_pem: enrolled["server_key_pem"].as_str().unwrap().to_string(),
+    };
+    let (port, handle) = serve_mock_identity(
+        MockWorker::new("phone-a", 0xA1, 100, log.clone()),
+        &server,
+        enrolled["ca_pem"].as_str().unwrap(),
+    )
+    .await;
+
+    let error = match LoadedPipeline::load_secure(
+        "llama-3-8b",
+        &[assignment("phone-a", port, 0, 3)],
+        &EnrolledWorkerSource::new(state.security.clone()),
+    )
+    .await
+    {
+        Ok(_) => panic!("a certificate issued for another address must not be accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        !error.contains("enrollment"),
+        "the enrollment lookup must have resolved; the refusal is the SAN check. got: {error}"
+    );
+    assert!(
+        events(&log).is_empty(),
+        "no RPC may complete against a worker whose certificate does not cover the dialed address"
+    );
+
+    handle.abort();
 }

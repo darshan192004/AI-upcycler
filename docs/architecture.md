@@ -239,15 +239,21 @@ Limits the driver applies to every call: 5 s to establish the connection
 
 > **Transport.** The driver dials each worker with the transport a `WorkerTransportSource`
 > resolves for it. `LoadedPipeline::load_secure` takes that source, so the caller — backed by
-> the pairing store — decides per worker; `LoadedPipeline::load` is the plaintext shorthand,
+> the pairing store; `EnrolledWorkerSource` is the implementation today — decides per worker; `LoadedPipeline::load` is the plaintext shorthand,
 > acceptable only on a loopback or ADB-tunneled link. A worker reported as
 > `WorkerTransport::MutualTls` is reached over mTLS with its server certificate **pinned to
 > the cluster CA** (`WorkerRpcClient::connect_tls`; pinning in `core/src/security.rs`,
-> adversarial TLS tests in `core/tests/mtls.rs`). There is deliberately **no fallback to
-> plaintext**, and every transport is resolved *before* the first dial, so a misconfigured or
-> incomplete credential store fails the load without contacting any worker. Still
-> hardware-gated: the worker-side mTLS server and a pairing-store-backed
-> `WorkerTransportSource` implementation (§5.1 of the plan).
+> adversarial TLS tests in `core/tests/mtls.rs`). Certificate verification uses the address
+> actually dialed (`LayerAssignment::ip_address`), which is the SAN the worker was issued
+> during pairing — a `WorkerTransportSource` resolves from the node id alone and so cannot
+> know that name. The address is normalized before it is used for either the URL or the
+> verification (an IPv6 literal's brackets are stripped, via `host`), so `[::1]` verifies
+> against the bare `::1` SAN rather than a name no worker was ever issued. There is
+> deliberately **no fallback to plaintext**, and every transport is
+> resolved *before* the first dial, so a misconfigured or incomplete credential store fails
+> the load without contacting any worker. `EnrolledWorkerSource` is the production source: it
+> resolves a transport only for a worker that completed pairing, and errors otherwise. Still
+> hardware-gated: the worker-side mTLS server (§5.1 of the plan).
 
 ---
 

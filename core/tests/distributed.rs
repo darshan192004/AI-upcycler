@@ -6,220 +6,16 @@
 //! unique tag byte to the activation it receives, so the final tensor proves
 //! the stages ran in layer order and that the handoff threaded through them.
 
+mod common;
+
 use ai_upcycler_core::rpc::engine::{
-    ActivationType, LoadedPipeline, TensorPayload, WorkerTlsConfig, WorkerTransport,
-    WorkerTransportSource,
+    ActivationType, LoadedPipeline, WorkerTlsConfig, WorkerTransport, WorkerTransportSource,
 };
-use ai_upcycler_core::rpc::proto::aiupcycler::rpc::worker_service_server::{
-    WorkerService, WorkerServiceServer,
-};
-use ai_upcycler_core::rpc::proto::aiupcycler::rpc::{
-    ExecuteForwardRequest, ExecuteForwardResponse, HandshakeRequest, HandshakeResponse,
-    HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse, TensorBuffer,
-    UnloadLayersRequest, UnloadLayersResponse,
-};
-use ai_upcycler_core::scheduler::planner::LayerAssignment;
 use ai_upcycler_core::security::{ClientIdentity, NodeCa};
+use common::{
+    assignment, events, expect_load_error, sample_payload, serve_mock, serve_mock_tls, MockWorker,
+};
 use std::sync::{Arc, Mutex};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
-
-/// Deterministic stand-in for the native worker engine.
-///
-/// * `handshake` reports a fixed identity.
-/// * `load_layers` records the range; `fail_load` makes it refuse.
-/// * `execute_forward` appends `tag` to the incoming activation and reports a
-///   fixed latency; `fail_forward` makes it reject.
-/// * `unload_layers` records the release.
-///
-/// Every call is appended to the shared `events` log so a test can assert the
-/// exact cross-worker order the driver produced.
-struct MockWorker {
-    node_id: String,
-    tag: u8,
-    execution_time_us: i64,
-    fail_load: bool,
-    fail_forward: bool,
-    events: Arc<Mutex<Vec<String>>>,
-}
-
-impl MockWorker {
-    fn new(
-        node_id: &str,
-        tag: u8,
-        execution_time_us: i64,
-        events: Arc<Mutex<Vec<String>>>,
-    ) -> Self {
-        Self {
-            node_id: node_id.into(),
-            tag,
-            execution_time_us,
-            fail_load: false,
-            fail_forward: false,
-            events,
-        }
-    }
-
-    fn refusing_load(mut self) -> Self {
-        self.fail_load = true;
-        self
-    }
-
-    fn refusing_forward(mut self) -> Self {
-        self.fail_forward = true;
-        self
-    }
-
-    fn record(&self, event: impl Into<String>) {
-        self.events.lock().expect("events lock").push(event.into());
-    }
-}
-
-#[tonic::async_trait]
-impl WorkerService for MockWorker {
-    async fn handshake(
-        &self,
-        _request: tonic::Request<HandshakeRequest>,
-    ) -> Result<tonic::Response<HandshakeResponse>, tonic::Status> {
-        self.record(format!("handshake:{}", self.node_id));
-        Ok(tonic::Response::new(HandshakeResponse {
-            worker_id: self.node_id.clone(),
-            device_name: format!("{} device", self.node_id),
-            total_ram_bytes: 1 << 30,
-            free_ram_bytes: 1 << 29,
-            cpu_cores: 4,
-            has_npu_acceleration: false,
-        }))
-    }
-
-    async fn load_layers(
-        &self,
-        request: tonic::Request<LoadLayersRequest>,
-    ) -> Result<tonic::Response<LoadLayersResponse>, tonic::Status> {
-        let request = request.into_inner();
-        self.record(format!(
-            "load:{}:{}..{}",
-            self.node_id, request.start_layer, request.end_layer
-        ));
-        if self.fail_load {
-            return Ok(tonic::Response::new(LoadLayersResponse {
-                success: false,
-                error_message: format!("{} has no free RAM", self.node_id),
-                allocated_ram_bytes: 0,
-            }));
-        }
-        Ok(tonic::Response::new(LoadLayersResponse {
-            success: true,
-            error_message: String::new(),
-            allocated_ram_bytes: 1 << 20,
-        }))
-    }
-
-    async fn execute_forward(
-        &self,
-        request: tonic::Request<ExecuteForwardRequest>,
-    ) -> Result<tonic::Response<ExecuteForwardResponse>, tonic::Status> {
-        let request = request.into_inner();
-        self.record(format!("forward:{}", self.node_id));
-        if self.fail_forward {
-            return Ok(tonic::Response::new(ExecuteForwardResponse {
-                success: false,
-                output_activation_tensor: None,
-                execution_time_us: 0,
-            }));
-        }
-
-        let tensor = request.activation_tensor.unwrap_or_default();
-        let mut raw_data = tensor.raw_data;
-        raw_data.push(self.tag);
-        Ok(tonic::Response::new(ExecuteForwardResponse {
-            success: true,
-            output_activation_tensor: Some(TensorBuffer {
-                shape: tensor.shape,
-                data_type: tensor.data_type,
-                raw_data,
-            }),
-            execution_time_us: self.execution_time_us,
-        }))
-    }
-
-    async fn unload_layers(
-        &self,
-        request: tonic::Request<UnloadLayersRequest>,
-    ) -> Result<tonic::Response<UnloadLayersResponse>, tonic::Status> {
-        let request = request.into_inner();
-        self.record(format!("unload:{}:{}", self.node_id, request.model_id));
-        Ok(tonic::Response::new(UnloadLayersResponse {
-            success: true,
-            error_message: String::new(),
-            freed_ram_bytes: 1 << 20,
-        }))
-    }
-
-    async fn get_health_status(
-        &self,
-        _request: tonic::Request<HealthRequest>,
-    ) -> Result<tonic::Response<HealthResponse>, tonic::Status> {
-        Ok(tonic::Response::new(HealthResponse {
-            battery_percentage: 80.0,
-            cpu_temp_celsius: 40.0,
-            free_ram_bytes: 1 << 29,
-        }))
-    }
-}
-
-/// Serves `worker` over plaintext gRPC on an ephemeral loopback port.
-async fn serve_mock(worker: MockWorker) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
-    let incoming = TcpListenerStream::new(listener);
-    let handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(WorkerServiceServer::new(worker))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock worker server");
-    });
-    (port, handle)
-}
-
-fn assignment(node_id: &str, port: u16, start_layer: usize, end_layer: usize) -> LayerAssignment {
-    LayerAssignment {
-        node_id: node_id.into(),
-        device_name: format!("{node_id} device"),
-        ip_address: "127.0.0.1".into(),
-        port,
-        start_layer,
-        end_layer,
-        total_ram_used_bytes: 1 << 28,
-        estimated_latency_ms: 1.0,
-    }
-}
-
-fn events(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
-    log.lock().expect("events lock").clone()
-}
-
-/// `LoadedPipeline` is deliberately not `Debug`, so `expect_err` cannot be used
-/// on a load result; unwrap the failure explicitly instead.
-fn expect_load_error(result: Result<LoadedPipeline, String>) -> String {
-    match result {
-        Ok(_) => panic!("expected the pipeline load to fail"),
-        Err(error) => error,
-    }
-}
-
-fn sample_payload() -> TensorPayload {
-    TensorPayload {
-        session_id: "session-1".into(),
-        sequence_index: 7,
-        shape: vec![1, 4, 4096],
-        data_bytes: vec![0x10, 0x20],
-        data_type: ActivationType::Fp16,
-    }
-}
 
 #[tokio::test]
 async fn loads_runs_and_unloads_in_layer_order_across_workers() {
@@ -473,34 +269,6 @@ async fn rejects_an_inverted_layer_range() {
 // mTLS transport
 // ---------------------------------------------------------------------------
 
-/// Serves `worker` behind mutual TLS: the server identity comes from `ca`, and
-/// `client_auth_optional(false)` makes a valid client certificate mandatory, so
-/// a completed `load_secure` is itself proof the driver presented one.
-async fn serve_mock_tls(worker: MockWorker, ca: &NodeCa) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
-    let tls = ServerTlsConfig::new()
-        .identity(Identity::from_pem(
-            ca.server_cert_pem(),
-            ca.server_key_pem(),
-        ))
-        .client_ca_root(Certificate::from_pem(ca.ca_pem()))
-        .client_auth_optional(false);
-    let incoming = TcpListenerStream::new(listener);
-    let handle = tokio::spawn(async move {
-        Server::builder()
-            .tls_config(tls)
-            .expect("server tls config")
-            .add_service(WorkerServiceServer::new(worker))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock tls worker server");
-    });
-    (port, handle)
-}
-
 /// Test double for the credential store. Only enrolled node ids resolve; any
 /// other worker is an error, so an incomplete store cannot silently reach a
 /// worker over plaintext.
@@ -540,7 +308,6 @@ impl WorkerTransportSource for EnrolledTransports {
             ca_pem: self.ca_pem.clone(),
             client_cert_pem: self.identity.cert_pem.clone(),
             client_key_pem: self.identity.key_pem.clone(),
-            domain: "localhost".into(),
         }))
     }
 }
@@ -592,6 +359,36 @@ async fn loads_runs_and_unloads_over_mtls() {
 
     server_a.abort();
     server_b.abort();
+}
+
+/// A worker address may be spelled with the brackets an IPv6 literal needs in a
+/// URL authority. The driver builds `https://[host]:port` from it and verifies
+/// the certificate against `host`, so both consumers must strip the brackets —
+/// otherwise the SAN check runs against a name the worker was never issued and
+/// a correctly-provisioned worker becomes undialable.
+#[tokio::test]
+async fn verifies_a_bracketed_address_against_its_unbracketed_san() {
+    let ca = NodeCa::generate().expect("ca");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port, server) =
+        serve_mock_tls(MockWorker::new("phone-a", 0xA1, 100, log.clone()), &ca).await;
+
+    // The certificate's SAN is the bare `127.0.0.1`.
+    let mut plan = [assignment("phone-a", port, 0, 3)];
+    plan[0].ip_address = "[127.0.0.1]".into();
+    let transports = EnrolledTransports::new(&ca, &["phone-a"]);
+
+    let mut pipeline = LoadedPipeline::load_secure("llama-3-8b", &plan, &transports)
+        .await
+        .expect("a bracketed address must verify against its unbracketed SAN");
+    let result = pipeline
+        .forward(sample_payload())
+        .await
+        .expect("forward over mTLS");
+    assert_eq!(result.output_bytes, vec![0x10, 0x20, 0xA1]);
+    pipeline.unload().await.expect("unload over mTLS");
+
+    server.abort();
 }
 
 /// The worker's certificate is pinned to the cluster CA from the out-of-band

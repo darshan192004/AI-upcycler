@@ -183,19 +183,43 @@ data: [DONE]
 ```json
 {
   "pin": "811896",
-  "device_name": "Pixel 8"
+  "device_name": "Pixel 8",
+  "node_id": "Pixel-8._aiupcycler-worker._tcp.local.",
+  "addresses": ["192.168.1.50", "127.0.0.1"]
 }
 ```
-- **Response**: `200 OK` — redeems the PIN and issues a worker client certificate signed by the master's ephemeral CA (PEMs; the worker presents the client cert on the mTLS gRPC channel and validates the server cert against `fingerprint`).
+  - `node_id` is the id the master dials this worker by (`DiscoveredNode::node_id`
+    for mDNS, `adb:<serial>` for USB). Required: enrollment is recorded against
+    it, and the split driver resolves a worker's transport by it, so defaulting
+    it would silently disagree with what discovery reports.
+  - `addresses` are the addresses the master will dial this worker at — they
+    become the issued server certificate's subject alternative names. Optional:
+    omitted, they default to `["127.0.0.1", "localhost"]` (the `adb reverse`
+    loopback tunnel). An explicitly empty list is a `400`, not a default.
+- **Response**: `200 OK` — redeems the PIN and issues the worker's two mTLS
+  identities, plus the CA to trust. Both are signed by the master's ephemeral CA
+  and pinned to one role (TLS certificates here are never dual-purpose):
+  - `server_cert_pem`/`server_key_pem` — **server** role. The worker serves
+    `WorkerService` behind this; the master validates it against `fingerprint`
+    on every dial, and its SANs are the `addresses` above.
+  - `client_cert_pem`/`client_key_pem` — **client** role, for worker→master links.
 ```json
 {
   "ca_pem": "-----BEGIN CERTIFICATE-----…",
   "client_cert_pem": "-----BEGIN CERTIFICATE-----…",
   "client_key_pem": "-----BEGIN PRIVATE KEY-----…",
+  "server_cert_pem": "-----BEGIN CERTIFICATE-----…",
+  "server_key_pem": "-----BEGIN PRIVATE KEY-----…",
   "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8"
 }
 ```
-- **Errors**: `400` when `device_name` is empty or longer than 64 characters; `403` when the PIN is wrong or expired; `409` when the PIN was already redeemed.
+  The enrollment is recorded in-memory against `node_id`; the master's CA is
+  ephemeral, so it is discarded on restart along with the certificates it signed.
+- **Errors**: `400` when `device_name` is empty or longer than 64 characters, when
+  `node_id` is empty or longer than 128 characters, or when an address is neither
+  an IP literal nor a DNS name (or more than 8 are given); `403` when the PIN is
+  wrong or expired; `409` when the PIN was already redeemed. A rejected request
+  does not consume the PIN.
 
 ---
 
