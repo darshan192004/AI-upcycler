@@ -9,8 +9,8 @@
 
 use crate::rpc::engine::{WorkerTlsConfig, WorkerTransport, WorkerTransportSource};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    string::Ia5String, BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -55,8 +55,9 @@ pub struct ServerIdentity {
 /// the master's two identities (gRPC server, outbound mTLS client) and each
 /// worker's pair (server for master→worker, client for worker→master).
 pub struct NodeCa {
-    ca_cert: Certificate,
-    ca_key: KeyPair,
+    /// The CA certificate bundled with its signing key (`rcgen` 0.14's
+    /// `CertifiedIssuer`); every issued cert is signed through it.
+    ca: CertifiedIssuer<'static, KeyPair>,
     fingerprint: String,
     server_cert_pem: String,
     server_key_pem: String,
@@ -71,19 +72,14 @@ impl NodeCa {
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_key = KeyPair::generate().map_err(cred_err)?;
-        let ca_cert = ca_params.self_signed(&ca_key).map_err(cred_err)?;
-        let fingerprint = hex(&Sha256::digest(ca_cert.der()));
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).map_err(cred_err)?;
+        let fingerprint = hex(&Sha256::digest(ca.der()));
 
-        let server = sign_server_cert(
-            &ca_cert,
-            &ca_key,
-            &["localhost".to_string(), "127.0.0.1".to_string()],
-        )?;
-        let client = sign_client_cert(&ca_cert, &ca_key, "master")?;
+        let server = sign_server_cert(&ca, &["localhost".to_string(), "127.0.0.1".to_string()])?;
+        let client = sign_client_cert(&ca, "master")?;
 
         Ok(Self {
-            ca_cert,
-            ca_key,
+            ca,
             fingerprint,
             server_cert_pem: server.cert_pem,
             server_key_pem: server.key_pem,
@@ -98,7 +94,7 @@ impl NodeCa {
     }
 
     pub fn ca_pem(&self) -> String {
-        self.ca_cert.pem()
+        self.ca.pem()
     }
 
     pub fn server_cert_pem(&self) -> &str {
@@ -130,13 +126,13 @@ impl NodeCa {
                 "a worker server certificate needs at least one address".into(),
             ));
         }
-        sign_server_cert(&self.ca_cert, &self.ca_key, addresses)
+        sign_server_cert(&self.ca, addresses)
     }
 
     /// Issues a worker client certificate signed by this CA (the worker→master
     /// direction).
     pub fn issue_client_cert(&self, device_name: &str) -> Result<ClientIdentity, PairingError> {
-        sign_client_cert(&self.ca_cert, &self.ca_key, device_name)
+        sign_client_cert(&self.ca, device_name)
     }
 }
 
@@ -145,8 +141,7 @@ impl NodeCa {
 /// Each address is a subject alternative name: an IP literal becomes an IP SAN,
 /// anything else has to be a well-formed DNS name.
 fn sign_server_cert(
-    ca_cert: &Certificate,
-    ca_key: &KeyPair,
+    ca: &CertifiedIssuer<'static, KeyPair>,
     addresses: &[String],
 ) -> Result<ServerIdentity, PairingError> {
     let mut params = CertificateParams::default();
@@ -161,7 +156,7 @@ fn sign_server_cert(
         .map(|address| san_type(address))
         .collect::<Result<Vec<_>, _>>()?;
     let key = KeyPair::generate().map_err(cred_err)?;
-    let cert = params.signed_by(&key, ca_cert, ca_key).map_err(cred_err)?;
+    let cert = params.signed_by(&key, ca).map_err(cred_err)?;
     Ok(ServerIdentity {
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
@@ -170,8 +165,7 @@ fn sign_server_cert(
 
 /// Signs a TLS **client** certificate (`ClientAuth`, non-CA) for `common_name`.
 fn sign_client_cert(
-    ca_cert: &Certificate,
-    ca_key: &KeyPair,
+    ca: &CertifiedIssuer<'static, KeyPair>,
     common_name: &str,
 ) -> Result<ClientIdentity, PairingError> {
     let mut params = CertificateParams::default();
@@ -182,7 +176,7 @@ fn sign_client_cert(
     dn.push(DnType::CommonName, common_name);
     params.distinguished_name = dn;
     let key = KeyPair::generate().map_err(cred_err)?;
-    let cert = params.signed_by(&key, ca_cert, ca_key).map_err(cred_err)?;
+    let cert = params.signed_by(&key, ca).map_err(cred_err)?;
     Ok(ClientIdentity {
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
