@@ -101,7 +101,7 @@ Boundaries: `gguf` knows bytes and metadata, `quant` knows bit layouts, `math` i
 Tensors (ggml dims: `dims[0] = n_in` contiguous, `dims[1] = n_out`; `y[o] = Σᵢ w[o·n_in + i]·x[i]`):
 `token_embd.weight` [64,256]; per layer `i`: `blk.{i}.{attn_norm,ffn_norm}.weight` [64], `blk.{i}.{attn_q_norm,attn_k_norm}.weight` [16], `blk.{i}.attn_q.weight` [64,64], `blk.{i}.attn_{k,v}.weight` [64,32], `blk.{i}.attn_output.weight` [64,64], `blk.{i}.ffn_{gate,up}.weight` [64,128], `blk.{i}.ffn_down.weight` [128,64]; `output_norm.weight` [64]; `output.weight` [64,256] only when `tied = false`. Tied config omits `output.weight` (this is the default-model shape — Review Focus 4).
 
-Weights: deterministic xorshift32 in `[-0.05, 0.05]` (same seed → byte-identical fixtures across runs; no `rand` dependency). Writer encodes GGUF v3: magic `GGUF`, version 3, n_tensors, n_kv, KV list (u64 len + key, u64 type + value), tensor infos (name, u32 n_dims, u64 dims[], u64 type, u64 offset), data section at 32-byte alignment.
+Weights: deterministic xorshift32 in `[-0.05, 0.05]` (same seed → byte-identical fixtures across runs; no `rand` dependency). Writer encodes GGUF v3: magic `GGUF`, version 3, n_tensors, n_kv, KV list (u64 len + key, u32 type + value — both type tags are 4-byte enums on disk, corrected after PR1 review against gguf.md and llama.cpp's reference reader — ), tensor infos (name, u32 n_dims, u64 dims[], u32 type — `ggml_type` is `uint32_t` per the official spec, corrected after PR1 review — , u64 offset), data section at 32-byte alignment.
 
 ---
 

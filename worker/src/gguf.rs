@@ -100,7 +100,9 @@ impl GgufFile {
 
         for _ in 0..n_kv {
             let key = r.string()?;
-            let ty = r.u64()?;
+            // value_type is an int32/uint32-wide enum on disk (gguf.md spec
+            // and llama.cpp's reference reader/writer both use 4 bytes).
+            let ty = r.u32()? as u64;
             let value = r.skip_value(ty)?;
             match key.as_str() {
                 "general.name" => model_name = Some(as_string(ty, &value, "general.name")?),
@@ -155,16 +157,16 @@ impl GgufFile {
             for _ in 0..n_dims {
                 ne.push(r.u64()?);
             }
-            let ggml_type = r.u64()?;
+            let ggml_type = r.u32()?;
             let offset = r.u64()?;
             if ne.is_empty() {
                 return Err(GgufError::Malformed("tensor with zero dimensions"));
             }
-            let nbytes = tensor_nbytes(ggml_type, &ne);
+            let nbytes = tensor_nbytes(ggml_type as u64, &ne);
             tensors.insert(
                 name,
                 TensorDesc {
-                    ggml_type: ggml_type as u32,
+                    ggml_type,
                     ne,
                     offset,
                     nbytes,
@@ -268,6 +270,9 @@ fn tensor_nbytes(ggml_type: u64, ne: &[u64]) -> Option<u64> {
 
 /// Blocks of `per_block` elements encode to `block_size` bytes each.
 fn block_bytes(elems: u64, per_block: u64, block_size: u64) -> Option<u64> {
+    if !elems.is_multiple_of(per_block) {
+        return None; // quantized dims must align with block boundaries
+    }
     elems.checked_div(per_block)?.checked_mul(block_size)
 }
 
@@ -318,8 +323,8 @@ impl Cursor<'_> {
             6 => Value::F32(f32::from_le_bytes(self.take(4)?.try_into().unwrap())),
             8 => Value::Str(self.string()?),
             9 => {
-                // array: element type, count, then values
-                let elem_ty = self.u64()?;
+                // array: element type (u32), count (u64), then values
+                let elem_ty = self.u32()? as u64;
                 let count = self.u64()?;
                 for _ in 0..count {
                     self.skip_value(elem_ty)?;
@@ -327,7 +332,7 @@ impl Cursor<'_> {
                 Value::U64(count)
             }
             10 | 11 => Value::U64(self.u64()?), // u64, i64
-            12 => Value::F32(self.u64()? as f64 as f32), // f64
+            12 => Value::F32(f64::from_bits(self.u64()?) as f32), // f64
             _ => return Err(GgufError::Malformed("unknown KV value type")),
         })
     }

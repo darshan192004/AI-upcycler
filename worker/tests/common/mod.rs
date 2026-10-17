@@ -160,7 +160,8 @@ pub fn write_tiny_model(dir: &Path, cfg: TinyModelConfig) -> Fixture {
         for dim in &t.ne {
             file.extend_from_slice(&dim.to_le_bytes());
         }
-        file.extend_from_slice(&tensor_type(&t.ne, &cfg).to_le_bytes());
+        // ggml_type is uint32_t in the GGUF tensor info header (spec).
+        file.extend_from_slice(&(tensor_type(&t.ne, &cfg) as u32).to_le_bytes());
         file.extend_from_slice(&offset.to_le_bytes());
     }
     while !file.len().is_multiple_of(ALIGNMENT) {
@@ -219,7 +220,7 @@ pub async fn serve_engine(
 // GGUF encoding internals
 // ---------------------------------------------------------------------------
 
-const GGUF_TYPE_U32: u64 = 4;
+const GGUF_TYPE_U32: u32 = 4;
 const GGML_TYPE_F32: u64 = 0;
 const GGML_TYPE_Q4_0: u64 = 2;
 const GGML_TYPE_Q5_0: u64 = 6;
@@ -257,7 +258,7 @@ fn build_kvs(cfg: &TinyModelConfig) -> Vec<Vec<u8>> {
 fn push_kv_str(out: &mut Vec<Vec<u8>>, key: &str, value: &str) {
     let mut entry = Vec::new();
     write_str(&mut entry, key);
-    entry.extend_from_slice(&8u64.to_le_bytes()); // GGUF_TYPE_STRING
+    entry.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING
     write_str(&mut entry, value);
     out.push(entry);
 }
@@ -273,7 +274,7 @@ fn push_kv_u32(out: &mut Vec<Vec<u8>>, key: &str, value: u32) {
 fn push_kv_f32(out: &mut Vec<Vec<u8>>, key: &str, value: f32) {
     let mut entry = Vec::new();
     write_str(&mut entry, key);
-    entry.extend_from_slice(&6u64.to_le_bytes()); // GGUF_TYPE_F32
+    entry.extend_from_slice(&6u32.to_le_bytes()); // GGUF_TYPE_F32
     entry.extend_from_slice(&value.to_le_bytes());
     out.push(entry);
 }
