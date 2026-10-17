@@ -69,8 +69,16 @@ const BLOCK_TENSORS_REQUIRED: [&str; 9] = [
 ];
 
 /// Optional per-block extras: qwen2 files have no QK-norm tensors, but
-/// files that ship them (Qwen3-style shapes) must be retained too.
-const BLOCK_TENSORS_OPTIONAL: [&str; 2] = ["attn_q_norm.weight", "attn_k_norm.weight"];
+/// files that ship them (Qwen3-style shapes) must be retained too. Attention
+/// QKV biases (`blk.*.attn_{q,k,v}.bias`) exist in Qwen 0.5B-class files and
+/// must be added to the projections.
+const BLOCK_TENSORS_OPTIONAL: [&str; 5] = [
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+    "attn_q.bias",
+    "attn_k.bias",
+    "attn_v.bias",
+];
 
 impl WorkerEngine {
     /// `device_name` empty resolves to the host name (or `"host"`). A model
@@ -121,6 +129,15 @@ fn put_block_back(tensors: &mut HashMap<String, Vec<f32>>, layer: u32, w: BlockW
     }
     if let Some(v) = w.k_norm {
         tensors.insert(name("attn_k_norm.weight"), v);
+    }
+    if let Some(v) = w.q_bias {
+        tensors.insert(name("attn_q.bias"), v);
+    }
+    if let Some(v) = w.k_bias {
+        tensors.insert(name("attn_k.bias"), v);
+    }
+    if let Some(v) = w.v_bias {
+        tensors.insert(name("attn_v.bias"), v);
     }
     tensors.insert(name("attn_q.weight"), w.attn_q);
     tensors.insert(name("attn_k.weight"), w.attn_k);

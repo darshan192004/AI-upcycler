@@ -39,6 +39,8 @@ pub struct TinyModelConfig {
     pub architecture: String,
     /// `None` omits the KV so the reader's default (10000.0) is exercised.
     pub rope_theta: Option<f32>,
+    /// Adds `blk.i.attn_{q,k,v}.bias` F32 tensors (Qwen 0.5B uses them).
+    pub qkv_bias: bool,
 }
 
 impl Default for TinyModelConfig {
@@ -50,6 +52,7 @@ impl Default for TinyModelConfig {
             model_name: "tiny-qwen2-f32".to_string(),
             architecture: "qwen2".to_string(),
             rope_theta: Some(ROPE_THETA),
+            qkv_bias: false,
         }
     }
 }
@@ -316,6 +319,11 @@ fn build_tensors(cfg: &TinyModelConfig, rng: &mut XorShift) -> Vec<TensorSpec> {
         tensors.push(tensor(&blk("attn_q.weight"), &[HIDDEN, HIDDEN], rng));
         tensors.push(tensor(&blk("attn_k.weight"), &[HIDDEN, kv_dim], rng));
         tensors.push(tensor(&blk("attn_v.weight"), &[HIDDEN, kv_dim], rng));
+        if cfg.qkv_bias {
+            tensors.push(tensor(&blk("attn_q.bias"), &[HIDDEN], rng));
+            tensors.push(tensor(&blk("attn_k.bias"), &[kv_dim], rng));
+            tensors.push(tensor(&blk("attn_v.bias"), &[kv_dim], rng));
+        }
         tensors.push(tensor(&blk("attn_output.weight"), &[HIDDEN, HIDDEN], rng));
         tensors.push(tensor(
             &blk("ffn_gate.weight"),

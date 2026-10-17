@@ -343,14 +343,14 @@ async fn untied_full_range_forward_uses_output_weight() {
 
 // ---- the math gate -----------------------------------------------------------
 
-#[tokio::test]
-async fn single_block_matches_f64_reference() {
+async fn assert_single_block_matches_f64(qkv_bias: bool) {
     let dir = tempfile::tempdir().unwrap();
     let fx = common::write_tiny_model(
         dir.path(),
         common::TinyModelConfig {
             n_layers: 1,
             tied: true,
+            qkv_bias,
             ..Default::default()
         },
     );
@@ -408,6 +408,34 @@ async fn single_block_matches_f64_reference() {
     let (wdown, _, _) = mat("blk.0.ffn_down.weight");
     let (out_norm, _, _) = mat("output_norm.weight");
 
+    // Attention QKV biases exist only in the biased fixture variant.
+    let bias1d = |name: &str| -> Option<Vec<f64>> {
+        match file.tensor(name) {
+            Some(desc) => {
+                assert_eq!(desc.ggml_type, 0, "fixture biases must be F32");
+                let v = f32_of(name);
+                eprintln!("ref sees {name}: n={:} first={:?}", v.len(), v.first());
+                Some(v)
+            }
+            None => {
+                eprintln!("ref sees {name}: ABSENT");
+                None
+            }
+        }
+    };
+    let (b_q, b_k, b_v) = (
+        bias1d("blk.0.attn_q.bias"),
+        bias1d("blk.0.attn_k.bias"),
+        bias1d("blk.0.attn_v.bias"),
+    );
+    let add_bias = |add: &Option<Vec<f64>>, out: &mut Vec<f64>| {
+        if let Some(b) = add {
+            for (o, b) in out.iter_mut().zip(b) {
+                *o += b;
+            }
+        }
+    };
+
     let ids: [usize; 2] = [1, 2];
     assert_eq!(vocab, common::VOCAB);
 
@@ -436,11 +464,14 @@ async fn single_block_matches_f64_reference() {
         let pos = t; // sequence_position = 0
         let mut x: Vec<f64> = (0..h).map(|i| token_embd[id * h + i]).collect();
 
-        // rms_norm(attn_norm) → q/k/v
+        // rms_norm(attn_norm) → q/k/v (+ attention bias when the fixture ships one)
         let xn = rms(&x, &attn_norm);
         let mut q = lin(&wq, h, &xn);
         let mut k = lin(&wk, h, &xn);
-        let v = lin(&wv, h, &xn);
+        let mut v = lin(&wv, h, &xn);
+        add_bias(&b_q, &mut q);
+        add_bias(&b_k, &mut k);
+        add_bias(&b_v, &mut v);
 
         // per-head q_norm/k_norm
         for g in 0..heads {
@@ -454,14 +485,16 @@ async fn single_block_matches_f64_reference() {
             k[s..e].copy_from_slice(&kh);
         }
 
-        // rope on q and k — per head slice (head_dim), not the whole row
+        // rope on q and k — per head slice (head_dim), llama.cpp's NeoX
+        // pairing: (j, j + head_dim/2), frequency index j
         let rope = |hc: &mut [f64]| {
-            for j in 0..hc.len() / 2 {
+            let half = hc.len() / 2;
+            for j in 0..half {
                 let angle = pos as f64 * theta.powf(-(2.0 * j as f64) / hc.len() as f64);
                 let (c, s) = (angle.cos(), angle.sin());
-                let (x0, x1) = (hc[2 * j], hc[2 * j + 1]);
-                hc[2 * j] = x0 * c - x1 * s;
-                hc[2 * j + 1] = x0 * s + x1 * c;
+                let (x0, x1) = (hc[j], hc[j + half]);
+                hc[j] = x0 * c - x1 * s;
+                hc[j + half] = x0 * s + x1 * c;
             }
         };
         for g in 0..heads {
@@ -538,4 +571,16 @@ async fn single_block_matches_f64_reference() {
         }
     }
     eprintln!("block-reference: max |logit| ≈ {max_logit:.4}, max f32−f64 Δ ≈ {max_delta:.2e}");
+}
+
+#[tokio::test]
+async fn single_block_matches_f64_reference() {
+    assert_single_block_matches_f64(false).await;
+}
+
+/// Qwen 0.5B-class files ship `blk.*.attn_{q,k,v}.bias`; the forward must add
+/// them to the projections or real-model condensing diverges from llama.cpp.
+#[tokio::test]
+async fn qkv_bias_block_matches_f64_reference() {
+    assert_single_block_matches_f64(true).await;
 }

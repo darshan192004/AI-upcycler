@@ -77,6 +77,10 @@ pub struct BlockWeights {
     pub attn_k: Vec<f32>,
     pub attn_v: Vec<f32>,
     pub attn_output: Vec<f32>,
+    /// Qwen 0.5B-class attention biases; added to the projections.
+    pub q_bias: Option<Vec<f32>>,
+    pub k_bias: Option<Vec<f32>>,
+    pub v_bias: Option<Vec<f32>>,
     pub ffn_gate: Vec<f32>,
     pub ffn_up: Vec<f32>,
     pub ffn_down: Vec<f32>,
@@ -109,6 +113,9 @@ impl BlockWeights {
             attn_output: tensors
                 .remove(&name("attn_output.weight"))
                 .expect("attn_output loaded"),
+            q_bias: tensors.remove(&name("attn_q.bias")),
+            k_bias: tensors.remove(&name("attn_k.bias")),
+            v_bias: tensors.remove(&name("attn_v.bias")),
             ffn_gate: tensors
                 .remove(&name("ffn_gate.weight"))
                 .expect("ffn_gate loaded"),
@@ -179,6 +186,21 @@ pub fn run_block(
         linear(&mut q_all[q..q + q_dim], &w.attn_q, hidden, &normed);
         linear(&mut k_all[ks..ks + kv_dim], &w.attn_k, hidden, &normed);
         linear(&mut v_all[vs..vs + kv_dim], &w.attn_v, hidden, &normed);
+        if let Some(b) = &w.q_bias {
+            for (o, &bq) in q_all[q..q + q_dim].iter_mut().zip(b) {
+                *o += bq;
+            }
+        }
+        if let Some(b) = &w.k_bias {
+            for (o, &bk) in k_all[ks..ks + kv_dim].iter_mut().zip(b) {
+                *o += bk;
+            }
+        }
+        if let Some(b) = &w.v_bias {
+            for (o, &bv) in v_all[vs..vs + kv_dim].iter_mut().zip(b) {
+                *o += bv;
+            }
+        }
 
         if let Some(qn) = &w.q_norm {
             for g in 0..heads {
