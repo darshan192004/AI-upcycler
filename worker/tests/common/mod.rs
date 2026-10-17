@@ -25,7 +25,9 @@ pub const ALIGNMENT: usize = 32;
 pub enum FixtureQuant {
     F32,
     Q4_0,
-    UnsupportedQ5_0,
+    /// Not in the worker's supported set (ids 0/1/2/6/8/12/14): quantizable
+    /// tensors get type id 7 (Q5_1) so load must refuse loudly.
+    UnsupportedQ5_1,
 }
 
 #[derive(Clone)]
@@ -216,6 +218,23 @@ pub async fn serve_engine(
     (port, handle)
 }
 
+/// Serves `fx`'s engine in-process and returns a connected client.
+pub async fn connect_engine(
+    fx: &Fixture,
+) -> ai_upcycler_worker::proto::aiupcycler::rpc::worker_service_client::WorkerServiceClient<
+    tonic::transport::Channel,
+> {
+    let engine =
+        ai_upcycler_worker::engine::WorkerEngine::new(&fx.model_id, "test-device", fx.path.clone())
+            .expect("engine parses fixture");
+    let (port, _server) = serve_engine(engine).await;
+    ai_upcycler_worker::proto::aiupcycler::rpc::worker_service_client::WorkerServiceClient::connect(
+        format!("http://127.0.0.1:{port}"),
+    )
+    .await
+    .expect("connect engine client")
+}
+
 // ---------------------------------------------------------------------------
 // GGUF encoding internals
 // ---------------------------------------------------------------------------
@@ -223,7 +242,7 @@ pub async fn serve_engine(
 const GGUF_TYPE_U32: u32 = 4;
 const GGML_TYPE_F32: u64 = 0;
 const GGML_TYPE_Q4_0: u64 = 2;
-const GGML_TYPE_Q5_0: u64 = 6;
+const GGML_TYPE_Q5_1: u64 = 7;
 
 struct TensorSpec {
     name: String,
@@ -335,8 +354,8 @@ fn tensor_type(ne: &[u64], cfg: &TinyModelConfig) -> u64 {
         FixtureQuant::F32 => GGML_TYPE_F32,
         FixtureQuant::Q4_0 if quantizable => GGML_TYPE_Q4_0,
         FixtureQuant::Q4_0 => GGML_TYPE_F32,
-        FixtureQuant::UnsupportedQ5_0 if quantizable => GGML_TYPE_Q5_0,
-        FixtureQuant::UnsupportedQ5_0 => GGML_TYPE_F32,
+        FixtureQuant::UnsupportedQ5_1 if quantizable => GGML_TYPE_Q5_1,
+        FixtureQuant::UnsupportedQ5_1 => GGML_TYPE_F32,
     }
 }
 

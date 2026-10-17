@@ -19,7 +19,7 @@
 - **`model_id` must equal the GGUF's `general.name` KV.** One model per worker process (`--model`); one loaded range per process at a time. `weights_chunk_data` stays empty on the wire — workers resolve weights from their local `--model` file (spec §2); wire-side weight push is out of this epic.
 - **Session rules:** `MAX_SESSIONS = 16` (17th concurrent session → `success = false`); forward requires `sequence_position ==` rows already in that session's KV cache (first call: 0); `sequence_position + n > hparams.context_length` → `success = false`.
 - **Unload tolerance (spec §3.1.4):** `UnloadLayers` for a model the process never loaded returns `success = true, freed_ram_bytes = 0`. This is what makes the driver's rollback path work.
-- **Supported tensor types:** F32 (0), F16 (1), Q4_0 (2), Q8_0 (8), Q4_K (12), Q6_K (14). Any other ggml type id → `LoadLayers` `success = false` with the type id in `error_message` (loud, never partial).
+- **Supported tensor types:** F32 (0), F16 (1), Q4_0 (2), Q8_0 (8), Q4_K (12), Q6_K (14). Any other ggml type id → `LoadLayers` `success = false` with the type id in `error_message` (loud, never partial). *(Task 4 amendment: Q5_0 (6) joins the supported set — the real-model gate found Q5_0 attention tensors inside Qwen's official `qwen2.5-0.5b-instruct-q4_k_m.gguf` (byte-size verified against the HuggingFace listing), so "q4_k_m" files are unloadable without it; reference `dequantize_row_q5_0`, ggml-quants.c:500. The loud-refusal fixture marker moved to Q5_1 (7).)*
 - **Commit identity:** `git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' commit ...` on every commit.
 - **Local verify before every push:**
   `export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"` then
@@ -116,7 +116,7 @@ Weights: deterministic xorshift32 in `[-0.05, 0.05]` (same seed → byte-identic
 - Produces:
   - `pub struct WorkerEngine` in `worker::engine` with `pub fn new(worker_id: &str, device_name: &str, model_path: PathBuf) -> Result<Self, String>` (returns `Ok` until Task 2 adds parsing), implementing `worker::proto::aiupcycler::rpc::worker_service_server::WorkerService`.
   - CLI: `ai-upcycler-worker --model <path> [--bind 127.0.0.1:0] [--worker-id host-worker]`; on bind prints exactly `READY <ip:port>\n` to stdout and flushes. `--model` missing → exit 2 with usage on stderr.
-  - `worker/tests/common`: `pub fn write_tiny_model(dir: &Path, cfg: TinyModelConfig) -> Fixture` where `TinyModelConfig { n_layers: usize, tied: bool, quant: FixtureQuant }`, `FixtureQuant::{F32, Q4_0, UnsupportedQ5_0}`, and `Fixture { path: PathBuf, model_id: String, n_layers: usize, hidden: usize, vocab: usize, ... , fn expected_f32_bytes(&self, start: usize, end: usize) -> u64 }` implementing the ownership rule (includes `token_embd` iff `start == 0`, head tensors iff `end == n_layers - 1`) from the fixture's declared dims — independent of anything the engine returns.
+  - `worker/tests/common`: `pub fn write_tiny_model(dir: &Path, cfg: TinyModelConfig) -> Fixture` where `TinyModelConfig { n_layers: usize, tied: bool, quant: FixtureQuant }`, `FixtureQuant::{F32, Q4_0, UnsupportedQ5_1}` *(Task 4 amendment: was `UnsupportedQ5_0` — Q5_0 (6) joined the supported set after the real-model gate, so the loud-refusal marker moved to Q5_1 (7)),* and `Fixture { path: PathBuf, model_id: String, n_layers: usize, hidden: usize, vocab: usize, ... , fn expected_f32_bytes(&self, start: usize, end: usize) -> u64 }` implementing the ownership rule (includes `token_embd` iff `start == 0`, head tensors iff `end == n_layers - 1`) from the fixture's declared dims — independent of anything the engine returns.
   - Handshake response: `worker_id`/`device_name` as configured (device defaults to `sysinfo::System::host_name()` or `"host"`), real `total_ram_bytes`/`free_ram_bytes` via sysinfo, `cpu_cores` from `std::thread::available_parallelism()`, `has_npu_acceleration = false`. Health: real `free_ram_bytes`, `battery_percentage = 0.0`, `cpu_temp_celsius = 0.0`.
   - Compute RPCs in this task honestly refuse: `LoadLayers`/`UnloadLayers` → `success = false` + `error_message` containing `not implemented`; `ExecuteForward` → `success = false`, no tensor (its response type has **no** message field — reason goes to `eprintln!`).
 
@@ -217,7 +217,7 @@ git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycl
 - Consumes: `GgufFile` (Task 2), `Fixture::expected_f32_bytes` (Task 1), tonic server types.
 - Produces:
   - `tests/common::serve_engine(engine: WorkerEngine) -> (u16, tokio::task::JoinHandle<()>)` — binds `127.0.0.1:0` and serves in-process, mirroring `core/tests/common/mod.rs::serve_mock`.
-  - `LoadLayers` semantics (in order): `model_id != model_name` → false+msg; `start > end || end >= block_count` → false+msg; already loaded → false+msg; collect tensors = the 11 `blk.{i}.*` names present for each layer in range, `token_embd.weight` iff `start == 0`, `output_norm.weight` + `output.weight` iff `end == block_count-1` and it exists (tied: skip) → any missing tensor or unsupported/non-F32 type → false+msg; else materialize F32, store range, return `success=true, allocated_ram_bytes = materialized.len() * 4`.
+  - `LoadLayers` semantics (in order): `model_id != model_name` → false+msg; `start > end || end >= block_count` → false+msg; already loaded → false+msg; collect tensors = the 11 `blk.{i}.*` names present for each layer in range, `token_embd.weight` iff `start == 0`, `output_norm.weight` + `output.weight` iff `end == block_count-1` and it exists (tied: skip) → any missing tensor or unsupported/non-F32 type → false+msg; else materialize F32, store range, return `success=true, allocated_ram_bytes = materialized.len() * 4`. *(Task 4 amendment: `attn_q_norm`/`attn_k_norm` become optional-if-present — real qwen2 files have no QK-norm tensors, while the fixture (Qwen3-style shape) does; the other 9 per-block tensors stay strict-refuse-if-missing.)*
   - `UnloadLayers`: wrong `model_id` → false+msg; never loaded → `true, 0`; loaded → free everything, `true, freed_ram_bytes = bytes freed`.
   - Loaded state also records `(start, end)` — Task 6's forward reads it.
 
@@ -232,7 +232,7 @@ git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycl
 - `second_load_without_unload_is_refused` — load ok, load again → false; allocated state untouched (subsequent unload still reports the original figure).
 - `unload_of_never_loaded_model_succeeds_with_zero_then_reload_works` — (rollback scenario, Review Focus 5) load `0..1`, unload, then load `0..3` → success with full allocation; also fresh-engine unload → `true, freed = 0`.
 - `tied_fixture_loads_full_range` — tied default fixture loads `0..3` (no `output.weight` exists; guards tie rule at load).
-- `unsupported_tensor_type_is_refused_loudly` — `FixtureQuant::UnsupportedQ5_0` fixture → false, message contains the type id (placeholder test now; its fixture variant already exists).
+- `unsupported_tensor_type_is_refused_loudly` — `FixtureQuant::UnsupportedQ5_1` fixture → false, message contains the type id *(Task 4 amendment: was `UnsupportedQ5_0`; see the supported-types amendment above)*.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -271,7 +271,7 @@ End of PR1: local verify (Global Constraints), `gh pr create` (describe contract
 **Interfaces:**
 - Consumes: `TensorDesc.ggml_type`, fixture writer's `FixtureQuant` variants (Task 1).
 - Produces (pub in `worker::quant`):
-  - `pub enum GgmlType { F32, F16, Q4_0, Q8_0, Q4_K, Q6_K }` with `pub fn from_id(id: u32) -> Option<GgmlType>` (ids 0/1/2/8/12/14; anything else → `None` → Task 3's loud refusal).
+  - `pub enum GgmlType { F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q6_K }` with `pub fn from_id(id: u32) -> Option<GgmlType>` (ids 0/1/2/6/8/12/14 — *(Task 4 amendment: Q5_0 (6) added after the real-model gate found it in Qwen's official q4_k_m asset; see the supported-types amendment at the top of this task)* anything else → `None` → Task 3's loud refusal).
   - `pub fn dequantize(ty: GgmlType, raw: &[u8], ne: &[u64]) -> Result<Vec<f32>, String>` — whole tensor; row length = `ne[0]`, rows = product of `ne[1..]`; row length must satisfy the type's block divisibility (32 for Q4_0/Q8_0, 256 for Q4_K/Q6_K, else error); output length = product(`ne`).
 - Engine: `LoadLayers` now accepts any `GgmlType` in the supported set (still materializes F32; `allocated_ram_bytes` unchanged semantics = F32 bytes).
 
@@ -283,7 +283,7 @@ End of PR1: local verify (Global Constraints), `gh pr create` (describe contract
 - `f16_round_trip_for_exactly_representable_values` — `[0.5, -1.0, 2.0, 0.25, 1.0009765625]` → bit-exact f32 (hand-rolled f16→f32 conversion, no new dep).
 - `k_quants_produce_finite_full_length_output` — synthetic Q4_K/Q6_K super-block bytes (hand-assembled per the layout in llama.cpp `ggml-common.h`, cited): output length correct, all finite, values within `±(|d|·sum(scales)…)` bounded range — structural, not golden (see Known CI gap).
 - `q4_0_fixture_allocates_same_as_f32_fixture` — engine-level differential: `Q4_0` variant of the default fixture loads `0..3` with allocated **equal** to the F32 fixture's (dequantized storage claim).
-- `unsupported_type_refused_with_type_id` — promotes the Task 3 placeholder to a real assertion against `UnsupportedQ5_0`.
+- `unsupported_type_refused_with_type_id` — promotes the Task 3 placeholder to a real assertion against `UnsupportedQ5_1` *(Task 4 amendment: was `UnsupportedQ5_0`; see above)*.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -299,7 +299,7 @@ Run: `cargo test -p ai-upcycler-worker dequant && cargo test -p ai-upcycler-work
 
 - [ ] **Step 5: Asset-gated real-model gate (`#[ignore]`, local)**
 
-`worker/tests/real_model.rs::real_model_header_and_full_load` — skips with a printed message unless `AI_UPCYCLER_MODEL` is set. When set, assert: `GgufFile` hparams match Qwen2.5-0.5B (block_count 24, embedding 896, heads 14, kv_heads 2, ff 4864, context ≥ 8192 — cross-check against Qwen's `config.json` in the step and fix constants if they differ, they are the independent oracle), **every** tensor's type ∈ supported set, full-range materialization completes in < 25 s (print elapsed + GB allocated — this is the spec's load-budget benchmark), and all values finite. If assets are absent, follow the spec's asset step first: download `llama-server` linux-x64 release from `ggml-org/llama.cpp` releases and `qwen2.5-0.5b-instruct-q4_k_m.gguf` from `huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF` (matches `DEFAULT_MODEL_FILE`), store outside the repo, export both env vars.
+`worker/tests/real_model.rs::real_model_header_and_full_load` — skips with a printed message unless `AI_UPCYCLER_MODEL` is set. When set, assert: `GgufFile` hparams match Qwen2.5-0.5B (block_count 24, embedding 896, heads 14, kv_heads 2, ff 4864, context ≥ 8192 — cross-check against Qwen's `config.json` in the step and fix constants if they differ, they are the independent oracle), **every** tensor's type ∈ supported set, full-range materialization completes in < 25 s (print elapsed + GB allocated — this is the spec's load-budget benchmark; *(Task 4 amendment: the budget asserts only in release profiles — debug builds dequantize ~6× slower and the binary ships in release)*), and all values finite. If assets are absent, follow the spec's asset step first: download `llama-server` linux-x64 release from `ggml-org/llama.cpp` releases and `qwen2.5-0.5b-instruct-q4_k_m.gguf` from `huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF` (matches `DEFAULT_MODEL_FILE`), store outside the repo, export both env vars.
 
 - [ ] **Step 6: Commit (include real-model results in PR2 text)**
 

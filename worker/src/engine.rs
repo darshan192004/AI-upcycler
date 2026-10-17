@@ -10,6 +10,7 @@ use crate::proto::aiupcycler::rpc::{
     HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
     LoadLayersResponse, UnloadLayersRequest, UnloadLayersResponse,
 };
+use crate::quant::{dequantize, GgmlType};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -39,12 +40,11 @@ struct LoadedRange {
     bytes: u64,
 }
 
-/// The 11 per-block tensor names from the model spec table.
-const BLOCK_TENSORS: [&str; 11] = [
+/// The per-block tensors the qwen2 forward pass consumes; a file missing
+/// any of these is refused loudly (never partially loaded).
+const BLOCK_TENSORS_REQUIRED: [&str; 9] = [
     "attn_norm.weight",
     "ffn_norm.weight",
-    "attn_q_norm.weight",
-    "attn_k_norm.weight",
     "attn_q.weight",
     "attn_k.weight",
     "attn_v.weight",
@@ -53,6 +53,10 @@ const BLOCK_TENSORS: [&str; 11] = [
     "ffn_up.weight",
     "ffn_down.weight",
 ];
+
+/// Optional per-block extras: qwen2 files have no QK-norm tensors, but
+/// files that ship them (Qwen3-style shapes) must be retained too.
+const BLOCK_TENSORS_OPTIONAL: [&str; 2] = ["attn_q_norm.weight", "attn_k_norm.weight"];
 
 impl WorkerEngine {
     /// `device_name` empty resolves to the host name (or `"host"`). A model
@@ -154,8 +158,14 @@ impl WorkerService for WorkerEngine {
             names.push("token_embd.weight".to_string());
         }
         for i in start..=end {
-            for part in BLOCK_TENSORS {
+            for part in BLOCK_TENSORS_REQUIRED {
                 names.push(format!("blk.{i}.{part}"));
+            }
+            for part in BLOCK_TENSORS_OPTIONAL {
+                let name = format!("blk.{i}.{part}");
+                if state.model.tensor(&name).is_some() {
+                    names.push(name);
+                }
             }
         }
         if end == block_count as i32 - 1 {
@@ -171,22 +181,20 @@ impl WorkerService for WorkerEngine {
             let Some(desc) = state.model.tensor(name) else {
                 return refuse(format!("model is missing tensor {name}"));
             };
-            if desc.ggml_type != 0 {
+            let Some(ty) = GgmlType::from_id(desc.ggml_type) else {
                 return refuse(format!(
                     "tensor {name} has unsupported ggml type id {}",
                     desc.ggml_type
                 ));
-            }
+            };
             let raw = match state.model.read_raw(name) {
                 Ok(raw) => raw,
                 Err(e) => return refuse(format!("tensor {name} could not be read: {e}")),
             };
-            let f32s: Vec<f32> = raw
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect();
+            let f32s = match dequantize(ty, &raw, &desc.ne) {
+                Ok(f32s) => f32s,
+                Err(e) => return refuse(format!("tensor {name}: {e}")),
+            };
             bytes += (f32s.len() * 4) as u64;
             tensors.insert(name.clone(), f32s);
         }

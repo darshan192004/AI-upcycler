@@ -4,3 +4,4 @@
 pub mod engine;
 pub mod gguf;
 pub mod proto;
+pub mod quant;

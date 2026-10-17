@@ -239,7 +239,7 @@ async fn tied_fixture_loads_full_range() {
 async fn unsupported_tensor_type_is_refused_loudly() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = common::TinyModelConfig {
-        quant: common::FixtureQuant::UnsupportedQ5_0,
+        quant: common::FixtureQuant::UnsupportedQ5_1,
         ..Default::default()
     };
     let fx = common::write_tiny_model(dir.path(), cfg);
@@ -250,9 +250,9 @@ async fn unsupported_tensor_type_is_refused_loudly() {
         .await
         .expect("rpc")
         .into_inner();
-    assert!(!resp.success, "Q5_0 (type id 6) must be refused");
+    assert!(!resp.success, "Q5_1 (type id 7) must be refused");
     assert!(
-        resp.error_message.contains("ggml type id 6"),
+        resp.error_message.contains("ggml type id 7"),
         "message names the type id: {}",
         resp.error_message
     );

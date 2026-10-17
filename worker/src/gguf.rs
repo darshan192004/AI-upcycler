@@ -261,6 +261,7 @@ fn tensor_nbytes(ggml_type: u64, ne: &[u64]) -> Option<u64> {
         1 => elems.checked_mul(2),          // F16
         2 => block_bytes(elems, 32, 18),    // Q4_0
         6 => block_bytes(elems, 32, 22),    // Q5_0
+        7 => block_bytes(elems, 32, 24),    // Q5_1 (refused at load; sized only)
         8 => block_bytes(elems, 32, 34),    // Q8_0
         12 => block_bytes(elems, 256, 144), // Q4_K
         14 => block_bytes(elems, 256, 210), // Q6_K
