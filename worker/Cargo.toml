@@ -1,0 +1,24 @@
+[package]
+name = "ai-upcycler-worker"
+version = "0.1.0"
+description = "AI Upcycler worker engine: real GGUF layer-range loading and Qwen2-family forward math"
+license = "MIT"
+authors = ["AI Upcycler Contributors"]
+edition = "2021"
+
+[dependencies]
+tonic = { version = "0.13", features = ["transport"] }
+prost = "0.13"
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net"] }
+tokio-stream = "0.1"
+memmap2 = "0.9"
+sysinfo = "0.39"
+thiserror = "1"
+
+[build-dependencies]
+tonic-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.36", features = ["full"] }

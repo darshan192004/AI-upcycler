@@ -33,6 +33,32 @@ jobs:
       - name: Run tests
         run: cargo test -p ai-upcycler-core
 
+  worker:
+    name: Worker engine (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint worker crate (clippy, deny warnings)
+        run: cargo clippy -p ai-upcycler-worker --all-targets -- -D warnings
+
+      - name: Run worker tests
+        run: cargo test -p ai-upcycler-worker
+
   desktop:
     name: Desktop shell (Tauri v2, Linux)
     runs-on: ubuntu-22.04
