@@ -2,4 +2,5 @@
 //! math behind the `WorkerService` contract from `proto/cluster_rpc.proto`.
 
 pub mod engine;
+pub mod gguf;
 pub mod proto;

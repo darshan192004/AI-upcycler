@@ -34,6 +34,9 @@ pub struct TinyModelConfig {
     pub tied: bool,
     pub quant: FixtureQuant,
     pub model_name: String,
+    pub architecture: String,
+    /// `None` omits the KV so the reader's default (10000.0) is exercised.
+    pub rope_theta: Option<f32>,
 }
 
 impl Default for TinyModelConfig {
@@ -43,6 +46,8 @@ impl Default for TinyModelConfig {
             tied: true,
             quant: FixtureQuant::F32,
             model_name: "tiny-qwen2-f32".to_string(),
+            architecture: "qwen2".to_string(),
+            rope_theta: Some(ROPE_THETA),
         }
     }
 }
@@ -56,9 +61,31 @@ pub struct Fixture {
     pub hidden: usize,
     pub vocab: usize,
     pub tied: bool,
+    pub quant: FixtureQuant,
 }
 
 impl Fixture {
+    /// The exact encoded bytes the writer produced for `name`, replaying the
+    /// deterministic generator — the independent side of the reader's
+    /// round-trip check.
+    pub fn expected_raw_tensor(&self, name: &str) -> Vec<u8> {
+        let cfg = TinyModelConfig {
+            n_layers: self.n_layers,
+            tied: self.tied,
+            quant: self.quant,
+            model_name: self.model_id.clone(),
+            ..Default::default()
+        };
+        let mut rng = XorShift(0xA1C7_1234);
+        let tensors = build_tensors(&cfg, &mut rng);
+        let tensor = tensors
+            .iter()
+            .find(|t| t.name == name)
+            .expect("fixture must contain this tensor");
+        let mut out = Vec::new();
+        encode_tensor(tensor, &cfg, &mut out);
+        out
+    }
     /// F32 bytes the engine must report as allocated for `[start, end]`
     /// under the spec's ownership rule: `token_embd` iff `start == 0`, the
     /// 11 `blk.{i}.*` tensors per owned layer, and the head tensors
@@ -149,6 +176,7 @@ pub fn write_tiny_model(dir: &Path, cfg: TinyModelConfig) -> Fixture {
         hidden: HIDDEN,
         vocab: VOCAB,
         tied: cfg.tied,
+        quant: cfg.quant,
     }
 }
 
@@ -182,7 +210,7 @@ struct TensorSpec {
 fn build_kvs(cfg: &TinyModelConfig) -> Vec<Vec<u8>> {
     let mut kvs = Vec::new();
     push_kv_str(&mut kvs, "general.name", &cfg.model_name);
-    push_kv_str(&mut kvs, "general.architecture", "qwen2");
+    push_kv_str(&mut kvs, "general.architecture", &cfg.architecture);
     push_kv_u32(&mut kvs, "general.alignment", ALIGNMENT as u32);
     push_kv_u32(&mut kvs, "qwen2.block_count", cfg.n_layers as u32);
     push_kv_u32(&mut kvs, "qwen2.context_length", CONTEXT_LENGTH as u32);
@@ -197,7 +225,9 @@ fn build_kvs(cfg: &TinyModelConfig) -> Vec<Vec<u8>> {
     push_kv_u32(&mut kvs, "qwen2.attention.key_length", HEAD_DIM as u32);
     push_kv_u32(&mut kvs, "qwen2.attention.value_length", HEAD_DIM as u32);
     push_kv_f32(&mut kvs, "qwen2.attention.layer_norm_rms_epsilon", RMS_EPS);
-    push_kv_f32(&mut kvs, "qwen2.rope.freq_base", ROPE_THETA);
+    if let Some(theta) = cfg.rope_theta {
+        push_kv_f32(&mut kvs, "qwen2.rope.freq_base", theta);
+    }
     kvs
 }
 

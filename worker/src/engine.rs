@@ -4,16 +4,17 @@
 //! metadata; the compute RPCs refuse honestly until the load/forward
 //! slices land.
 
+use crate::gguf::GgufFile;
 use crate::proto::aiupcycler::rpc::{
     worker_service_server::WorkerService, ExecuteForwardRequest, ExecuteForwardResponse,
     HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
     LoadLayersResponse, UnloadLayersRequest, UnloadLayersResponse,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
-/// One worker process: holds the model path, the loaded layer range
+/// One worker process: holds the parsed model file, the loaded layer range
 /// (later slices) and the per-session forward state.
 pub struct WorkerEngine {
     state: Arc<Mutex<EngineState>>,
@@ -22,13 +23,17 @@ pub struct WorkerEngine {
 struct EngineState {
     worker_id: String,
     device_name: String,
-    #[allow(dead_code)] // consumed by the GGUF-load slice
-    model_path: PathBuf,
+    /// Parsed at construction; the load slice validates requests against it.
+    #[allow(dead_code)] // read by the LoadLayers slice
+    model: GgufFile,
 }
 
 impl WorkerEngine {
-    /// `device_name` empty resolves to the host name (or `"host"`).
+    /// `device_name` empty resolves to the host name (or `"host"`). A model
+    /// file that fails GGUF validation makes construction fail — the binary
+    /// exits 1 before ever announcing `READY`.
     pub fn new(worker_id: &str, device_name: &str, model_path: PathBuf) -> Result<Self, String> {
+        let model = GgufFile::open(Path::new(&model_path)).map_err(|e| format!("model: {e}"))?;
         let device_name = if device_name.is_empty() {
             sysinfo::System::host_name().unwrap_or_else(|| "host".to_string())
         } else {
@@ -38,7 +43,7 @@ impl WorkerEngine {
             state: Arc::new(Mutex::new(EngineState {
                 worker_id: worker_id.to_string(),
                 device_name,
-                model_path,
+                model,
             })),
         })
     }
