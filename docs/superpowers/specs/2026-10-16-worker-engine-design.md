@@ -1,8 +1,12 @@
 # Worker Engine — Design (2026-10-16)
 
-Status: BUILDER-CHECK COMPLETE (7 items: 6 settled in-document as my calls, 1 — the epic
-edge — answered by the partner: **ends at split equivalence**). Awaiting the partner's
-approval of this document; no code before that gate.
+Status: **IMPLEMENTED** (2026-10-17). The engine ships as the pure-Rust `worker/` crate:
+GGUF layer-range loading, Q4_0/Q4_K/Q5_0/Q6_K/Q8_0 dequantization, full-range /
+partial-range / mid-stage forwards with KV-cached sessions, and split equivalence over
+real worker processes. Evidence: PRs #41 (scaffold + contract tests), #42 (dequant + math),
+#53 (forward + llama-server logits parity) and PR4 (split equivalence; this document's
+status). Build-approval gates: BUILDER-CHECK COMPLETE (7 items: 6 settled in-document as
+my calls, 1 — the epic edge — answered by the partner: **ends at split equivalence**).
 
 ## Intent
 

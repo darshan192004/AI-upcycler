@@ -457,7 +457,7 @@ End of PR3: local verify (fixture tests all green without assets), PR with parit
 - Consumes: `ai_upcycler_core::rpc::engine::{LoadedPipeline, TensorPayload, ActivationType}`, `ai_upcycler_core::scheduler::planner::LayerAssignment`, fixture + spawn helpers.
 - Produces: `common::spawn_worker(model_path: &Path, worker_id: &str) -> (u16, std::process::Child)` — spawns `env!("CARGO_BIN_EXE_ai-upcycler-worker")` with `--bind 127.0.0.1:0 --model … --worker-id …`, reads stdout until `READY ` and parses the port; `common::ids_payload(session: &str, ids: &[u32]) -> TensorPayload`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `worker/tests/split_equivalence.rs::two_worker_split_matches_single_worker`:
 
@@ -473,21 +473,24 @@ assert!(max_diff <= 1e-6, "split changed the math: {max_diff}");
 
 Plus `#[ignore]` sibling `real_model_two_worker_split_matches_single_worker` for `AI_UPCYCLER_MODEL` (same flow, 24 layers split at 12, `max_diff ≤ 1e-4`, argmax equality) — local evidence for PR4.
 
-- [ ] **Step 2: Run to verify it fails**
+*(Amendments found while landing this, 2026-10-17: (a) the engine's stage-0 contract is F32 **values** holding token ids — `ids_payload` writes `f32(id)`, not raw u32 LE bytes; the first draft wrote integral bytes and was refused loudly. (b) A **tied** model's tail stage (e.g. `2..3`) needs the head, and a tied head *is* `token_embd` reused — the ownership rule now loads `token_embd` also when the range ends the model on a tied file (`Fixture::expected_f32_bytes` mirrors it). Both surfaced as refusals from the first real-process run, exactly the cross-boundary detail this test exists to catch.)*
+
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p ai-upcycler-worker split_equivalence` → FAIL — `spawn_worker` not defined.
 
-- [ ] **Step 3: Implement `spawn_worker` + `ids_payload` in `tests/common/mod.rs`**
+- [x] **Step 3: Implement `spawn_worker` + `ids_payload` in `tests/common/mod.rs`**
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p ai-upcycler-worker` → PASS. If `max_diff > 0`: debug before relaxing — identical F32 ops in identical order should be near bit-exact; a real gap means stage-boundary conversion crept in.
 
-- [ ] **Step 5: Local real-model variant**
+- [x] **Step 5: Local real-model variant**
 
 Run with `AI_UPCYCLER_MODEL` set (`-- --ignored --nocapture`), record numbers for PR4.
+*(Recorded: 24-block Qwen2.5-0.5B q4_k_m, split at 12 across two real worker processes vs one process holding every block — `max_diff = 0`, bit-exact logits, identical argmax; ~34 s wall.)*
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
