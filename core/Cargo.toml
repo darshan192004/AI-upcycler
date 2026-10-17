@@ -24,7 +24,7 @@ futures = "0.3"
 async-stream = "0.3"
 memmap2 = "0.9"
 bytes = "1"
-rcgen = "0.13"
+rcgen = "0.14.10"
 sha2 = "0.10"
 
 [build-dependencies]
