@@ -417,24 +417,30 @@ git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycl
 - Consumes: `GgufFile`, engine + `serve_engine` (real model via `AI_UPCYCLER_MODEL`), `llama-server` binary via `AI_UPCYCLER_LLAMA_SERVER`.
 - Produces: `#[ignore]` test `next_token_matches_llama_server`; prompt `"The capital of France is"`, `sequence_position = 0`.
 
-- [ ] **Step 1: Source-driven discovery (local, before writing asserts)**
+- [x] **Step 1: Source-driven discovery (local, before writing asserts)**
 
 With the assets from Task 4's Step 5 present, run `"$AI_UPCYCLER_LLAMA_SERVER" --help` and the official llama.cpp HTTP docs: confirm `POST /tokenize` (returns token ids for `{"content": ...}`), `GET /health`, and whether `/v1/completions` or `/completion` returns `logprobs` in this release. Record findings in the test's header comment — they decide which assert branch below is active.
 
-- [ ] **Step 2: Write the failing parity test**
+- [x] **Step 2: Write the failing parity test**
 
 Flow: start `llama-server --model $AI_UPCYCLER_MODEL --port <free> --ctx 512` (stdout piped, killed at end), poll `/health` to ready → `POST /tokenize` → ids → feed `[1, n]` F32 to a full-range in-process engine → `argmax(logits)`. Required assert: greedy server next token (`temperature 0, n_predict 1` on the same prompt text) equals our argmax. Secondary assert if logprobs exist (per Step 1): server top-5 logprob values vs our `log_softmax` top-5 — same token set ≥ 4/5 and shared-token logprob diff ≤ 0.05. Test returns early (printing "skipped: env unset") when either env var is missing, so CI is never affected even without `#[ignore]`.
 
-- [ ] **Step 3: Run locally with assets**
+- [x] **Step 3: Run locally with assets**
 
 Run: `AI_UPCYCLER_MODEL=... AI_UPCYCLER_LLAMA_SERVER=... cargo test -p ai-upcycler-worker parity -- --ignored --nocapture`
 Expected: PASS; paste the argmax pair + logprob table into PR3's description. This plus Task 6's mutation check is PR3's evidence.
+*(See the test's header comment for the numeric-regime amendment: greedy-argmax stays exact, the shared-token bound is 0.6 on the quantized file — llama.cpp's CPU kernels quantize activations to 8-bit inside quantized-weight matmuls (block-bisect evidence in the PR); an F32-converted twin of the same model agrees with this engine to ≤ 4e-4 nats. Two real engine bugs were found and fixed by this gate: real Qwen2.5 files ship `attn_{q,k,v}.bias` tensors, and `rope_row` used GPT-J-style pairing instead of llama.cpp's NeoX `(i, i + head_dim/2)`.)*
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
-git add worker/tests/parity.rs && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
-  commit -m "test(worker): reference parity of full-range logits vs llama-server"
+# two commits — the gate uncovered real engine bugs:
+git add worker/src/math.rs worker/src/layers.rs worker/src/engine.rs worker/tests/forward.rs worker/tests/common worker/tests/math_units.rs
+git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
+  commit -F <file>   # "fix(worker): qkv attention biases + neox rope pairing for llama parity"
+git add worker/tests/parity.rs worker/examples
+git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
+  commit -F <file>   # "test(worker): reference parity of full-range logits vs llama-server"
 ```
 
 End of PR3: local verify (fixture tests all green without assets), PR with parity numbers + mutation check + K-quant disclosure, guide-comment check, squash-merge.
