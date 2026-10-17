@@ -76,6 +76,7 @@ dependencies = [
 name = "ai-upcycler-worker"
 version = "0.1.0"
 dependencies = [
+ "ai-upcycler-core",
  "memmap2",
  "prost",
  "protoc-bin-vendored",

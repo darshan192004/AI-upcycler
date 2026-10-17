@@ -203,11 +203,16 @@ impl WorkerService for WorkerEngine {
             return refuse("layers already loaded; unload before loading again".to_string());
         }
 
-        // Ownership rule: token_embd iff start==0, the 11 blk.{i}.* tensors
-        // per owned layer, and the head (output_norm, plus output.weight when
-        // the model is untied) iff end is the last block.
+        // Ownership rule: token_embd iff `start == 0` (stage-0 input), OR the
+        // model is tied (no `output.weight`) and this range ends the model —
+        // a tied model's head is `token_embd` reused, so the split's tail
+        // stage must hold it too. Plus the 11 blk.{i}.* tensors per owned
+        // layer, and the head (output_norm, plus `output.weight` when the
+        // model is untied) iff `end` is the last block.
         let mut names: Vec<String> = Vec::new();
-        if start == 0 {
+        if start == 0
+            || (end == block_count as i32 - 1 && state.model.tensor("output.weight").is_none())
+        {
             names.push("token_embd.weight".to_string());
         }
         for i in start..=end {
