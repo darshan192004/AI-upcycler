@@ -32,18 +32,21 @@ pub fn linear(out: &mut [f32], weight: &[f32], n_in: usize, x: &[f32]) {
     }
 }
 
-/// Rotary-embedding rotation of one attention head in place. Pair `j`
-/// (elements `2j`, `2j+1`) rotates by `pos Â· theta^(-2j / head_dim)`
-/// radians. `head.len()` must be even.
+/// Rotary-embedding rotation of one attention head in place, llama.cpp's
+/// `GGML_ROPE_TYPE_NEOX` pairing (verified against `rotate_pairs` in
+/// `ggml-cpu/ops.cpp`, commit d81235049): pair `j` (elements `j`,
+/// `j + head_dim/2`) rotates by `pos · theta^(-2j / head_dim)` radians.
+/// `head.len()` must be even.
 pub fn rope_row(head: &mut [f32], pos: usize, theta: f32) {
     let head_dim = head.len();
     debug_assert!(head_dim.is_multiple_of(2), "rope head_dim must be even");
-    for j in 0..head_dim / 2 {
+    let half = head_dim / 2;
+    for j in 0..half {
         let angle = pos as f32 * theta.powf(-(2.0 * j as f32) / head_dim as f32);
         let (sin, cos) = angle.sin_cos();
-        let (x0, x1) = (head[2 * j], head[2 * j + 1]);
-        head[2 * j] = x0 * cos - x1 * sin;
-        head[2 * j + 1] = x0 * sin + x1 * cos;
+        let (x0, x1) = (head[j], head[j + half]);
+        head[j] = x0 * cos - x1 * sin;
+        head[j + half] = x0 * sin + x1 * cos;
     }
 }
 

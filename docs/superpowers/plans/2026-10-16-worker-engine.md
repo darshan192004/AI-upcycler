@@ -190,15 +190,15 @@ git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' commit \
 Run: `cargo test -p ai-upcycler-worker gguf_reader`
 Expected: FAIL — `gguf` module not found / unresolved import.
 
-- [ ] **Step 3: Implement `gguf.rs` and constructor parsing**
+- [x] **Step 3: Implement `gguf.rs` and constructor parsing**
 
 Parse order: magic/version → n_tensors/n_kv → KV (generic skip by type, typed getters for the required keys) → tensor infos → data-section bounds check (offset + nbytes ≤ file len). `WorkerEngine::new` stores `GgufFile` (bad file → `Err`, process exits before serving).
 
-- [ ] **Step 4: Run to verify it passes (plus Task 1's smoke)**
+- [x] **Step 4: Run to verify it passes (plus Task 1's smoke)**
 
 Run: `cargo test -p ai-upcycler-worker` → all PASS (smoke still green — it already passes a real fixture).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
@@ -373,11 +373,11 @@ End of PR2: local verify, PR, guide-comment check, squash-merge.
   - `execute_forward` contract: not loaded → false; new session at cap → false; `data_type != FP32` → false; role shape check — `start == 0` requires `[1, n]`, `start > 0` requires `[n, embedding_length]`, `n ≥ 1` — else false; token ids (stage 0) must satisfy `id < vocab` → else false; `sequence_position < 0` or `!= kv_len` → false; `position + n > context_length` → false. Success: run `start..=end`; if `end == block_count-1` apply `output_norm` + head → logits `[n, vocab]`, else output `[n, hidden]`; populate shape AND `data_type = FP32`; `execution_time_us` = elapsed micros (> 0 for any real block pass). Failures: `success=false`, tensor `None`, time 0, reason via `eprintln!("[worker] forward refused: …")` (the proto has no error message on this response — noted for reviewers).
   - Unload frees sessions too; forward after unload → false; reload → fresh sessions at position 0.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worker/tests/forward.rs` (in-process `serve_engine` + direct tonic client; default 4-layer fixture unless noted):
 - `stage0_full_range_returns_logits` — fixture config `n_layers: 1` (writer's `TinyModelConfig`), ids `[1,2]` as `[1,2]` F32 → `success`, shape `[2, 256]`, dtype FP32, `execution_time_us > 0`.
-- `partial_stage0_returns_hidden` — `0..1` load, ids `[1,3]` → shape `[3, 64]`.
+- `partial_stage0_returns_hidden` — `0..1` load, ids `[1,3,2]` → shape `[3, 64]`. *(Amendment, PR3: the plan listed "ids `[1,3]`" against shape `[3, 64]` — inconsistent token count; resolved to three ids `[1,3,2]`.)*
 - `mid_stage_consumes_hidden_and_rejects_roles` — `2..2` load: F32 `[3,64]` hidden → success `[3,64]`; then `[1,3]` ids → false; `[3,64]` Fp16 dtype → false (Review Focus 1).
 - `forward_rejects_out_of_order_position_then_accepts_corrected` — fresh session: `sequence_position=1` → false; `=0` → success; repeat `=0` → false (cache intact); `= n` → success (Review Focus 2).
 - `forward_rejects_token_id_at_or_above_vocab` and `forward_rejects_beyond_context_length`.
@@ -385,21 +385,21 @@ End of PR2: local verify, PR, guide-comment check, squash-merge.
 - `tied_full_range_forward_returns_logits` (Review Focus 4 tie at forward).
 - `single_block_matches_f64_reference` — fixture `n_layers: 1`, ids `[1,2]`: test-side f64 reference runs embed → qwen2 block (rms/qknorm/rope/causal-GQA-softmax/silu) → tied head; assert every logit within `1e-4` of the engine's F32 output. This is the CI gate for block assembly (attention indexing, GQA broadcast, residual order).
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p ai-upcycler-worker forward` → FAIL — ExecuteForward still refuses.
 
-- [ ] **Step 3: Implement `layers.rs` + `execute_forward`**
+- [x] **Step 3: Implement `layers.rs` + `execute_forward`**
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p ai-upcycler-worker` → all green (load/dequant/reader/smoke untouched).
 
-- [ ] **Step 5: Mutation check the position gate**
+- [x] **Step 5: Mutation check the position gate**
 
 Back up `engine.rs`; weaken the `sequence_position != kv_len` check to `sequence_position < kv_len` → `forward_rejects_out_of_order_position_then_accepts_corrected` must FAIL; restore; re-run green. Record for PR3.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
@@ -417,24 +417,30 @@ git add worker && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycl
 - Consumes: `GgufFile`, engine + `serve_engine` (real model via `AI_UPCYCLER_MODEL`), `llama-server` binary via `AI_UPCYCLER_LLAMA_SERVER`.
 - Produces: `#[ignore]` test `next_token_matches_llama_server`; prompt `"The capital of France is"`, `sequence_position = 0`.
 
-- [ ] **Step 1: Source-driven discovery (local, before writing asserts)**
+- [x] **Step 1: Source-driven discovery (local, before writing asserts)**
 
 With the assets from Task 4's Step 5 present, run `"$AI_UPCYCLER_LLAMA_SERVER" --help` and the official llama.cpp HTTP docs: confirm `POST /tokenize` (returns token ids for `{"content": ...}`), `GET /health`, and whether `/v1/completions` or `/completion` returns `logprobs` in this release. Record findings in the test's header comment — they decide which assert branch below is active.
 
-- [ ] **Step 2: Write the failing parity test**
+- [x] **Step 2: Write the failing parity test**
 
 Flow: start `llama-server --model $AI_UPCYCLER_MODEL --port <free> --ctx 512` (stdout piped, killed at end), poll `/health` to ready → `POST /tokenize` → ids → feed `[1, n]` F32 to a full-range in-process engine → `argmax(logits)`. Required assert: greedy server next token (`temperature 0, n_predict 1` on the same prompt text) equals our argmax. Secondary assert if logprobs exist (per Step 1): server top-5 logprob values vs our `log_softmax` top-5 — same token set ≥ 4/5 and shared-token logprob diff ≤ 0.05. Test returns early (printing "skipped: env unset") when either env var is missing, so CI is never affected even without `#[ignore]`.
 
-- [ ] **Step 3: Run locally with assets**
+- [x] **Step 3: Run locally with assets**
 
 Run: `AI_UPCYCLER_MODEL=... AI_UPCYCLER_LLAMA_SERVER=... cargo test -p ai-upcycler-worker parity -- --ignored --nocapture`
 Expected: PASS; paste the argmax pair + logprob table into PR3's description. This plus Task 6's mutation check is PR3's evidence.
+*(See the test's header comment for the numeric-regime amendment: greedy-argmax stays exact, the shared-token bound is 0.6 on the quantized file — llama.cpp's CPU kernels quantize activations to 8-bit inside quantized-weight matmuls (block-bisect evidence in the PR); an F32-converted twin of the same model agrees with this engine to ≤ 4e-4 nats. Two real engine bugs were found and fixed by this gate: real Qwen2.5 files ship `attn_{q,k,v}.bias` tensors, and `rope_row` used GPT-J-style pairing instead of llama.cpp's NeoX `(i, i + head_dim/2)`.)*
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
-git add worker/tests/parity.rs && git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
-  commit -m "test(worker): reference parity of full-range logits vs llama-server"
+# two commits — the gate uncovered real engine bugs:
+git add worker/src/math.rs worker/src/layers.rs worker/src/engine.rs worker/tests/forward.rs worker/tests/common worker/tests/math_units.rs
+git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
+  commit -F <file>   # "fix(worker): qkv attention biases + neox rope pairing for llama parity"
+git add worker/tests/parity.rs worker/examples
+git -c user.name='AI Upcycler Bot' -c user.email='dev@aiupcycler.org' \
+  commit -F <file>   # "test(worker): reference parity of full-range logits vs llama-server"
 ```
 
 End of PR3: local verify (fixture tests all green without assets), PR with parity numbers + mutation check + K-quant disclosure, guide-comment check, squash-merge.

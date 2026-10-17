@@ -20,17 +20,19 @@ fn ref_linear(w: &[f64], n_in: usize, x: &[f64]) -> Vec<f64> {
 }
 
 fn ref_rope(x: &[f64], pos: usize, theta: f64) -> Vec<f64> {
+    // llama.cpp NeoX pairing (ggml-cpu/ops.cpp rotate_pairs, NEOX branch):
+    // pairs (j, j + head_dim/2), frequency index j.
     let head_dim = x.len();
-    (0..head_dim / 2)
-        .flat_map(|j| {
-            let angle = pos as f64 * theta.powf(-(2.0 * j as f64) / head_dim as f64);
-            let (c, s) = (angle.cos(), angle.sin());
-            [
-                x[2 * j] * c - x[2 * j + 1] * s,
-                x[2 * j] * s + x[2 * j + 1] * c,
-            ]
-        })
-        .collect()
+    let mut out = x.to_vec();
+    let half = head_dim / 2;
+    for j in 0..half {
+        let angle = pos as f64 * theta.powf(-(2.0 * j as f64) / head_dim as f64);
+        let (c, s) = (angle.cos(), angle.sin());
+        let (x0, x1) = (x[j], x[j + half]);
+        out[j] = x0 * c - x1 * s;
+        out[j + half] = x0 * s + x1 * c;
+    }
+    out
 }
 
 fn ref_softmax(v: &[f64]) -> Vec<f64> {
@@ -147,7 +149,7 @@ fn rope_preserves_pair_norm() {
     let x = [1.0f32, -2.0, 3.0, -0.5, 0.25, 7.0];
     let pair_norm = |v: &[f32; 6]| {
         (0..3)
-            .map(|j| (v[2 * j] as f64).powi(2) + (v[2 * j + 1] as f64).powi(2))
+            .map(|j| (v[j] as f64).powi(2) + (v[j + 3] as f64).powi(2))
             .collect::<Vec<f64>>()
     };
     let before = pair_norm(&x);
