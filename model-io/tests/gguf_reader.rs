@@ -1,14 +1,13 @@
 //! GGUF-v3 reader tests: metadata, tensor table, raw reads, and loud
 //! rejections of malformed fixtures (plan Task 2).
 
-mod common;
-
-use ai_upcycler_worker::gguf::GgufFile;
+use ai_upcycler_model_io::fixture::{write_tiny_model, TinyModelConfig};
+use ai_upcycler_model_io::gguf::GgufFile;
 
 #[test]
 fn parses_default_fixture_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let fx = common::write_tiny_model(dir.path(), common::TinyModelConfig::default());
+    let fx = write_tiny_model(dir.path(), TinyModelConfig::default());
 
     let gguf = GgufFile::open(&fx.path).expect("open fixture");
     assert_eq!(gguf.model_name(), "tiny-qwen2-f32");
@@ -28,7 +27,7 @@ fn parses_default_fixture_metadata() {
 #[test]
 fn tensor_table_matches_the_fixture_spec() {
     let dir = tempfile::tempdir().unwrap();
-    let fx = common::write_tiny_model(dir.path(), common::TinyModelConfig::default());
+    let fx = write_tiny_model(dir.path(), TinyModelConfig::default());
     let gguf = GgufFile::open(&fx.path).expect("open fixture");
 
     // Exactly the declared names: token_embd + 11 per-block tensors x 4
@@ -75,7 +74,7 @@ fn tensor_table_matches_the_fixture_spec() {
 #[test]
 fn read_raw_returns_the_bytes_the_writer_produced() {
     let dir = tempfile::tempdir().unwrap();
-    let fx = common::write_tiny_model(dir.path(), common::TinyModelConfig::default());
+    let fx = write_tiny_model(dir.path(), TinyModelConfig::default());
     let gguf = GgufFile::open(&fx.path).expect("open fixture");
 
     let got = gguf.read_raw("blk.0.attn_q.weight").expect("read");
@@ -91,7 +90,7 @@ fn read_raw_returns_the_bytes_the_writer_produced() {
 #[test]
 fn rejects_bad_magic() {
     let dir = tempfile::tempdir().unwrap();
-    let fx = common::write_tiny_model(dir.path(), common::TinyModelConfig::default());
+    let fx = write_tiny_model(dir.path(), TinyModelConfig::default());
     let mut bytes = std::fs::read(&fx.path).unwrap();
     bytes[0] = b'X';
     let bad = dir.path().join("bad-magic.gguf");
@@ -103,11 +102,11 @@ fn rejects_bad_magic() {
 #[test]
 fn rejects_wrong_architecture() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = common::TinyModelConfig {
+    let cfg = TinyModelConfig {
         architecture: "llama".into(),
         ..Default::default()
     };
-    let fx = common::write_tiny_model(dir.path(), cfg);
+    let fx = write_tiny_model(dir.path(), cfg);
 
     let err = GgufFile::open(&fx.path).expect_err("non-qwen2 arch rejected");
     assert!(
@@ -119,7 +118,7 @@ fn rejects_wrong_architecture() {
 #[test]
 fn rejects_truncated_file() {
     let dir = tempfile::tempdir().unwrap();
-    let fx = common::write_tiny_model(dir.path(), common::TinyModelConfig::default());
+    let fx = write_tiny_model(dir.path(), TinyModelConfig::default());
     let bytes = std::fs::read(&fx.path).unwrap();
 
     // Cuts across header, key/values, tensor infos and the data section.
@@ -136,11 +135,11 @@ fn rejects_truncated_file() {
 #[test]
 fn absent_rope_freq_base_defaults_to_10000() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = common::TinyModelConfig {
+    let cfg = TinyModelConfig {
         rope_theta: None,
         ..Default::default()
     };
-    let fx = common::write_tiny_model(dir.path(), cfg);
+    let fx = write_tiny_model(dir.path(), cfg);
 
     let gguf = GgufFile::open(&fx.path).expect("open fixture");
     assert_eq!(gguf.hparams().rope_theta, 10_000.0);

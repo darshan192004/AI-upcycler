@@ -61,10 +61,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-upcycler-model-io"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ai-upcycler-worker"
 version = "0.1.0"
 dependencies = [
  "ai-upcycler-core",
+ "ai-upcycler-model-io",
  "memmap2",
  "prost",
  "protoc-bin-vendored",

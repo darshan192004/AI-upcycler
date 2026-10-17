@@ -59,6 +59,32 @@ jobs:
       - name: Run worker tests
         run: cargo test -p ai-upcycler-worker
 
+  model-io:
+    name: Model I/O (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint model-io crate (clippy, deny warnings)
+        run: cargo clippy -p ai-upcycler-model-io --all-targets -- -D warnings
+
+      - name: Run model-io tests
+        run: cargo test -p ai-upcycler-model-io
+
   desktop:
     name: Desktop shell (Tauri v2, Linux)
     runs-on: ubuntu-22.04
