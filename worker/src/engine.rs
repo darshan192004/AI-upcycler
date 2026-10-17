@@ -5,10 +5,12 @@
 //! range. `ExecuteForward` refuses honestly until the forward slice lands.
 
 use crate::gguf::GgufFile;
+use crate::layers::{embed_ids, lm_head, run_block, BlockWeights, KvLayer};
+use crate::math::rms_norm;
 use crate::proto::aiupcycler::rpc::{
-    worker_service_server::WorkerService, ExecuteForwardRequest, ExecuteForwardResponse,
-    HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
-    LoadLayersResponse, UnloadLayersRequest, UnloadLayersResponse,
+    tensor_buffer::DataType, worker_service_server::WorkerService, ExecuteForwardRequest,
+    ExecuteForwardResponse, HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse,
+    LoadLayersRequest, LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::quant::{dequantize, GgmlType};
 use std::collections::HashMap;
@@ -27,6 +29,18 @@ struct EngineState {
     device_name: String,
     model: GgufFile,
     loaded: Option<LoadedRange>,
+    sessions: HashMap<String, Session>,
+}
+
+/// Concurrent forward sessions (KV-cache continuations). The cap bounds
+/// per-worker RAM growth: each session multiplies a full context-length cache.
+const MAX_SESSIONS: usize = 16;
+
+/// A forward session: KV caches for the loaded range plus the cache length
+/// reached. `kv[idx]` = cache of layer `start + idx`.
+struct Session {
+    kv: Vec<KvLayer>,
+    kv_len: usize,
 }
 
 /// Retained materialized weights for the loaded layer range; the forward
@@ -60,7 +74,7 @@ const BLOCK_TENSORS_OPTIONAL: [&str; 2] = ["attn_q_norm.weight", "attn_k_norm.we
 
 impl WorkerEngine {
     /// `device_name` empty resolves to the host name (or `"host"`). A model
-    /// file that fails GGUF validation makes construction fail — the binary
+    /// file that fails GGUF validation makes construction fail Ã¢â‚¬â€ the binary
     /// exits 1 before ever announcing `READY`.
     pub fn new(worker_id: &str, device_name: &str, model_path: PathBuf) -> Result<Self, String> {
         let model = GgufFile::open(Path::new(&model_path)).map_err(|e| format!("model: {e}"))?;
@@ -75,6 +89,7 @@ impl WorkerEngine {
                 device_name,
                 model,
                 loaded: None,
+                sessions: HashMap::new(),
             })),
         })
     }
@@ -93,6 +108,27 @@ impl WorkerEngine {
         sys.refresh_memory();
         (sys.total_memory(), sys.free_memory())
     }
+}
+
+/// Restores one block's weights to the loaded map so later forwards share
+/// the same allocation (the inverse of `BlockWeights::take`).
+fn put_block_back(tensors: &mut HashMap<String, Vec<f32>>, layer: u32, w: BlockWeights) {
+    let name = |part: &str| format!("blk.{layer}.{part}");
+    tensors.insert(name("attn_norm.weight"), w.attn_norm);
+    tensors.insert(name("ffn_norm.weight"), w.ffn_norm);
+    if let Some(v) = w.q_norm {
+        tensors.insert(name("attn_q_norm.weight"), v);
+    }
+    if let Some(v) = w.k_norm {
+        tensors.insert(name("attn_k_norm.weight"), v);
+    }
+    tensors.insert(name("attn_q.weight"), w.attn_q);
+    tensors.insert(name("attn_k.weight"), w.attn_k);
+    tensors.insert(name("attn_v.weight"), w.attn_v);
+    tensors.insert(name("attn_output.weight"), w.attn_output);
+    tensors.insert(name("ffn_gate.weight"), w.ffn_gate);
+    tensors.insert(name("ffn_up.weight"), w.ffn_up);
+    tensors.insert(name("ffn_down.weight"), w.ffn_down);
 }
 
 #[tonic::async_trait]
@@ -233,6 +269,7 @@ impl WorkerService for WorkerEngine {
         // Never-loaded unload reports success with zero bytes so the master's
         // rollback path never gets stuck.
         let freed = state.loaded.take().map(|loaded| loaded.bytes).unwrap_or(0);
+        state.sessions.clear();
         Ok(Response::new(UnloadLayersResponse {
             success: true,
             error_message: String::new(),
@@ -242,13 +279,218 @@ impl WorkerService for WorkerEngine {
 
     async fn execute_forward(
         &self,
-        _request: Request<ExecuteForwardRequest>,
+        request: Request<ExecuteForwardRequest>,
     ) -> Result<Response<ExecuteForwardResponse>, Status> {
-        eprintln!("[worker] execute_forward refused: not implemented yet");
+        let req = request.into_inner();
+        let mut state = self.state()?;
+        let hprops = state.model.hparams().clone();
+        let st = &mut *state;
+
+        #[allow(clippy::result_large_err)] // tonic::Status is large; returns are used immediately
+        let refuse = |reason: String| -> Result<Response<ExecuteForwardResponse>, Status> {
+            eprintln!("[worker] forward refused: {reason}");
+            Ok(Response::new(ExecuteForwardResponse {
+                success: false,
+                output_activation_tensor: None,
+                execution_time_us: 0,
+            }))
+        };
+
+        // ---- validation order: cheap structural checks before session work
+        let Some(loaded) = st.loaded.as_mut() else {
+            return refuse("no layers loaded".to_string());
+        };
+        if req.start_layer != loaded.start as i32 || req.end_layer != loaded.end as i32 {
+            return refuse(format!(
+                "forward range {}..={} does not match loaded {}..={}",
+                req.start_layer, req.end_layer, loaded.start, loaded.end
+            ));
+        }
+        let Some(tb) = &req.activation_tensor else {
+            return refuse("missing activation_tensor".to_string());
+        };
+        if tb.data_type != DataType::Fp32 as i32 {
+            return refuse(format!(
+                "activation data_type {} not supported (FP32 only)",
+                tb.data_type
+            ));
+        }
+
+        // Stage roles: start==0 carries token ids [1, n]; later stages carry
+        // hidden activations [n, hidden].
+        let hidden = hprops.embedding_length as usize;
+        let stage0 = loaded.start == 0;
+        let shape_ok = if stage0 {
+            tb.shape.len() == 2 && tb.shape[0] == 1 && tb.shape[1] >= 1
+        } else {
+            tb.shape.len() == 2 && tb.shape[0] >= 1 && tb.shape[1] == hidden as i64
+        };
+        if !shape_ok {
+            return refuse(format!(
+                "activation shape {:?} not valid for a stage starting at {} (ids expect [1, n], hidden expects [n, {hidden}])",
+                tb.shape, loaded.start
+            ));
+        }
+        let n_tokens = (if stage0 { tb.shape[1] } else { tb.shape[0] }) as usize;
+
+        let seq_pos = req.sequence_position;
+        if seq_pos < 0 {
+            return refuse(format!("negative sequence_position {seq_pos}"));
+        }
+        if (seq_pos as usize) + n_tokens > hprops.context_length as usize {
+            return refuse(format!(
+                "position {seq_pos} + {n_tokens} tokens exceeds context_length {}",
+                hprops.context_length
+            ));
+        }
+
+        // ---- session admission -------------------------------------------------
+        if !st.sessions.contains_key(&req.session_id) && st.sessions.len() >= MAX_SESSIONS {
+            return refuse(format!(
+                "session cap ({MAX_SESSIONS}) reached; no free slot for {:?}",
+                req.session_id
+            ));
+        }
+        let kv_dim = (hprops.head_count_kv * hprops.head_dim) as usize;
+        let layers_owned = (loaded.end - loaded.start) as usize + 1;
+        let kv_len = st
+            .sessions
+            .get(&req.session_id)
+            .map(|s| s.kv_len)
+            .unwrap_or(0);
+        if (seq_pos as usize) != kv_len {
+            return refuse(format!(
+                "sequence_position {seq_pos} != cached sequence length {kv_len} (out of order)"
+            ));
+        }
+
+        // ---- decode/validate inputs ------------------------------------------
+        let positions = kv_len..kv_len + n_tokens;
+        let mut x: Vec<f32> = if stage0 {
+            let Some(emb) = loaded.tensors.get("token_embd.weight") else {
+                return refuse(
+                    "stage 0 requires token_embd.weight in the loaded range".to_string(),
+                );
+            };
+            let raw: Vec<f32> = tb
+                .raw_data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            if raw.len() != n_tokens {
+                return refuse(format!(
+                    "stage-0 payload {} f32 values != shape [1, {n_tokens}]",
+                    raw.len()
+                ));
+            }
+            let vocab = emb.len() / hidden;
+            let mut ids: Vec<u32> = Vec::with_capacity(n_tokens);
+            for (i, &v) in raw.iter().enumerate() {
+                if !(v.is_finite() && v >= 0.0 && v.fract() == 0.0) {
+                    return refuse(format!("activation[{i}] = {v} is not a token id"));
+                }
+                let id = v as u32;
+                if id as usize >= vocab {
+                    return refuse(format!("token id {id} at/above vocab size {vocab}"));
+                }
+                ids.push(id);
+            }
+            let mut x = vec![0.0f32; n_tokens * hidden];
+            embed_ids(&ids, emb, hidden, &mut x);
+            x
+        } else {
+            let vals: Vec<f32> = tb
+                .raw_data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            if vals.len() != n_tokens * hidden {
+                return refuse(format!(
+                    "hidden payload {} f32 values != shape [{}Ãƒâ€”{hidden}]",
+                    vals.len(),
+                    n_tokens
+                ));
+            }
+            vals
+        };
+
+        // ---- run the owned range --------------------------------------------
+        // Blocks are taken out of the tensor map one at a time and restored,
+        // so concurrent sessions share one copy of the weights.
+        let t0 = std::time::Instant::now();
+        {
+            let session = st
+                .sessions
+                .entry(req.session_id.clone())
+                .or_insert_with(|| Session {
+                    kv: (0..layers_owned)
+                        .map(|_| KvLayer::new(kv_dim, hprops.context_length as usize))
+                        .collect(),
+                    kv_len: 0,
+                });
+            for idx in 0..layers_owned {
+                let layer = loaded.start + idx as u32;
+                let w = BlockWeights::take(&mut loaded.tensors, layer);
+                run_block(
+                    &w,
+                    &hprops,
+                    &mut session.kv[idx],
+                    &mut x,
+                    n_tokens,
+                    positions.clone(),
+                );
+                put_block_back(&mut loaded.tensors, layer, w);
+            }
+            session.kv_len = kv_len + n_tokens;
+        }
+
+        // ---- head stage (last block of the model) ---------------------------
+        let is_head = loaded.end == hprops.block_count - 1;
+        let (out, out_len) = if is_head {
+            {
+                let Some(norm) = loaded.tensors.get("output_norm.weight") else {
+                    return refuse("head stage requires output_norm.weight".to_string());
+                };
+                for t in 0..n_tokens {
+                    rms_norm(&mut x[t * hidden..(t + 1) * hidden], norm, hprops.rms_eps);
+                }
+            }
+            let head_part = if loaded.tensors.contains_key("output.weight") {
+                "output.weight"
+            } else if loaded.tensors.contains_key("token_embd.weight") {
+                "token_embd.weight" // tied model: the embedding is the head
+            } else {
+                return refuse("head stage loaded, but no output embedding/head found".to_string());
+            };
+            let n_vocab = loaded.tensors[head_part].len() / hidden;
+            let mut logits = vec![0.0f32; n_tokens * n_vocab];
+            for (t, logits_row) in logits.chunks_exact_mut(n_vocab).enumerate() {
+                lm_head(
+                    &x[t * hidden..(t + 1) * hidden],
+                    &loaded.tensors[head_part],
+                    hidden,
+                    logits_row,
+                );
+            }
+            (logits, n_vocab)
+        } else {
+            (x, hidden)
+        };
+
+        let us = t0.elapsed().as_micros().max(1) as i64;
+
         Ok(Response::new(ExecuteForwardResponse {
-            success: false,
-            output_activation_tensor: None,
-            execution_time_us: 0,
+            success: true,
+            output_activation_tensor: Some(TensorBuffer {
+                shape: vec![n_tokens as i64, out_len as i64],
+                data_type: DataType::Fp32 as i32,
+                raw_data: out.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            }),
+            execution_time_us: us,
         }))
     }
 
