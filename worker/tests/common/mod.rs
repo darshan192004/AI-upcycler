@@ -192,6 +192,29 @@ pub fn read_ready_line(out: &mut impl std::io::Read) -> String {
     panic!("worker exited before printing READY");
 }
 
+/// Serves an engine in-process on a loopback port (mirrors core's
+/// `serve_mock`); returns the port and the running server task.
+pub async fn serve_engine(
+    engine: ai_upcycler_worker::engine::WorkerEngine,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                ai_upcycler_worker::proto::aiupcycler::rpc::worker_service_server::WorkerServiceServer::new(
+                    engine,
+                ),
+            )
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("engine server");
+    });
+    (port, handle)
+}
+
 // ---------------------------------------------------------------------------
 // GGUF encoding internals
 // ---------------------------------------------------------------------------
