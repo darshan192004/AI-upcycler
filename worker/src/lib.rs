@@ -3,5 +3,6 @@
 
 pub mod engine;
 pub mod gguf;
+pub mod math;
 pub mod proto;
 pub mod quant;
