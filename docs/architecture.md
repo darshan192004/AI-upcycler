@@ -221,6 +221,14 @@ now, and pushing a contiguous GGUF chunk is future work.
 
 #### 3.1.4 What the worker engine must implement
 
+> **Implemented.** The host worker engine is the pure-Rust `worker/` crate
+> (`ai-upcycler-worker`): it satisfies this whole contract and is verified by
+> `worker/tests/*` (fixture tiers in CI; `load_contract.rs`, `split_equivalence.rs`
+> drive real processes through `LoadedPipeline`). The contract text below is kept
+> verbatim as the spec record; design + implementation notes live in
+> `docs/superpowers/specs/2026-10-16-worker-engine-design.md` and
+> `docs/superpowers/plans/2026-10-16-worker-engine.md` (PRs #41/#42/#53, PR4).
+
 The master half is done and mock-verified, so the remaining half is the engine. This is the
 contract it must satisfy:
 

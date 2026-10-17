@@ -12,6 +12,13 @@
 
 ## 3. Master Orchestrator Engine (Rust + Tauri)
 - [x] Initialize Tauri 2.0 Rust app in `src-tauri/` (config v2 schema, capability-based permissions).
+- [x] **Implement the host worker engine — the pure-Rust `worker/` crate (`ai-upcycler-worker`, engine half of the distributed split, `docs/superpowers/specs/2026-10-16-worker-engine-design.md`):**
+  - [x] Worker crate scaffold + GGUF-v3 reader + `LoadLayers`/`UnloadLayers` layer-range contract (PR #41; `worker/tests/process_smoke.rs`, `gguf_reader.rs`, `load_contract.rs`).
+  - [x] Dequantize the real model's ggml types (F32/F16/Q4_0/Q4_K/Q5_0/Q6_K/Q8_0) + decoder math units (RMS norm, linear, rope, softmax, SiLU) with f64 reference gates (PR #42; `dequant.rs`, `math_units.rs`).
+  - [x] `ExecuteForward`: KV-cached sessions, stage roles (token ids ↔ hidden handoff), full-range/partial/mid-stage forwards over the real 24-block Qwen2.5-0.5B file (PR #53; `forward.rs` — 13 tests incl. an f64-reference block gate).
+  - [x] **Logits parity vs `llama-server`** on the real quantized GGUF (asset-gated `worker/tests/parity.rs`): greedy argmax exact on "The capital of France is" (server −0.8261 vs ours −0.8355), all 25 server-listed logprobs shared, worst |Δ| 0.165 nats — bounded by llama.cpp's 8-bit activation quantization in its quantized-weight CPU kernels (an F32-converted twin of the same model agrees to ≤ 4e-4). The gate itself caught two real engine bugs: missing `attn_{q,k,v}.bias` support and GPT-J-style rope pairing instead of llama.cpp's NeoX `(i, i + head_dim/2)`.
+  - [x] **Split equivalence over real worker processes** (`worker/tests/split_equivalence.rs`, PR4): two-worker `[0..1, 2..3]` split through the master-side `LoadedPipeline` produces the same logits as the single-worker `[0..3]` run (fixture gate ≤ 1e-6; real-model 12/12 split gate ≤ 1e-4 + identical argmax). A tied model's tail stage carries `token_embd` as its output head — the ownership rule now reflects that.
+- [ ] Follow-ups from the worker-engine epic: master-side tokenizer (workers currently consume pre-tokenized ids); wire the live chat request path through `LoadedPipeline` + worker engines (the API still serves via host `llama-server`); commit K-quant dequant golden vectors once assets allow dequant-size regression gates in CI; port the engine to the Android worker (mTLS server + compute RPCs so phones join the split).
 - [x] Implement mDNS Service Browser (`mdns-sd` crate) to discover mobile workers.
 - [x] Implement ADB USB Tunnel Manager to trigger `adb forward tcp:50052 tcp:50052`.
 - [x] Build RPC Client module connecting to `cluster_rpc.proto` endpoints.
