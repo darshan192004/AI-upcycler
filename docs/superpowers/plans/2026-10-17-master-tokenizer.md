@@ -176,21 +176,38 @@ docs/...            this plan + the spec
       word). *(Done PR2, `decode_round_trips_the_whole_hermetic_corpus`.)*
 
 ### Task 6: Asset-gated /tokenize + /detokenize parity — PR3
-- [ ] `model-io/tests/tokenizer_parity.rs`: spawn llama-server (ephemeral port,
-      parity.rs pattern), run the 100+ corpus, `assert_eq!` on every id vector and
-      detokenization, exact.
-- [ ] Numbers recorded in the test header (corpus length, 100% match) and here.
+- [x] `model-io/tests/tokenizer_parity.rs`: spawn llama-server (ephemeral port,
+      parity.rs pattern), run the 111-string corpus, `assert_eq!` on every id
+      vector and detokenization, exact. *(Done PR3; every entry id-exact on
+      qwen2.5-0.5b-instruct-q4_k_m.gguf + llama.cpp build 11429, and
+      `/detokenize` string-equal to `decode` on the 8-string spot-corpus of
+      the same classes.)*
+- [x] Numbers recorded here: **111 corpus strings, 111/111 id-exact vs
+      `/tokenize`; 8/8 `/detokenize` string-equal.** The corpus is
+      codepoint-explicit (`\u{...}` escapes) so every script class is provable
+      from ASCII source alone; the `>= 100` corpus-size gate is asserted at
+      runtime inside the test.
 
 ### Task 7: ChatML helper — PR3
-- [ ] `apply_chatml(messages)` hard-codes the Qwen template; unit tests cover
-      system-first ordering and the literal `<|im_end|>` placement.
-- [ ] Qwen-only enforcement: the helper refuses on a file whose
-      `general.architecture` is not `qwen2` (honest, same refusal style as the
-      rest of the reader).
+- [x] `apply_chatml(messages)` hard-codes the Qwen template; unit tests cover
+      system-first ordering and the literal `<|im_end|>` placement. *(Done
+      PR3: `apply_chatml_renders_the_qwen_template_bit_exactly` - exact
+      string asserts, both with and without CONTROL specials present; the
+      specials case stays byte-exact through encode/decode.)*
+- [x] Qwen-only enforcement: the refusal lives at LOAD time
+      (`GgufFile::open` refuses any non-qwen2 `general.architecture` - single
+      source of truth, so a non-qwen2 `Tokenizer` cannot exist and
+      `apply_chatml` cannot run for one); the test proves the loader path
+      (`chatml_refuses_wrong_roles_and_wrong_architecture` builds a llama-marker
+      fixture and asserts the refusal), plus role refusals (unknown role,
+      mid-conversation system).
 
 ### Task 8: Docs — PR3
-- [ ] `tasks.md`: the "master-side tokenizer" follow-up checked with evidence.
-- [ ] `architecture.md`: the API note becomes "master tokenizes in-process via
-      model-io (tokenizer epic, PR#)".
-- [ ] `plan.md` / `tasks.md` phrasing stays accurate after the reader move (the
-      GGUF reader is `model-io`'s, shared with the engine).
+- [x] `tasks.md`: the "master-side tokenizer" follow-up checked with evidence
+      (111-string id-exact parity; live chat path + Android port remain as
+      separate unchecked items).
+- [x] `architecture.md`: a note after the §3 sequence diagram now states the
+      master tokenizes in-process via `model-io` (id-exact gates, ChatML,
+      specials-before-BPE) - PR-C.
+- [x] `plan.md` Phrasing stays accurate after the reader move (the GGUF
+      reader is `model-io`'s, shared with the engine).

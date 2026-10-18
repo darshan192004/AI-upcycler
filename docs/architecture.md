@@ -99,6 +99,22 @@ sequenceDiagram
     Master->>Master: Append Token to KV-Cache & Repeat Loop
 ```
 
+> **Master-side tokenization (the `model-io` tokenizer).** The master owns
+> the tokenizer. `model-io/src/tokenizer.rs` reads the `tokenizer.ggml.*` KVs
+> from the same `.gguf` the workers load and runs the qwen2-family pipeline
+> (`Tokenizer::encode`): the GPT-2 byte map, the qwen2 pre-tokenizer split -
+> one digit per pre-token, one arbitrary non-CR/LF prefix before letter runs -
+> rank-ordered BPE merges, and special markers such as `<|im_end|>` matched
+> leftmost-longest BEFORE BPE (llama.cpp's parse-special step). Prompts are
+> rendered through the hard-coded Qwen2.5 ChatML template
+> (`Tokenizer::apply_chatml`); decode refuses non-UTF-8 byte runs (`decode`).
+> The gates are **id-exact**: 111 corpus strings must produce byte-identical
+> id lists to llama.cpp's `POST /tokenize`, and the server's `/detokenize`
+> must string-equal our decode - see `model-io/tests/tokenizer_parity.rs`
+> (asset-gated like the engine parity; the proof run happened against
+> qwen2.5-0.5b-instruct-q4_k_m.gguf + llama.cpp build 11429). Workers keep
+> consuming pre-tokenized ids over `ExecuteForward` - they never see text.
+
 ### 3.1 Distributed Split Lifecycle: Load → Forward → Unload
 
 The diagram above traces a single *token*. A **session** loads the cluster once and then
