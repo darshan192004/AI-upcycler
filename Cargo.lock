@@ -21,6 +21,7 @@ dependencies = [
 name = "ai-upcycler-core"
 version = "0.2.0"
 dependencies = [
+ "ai-upcycler-model-io",
  "async-stream",
  "axum 0.7.9",
  "bytes",

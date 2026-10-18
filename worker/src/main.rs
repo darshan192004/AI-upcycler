@@ -8,6 +8,13 @@
 use ai_upcycler_worker::engine::WorkerEngine;
 use ai_upcycler_worker::proto::aiupcycler::rpc::worker_service_server::WorkerServiceServer;
 use std::net::SocketAddr;
+
+/// Shared RPC message limit with the master client
+/// (`ai-upcycler-core/src/rpc/client.rs`, `MAX_ACTIVATION_WIRE_BYTES`):
+/// whole prefill logits flow back through this server, one vocabulary row
+/// is 607,744 bytes on the shipped model, and the default 4MB tonic limit
+/// dies on a ~7-token prompt. Both sides must move together.
+const MAX_ACTIVATION_WIRE_BYTES: usize = 256 * 1024 * 1024;
 use std::path::PathBuf;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -72,7 +79,16 @@ async fn main() {
     let _ = std::io::stdout().flush();
 
     let result = Server::builder()
-        .add_service(WorkerServiceServer::new(engine))
+        .add_service(
+            // WHOLE prefill logits flow back through this server: a
+            // vocabulary row is 607,744 bytes on the shipped model, so the
+            // default 4MB tonic limit dies on a ~7-token prompt. Limits
+            // shared with the master client (core client.rs); long-context
+            // prefill needs a last-row-only wire contract (proto, deferred).
+            WorkerServiceServer::new(engine)
+                .max_decoding_message_size(MAX_ACTIVATION_WIRE_BYTES)
+                .max_encoding_message_size(MAX_ACTIVATION_WIRE_BYTES),
+        )
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await;
     if let Err(err) = result {

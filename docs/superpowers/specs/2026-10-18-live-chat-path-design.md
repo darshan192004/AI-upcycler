@@ -84,6 +84,38 @@ manual/mixed follow-up (existing pairing tests cover the ceremony itself).
 
 ### D4 - Positions and the token ledger
 
+> **REVISED during PR-1 implementation (2026-10-18), recorded here per the
+> "record deviating decisions with the reason" plan rule.** The KV-reuse ledger
+> above is sound on paper but fails two lived tests:
+>
+> 1. **BPE re-chunking breaks prefix alignment.** The worker's KV holds the RAW
+>    sampled id stream of the previous turn; the next request's ChatML render
+>    re-encodes the stored reply text, and `encode(decode(generated))` is not
+>    idempotent across turn boundaries (a reply like `" wor"+"d"` re-encodes as
+>    `" word"`), so "the first `full_ids[ledger..]` tokens are new" misindexes
+>    exactly when the memory saving matters.
+> 2. **Per-session KV is preallocated** for the worker's full context length
+>    (`KvLayer::new(kv_dim, context_length)`), hundreds of MB per session on the
+>    shipped model; `MAX_SESSIONS: 16` open sessions would exhaust worker RAM,
+>    and sessions are only reclaimed by `UnloadLayers` (`state.sessions.clear()`).
+>
+> **Shipped behavior (PR-1):** every request gets a FRESH worker KV session
+> (`{session}-r{requests}-a{attempt}`) and re-prefills the whole ChatML
+> conversation from sequence 0. Any worker refusal BEFORE the first emitted
+> token runs `driver.reset()` (unload -> every KV session cleared) and one
+> full retry; a second refusal fails the request honestly (bounded). Memory
+> stays bounded and correct for single-turn generation; multi-turn KV reuse -
+> which needs a free-single-session RPC (a proto change, excluded by D6) or a
+> worker-side LRU session eviction (worker-only, no proto change, plausible
+> PR-2+ follow-up) - moves to the follow-ups list. Each re-prefill costs one
+> prompt-length forward pass, strictly cheaper than a host-server round trip.
+
+The master keeps NO persistent position ledger: the fresh-session rule makes
+positions trivially correct by construction (prefill always starts at 0).
+
+<details><summary>Original D4 (2026-10-18 morning draft) - superseded, kept for the
+decision record</summary>
+
 The master keeps an in-memory ledger: `session_id -> tokens_already_in_context`.
 Workers own KV growth; the master owns only bookkeeping:
 
@@ -101,6 +133,25 @@ Workers own KV growth; the master owns only bookkeeping:
   retry per request); the second refusal fails the request honestly.
 - `session_id` (the chat session id) is passed through as `TensorPayload::session_id`
   verbatim; it is also the API session namespace, so KV separation is automatic.
+
+</details>
+
+**Gate outcome (2026-10-18, PR-1 acceptance):** llama-server's
+`/v1/chat/completions` cannot serve as the greedy reference on this build (it
+prepends the rendered prompt to `content`); the reference is llama's raw
+`/completion` with the hand-rendered ChatML prompt. Measured: llama picks id
+59604 "Paris" (top logprob -0.123; " Paris" was a hair behind in the chat
+endpoint's rendering, i.e. a genuine near-tie in the wild), then id 151645
+`<|im_end|>`; the master sampled the same ids id-for-id, and back-to-back runs
+were byte-identical - the forward path is a pure function of the prompt, so the
+D2 gate is deterministic, not luck-of-the-draw. Two serving-path limits were
+raised with measured basis in the PR commit message: `REQUEST_TIMEOUT` 30s ->
+120s (a release-profile prefill forward of the real model takes ~30s; debug
+builds exceed it outright) and RPC message limits 4MB -> 256MiB on both sides
+(the head stage returns WHOLE prefill logits - one vocab row is 607,744 bytes
+on the shipped model). Whole-logits prefill bounds prompts at ~430 tokens on
+the shipped model; long-context serving needs a last-row-only wire contract
+(a proto change, excluded by D6 - recorded as the natural follow-up).
 
 ### D5 - Stopping and shape of output
 

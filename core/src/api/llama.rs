@@ -360,6 +360,7 @@ mod tests {
             }],
             temperature: 0.7,
             max_tokens: 32,
+            session_id: "s-test".into(),
         }
     }
 

@@ -18,7 +18,23 @@ pub const PROTOCOL_VERSION: &str = "1.0";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time for a single RPC call once connected.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Measured (2026-10-18, release profile, this laptop + the real
+/// Qwen2.5-0.5B Q4_K_M model): one full prefill forward through the
+/// single-stage plan takes ~30s, and a DEBUG-build forward exceeds 30s
+/// outright (the old limit killed it - see `split_equivalence` runs). A
+/// phone is slower than this laptop, so prefill and long decode steps must
+/// not be murdered by the deadline; 120s stays bounded.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// RPC message limits, both directions. The head stage of a plan returns
+/// WHOLE prefill logits (`[n_tokens, n_vocab]` f32); for the shipped model
+/// one vocabulary row is 607,744 bytes(!), so a ~30-token prompt is already
+/// ~7.9MB - far past tonic's default 4MB. 256MiB admits prefill of ~430
+/// tokens on the shipped model; long-context serving needs a last-row-only
+/// wire contract (a proto change, deferred per the epic's D6) and the
+/// master refuses prompts that would not fit BEFORE dialing.
+pub const MAX_ACTIVATION_WIRE_BYTES: usize = 256 * 1024 * 1024;
 
 /// gRPC client for a single AI Upcycler worker node.
 ///
@@ -70,7 +86,9 @@ impl WorkerRpcClient {
             .timeout(REQUEST_TIMEOUT);
         let inner = WorkerServiceClient::connect(endpoint)
             .await
-            .map_err(|e| format!("failed to connect to worker at '{addr}': {e}"))?;
+            .map_err(|e| format!("failed to connect to worker at '{addr}': {e}"))?
+            .max_decoding_message_size(MAX_ACTIVATION_WIRE_BYTES)
+            .max_encoding_message_size(MAX_ACTIVATION_WIRE_BYTES);
         Ok(Self { inner })
     }
 
@@ -104,7 +122,9 @@ impl WorkerRpcClient {
             .map_err(|e| format!("invalid TLS config for '{addr}': {e}"))?;
         let inner = WorkerServiceClient::connect(endpoint)
             .await
-            .map_err(|e| format!("failed to connect to worker at '{addr}' over mTLS: {e}"))?;
+            .map_err(|e| format!("failed to connect to worker at '{addr}' over mTLS: {e}"))?
+            .max_decoding_message_size(MAX_ACTIVATION_WIRE_BYTES)
+            .max_encoding_message_size(MAX_ACTIVATION_WIRE_BYTES);
         Ok(Self { inner })
     }
 

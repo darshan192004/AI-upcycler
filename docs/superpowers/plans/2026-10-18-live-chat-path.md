@@ -10,35 +10,48 @@ the tokenizer epic: Conventional Commits, asset-gated proofs named explicitly,
 
 ## PR-1: DistributedBackend - single-stage happy path
 
-- [ ] `core/src/api/backend.rs`: keep `GenerationBackend`; add
+Status (2026-10-18, mid-implementation): code written on branch
+`feat/cluster-serving-single-stage`; the asset-gated parity run below is the
+acceptance gate. D4 was revised during implementation (see the spec blockquote)
+- the per-session token ledger became a fresh-session-per-request rule, and the
+"ledger math" hermetic tests became recovery/stop/emission tests.
+
+- [x] `core/src/api/backend.rs`: keep `GenerationBackend`; add
       `DistributedBackend` (construction: model_id, tokenizer path, transport
       source, planner input). Constructor loads `Tokenizer::from_gguf` once.
-- [ ] Token ledger: `session_id -> in_context_tokens` map owned by the backend
-      (Mutex-protected). Turn-1 prefill length == ChatML prompt length; ledger has
-      no persistence by design (D4: resets together with a fresh pipeline).
-- [ ] Sampler: greedy argmax over the last logits row + `temperature`/top-p
-      (seeded, llama-order-of-operations notes recorded). Unit tests: greedy exact
-      on a hand-made row incl. tie -> lower id; temperature flips a known ordering;
-      seeded determinism.
-- [ ] Generate loop: prefill once, then one-id `forward`s; stop on the
-      `<|im_end|>` id or `max_tokens`; decode per step; re-emission through the
-      existing `GenerationChunk` stream with real ids counted; refusal -> one
-      full re-prefill retry, second refusal -> honest error (D4).
-- [ ] Selection plumbing (D1): `AppState` learns a cluster-aware factory;
-      request-level fall-through to `LlamaCppBackend` when no enrolled verified
-      worker or a load/refusal failure occurs before the first byte. Unit test:
-      zero enrolled workers -> llama backend chosen (with mock discovery objects).
-- [ ] Asset-gated API test `core/tests/chat_serving.rs`: spawn ONE local
-      `ai-upcycler-worker` subprocess (full model, single stage), drive the REAL
-      router with a fixed prompt + `temperature: 0`, assert the streamed
-      continuation is token-equal to llama-server greedy on the same prompt
-      (llama-server spawned by the test, both reaped). Metrics events still
-      published per chunk. Skips without `AI_UPCCLER_MODEL` +
-      `AI_UPCCLER_LLAMA_SERVER` (worker binary path = `runtime/engine/`
-      sibling of llama-server, discovered the same way).
-- [ ] Hermetic CI additions: mock-worker loop test for the generate loop (1
-      worker, fake logits row chosen to force a stop id), ledger math, selection
-      fall-through. `cargo test -p ai-upcycler-core` green; workspace lanes green.
+- [x] Session handling (D4 revised, see header): fresh worker KV session per
+      request+attempt; no persistent master ledger.
+- [x] Sampler: greedy argmax over the last logits row + `temperature` and
+      top-p (seeded LCG, llama order of operations recorded). Unit tests:
+      greedy exact incl. tie-to-lower-id; temperature/top-p seeded
+      determinism; top-p narrows to the peak.
+- [x] Generate loop (`core/src/api/distributed.rs`): prefill once in a single
+      `forward`, then one-id `forward`s; stop on the `<|im_end|>` marker in
+      decoded text or `max_tokens`; decoded-diff streaming with partial-
+      marker withholding; refusal pre-first-emission -> `driver.reset()` +
+      one full re-prefill retry, second refusal -> honest error (D4).
+      No-emission recovery only (D4 invariant: a re-prefill after emitted
+      text would duplicate it). Hermetic tests against a canned
+      `PipelineDriver`: greedy reply, marker stop, double refusal, refusal +
+      reset recovery, marker-prefix buffering.
+- [x] Selection plumbing (D1): `AdaptiveBackend` in `core/src/api/mod.rs`
+      `bootstrap` - enrolled registered workers + valid plan + readable
+      tokenizer -> cluster; otherwise the llama `/stub` fallback inside
+      `AppState`. `session_id` added to `GenerationRequest` (llama and stub
+      ignore it). Zero-node selection fallback hermetic (mock `registry` + a
+      stub fallback) lives as an integration follow-up in PR-2's mock
+      cluster; the in-crate unit tests cover the cluster side directly.
+- [x] Asset-gated API test `core/tests/cluster_serving.rs` (PASSED 2026-10-18,
+      release profile): llama-server raw `/completion` reference (this build's
+      `/v1/chat/completions` prepends the rendered prompt to `content`) picks
+      ids 59604 "Paris" then 151645 `<|im_end|>`; the master sampled the same
+      ids id-for-id and back-to-back runs were byte-identical (determinism
+      confirmed). Bumped en route, both with measured basis in the commit:
+      `REQUEST_TIMEOUT` 30s -> 120s and RPC wire limits 4MB -> 256MiB (whole
+      prefill logits; over-limit prompts refused master-side before dialing).
+- [x] Hermetic CI additions: sampler, logits-row slicing, loop/recovery
+      tests in `core/src/api/distributed.rs` (`cargo test -p ai-upcycler-core`
+      green: 96 lib + 17 + 14 + 5).
 
 ## PR-2: Multi-stage splits + metrics truthing
 
