@@ -121,8 +121,14 @@ async fn buffered_response(
 
     let mut content = String::new();
     let mut completion_tokens: u64 = 0;
+    // The backend that encodes the prompt itself reports the TRUE prefill
+    // token count on its chunks (D5); the approximation stays the fallback.
+    let mut prompt_tokens: Option<u64> = None;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(ApiError::Internal)?;
+        if chunk.prompt_tokens.is_some() {
+            prompt_tokens = chunk.prompt_tokens.map(u64::from);
+        }
         content.push_str(&chunk.content);
         completion_tokens += u64::from(chunk.tokens_emitted);
     }
@@ -142,11 +148,13 @@ async fn buffered_response(
         elapsed,
     );
 
-    let prompt_tokens = generation
-        .messages
-        .iter()
-        .map(|m| approx_tokens(&m.content))
-        .sum::<i64>() as u64;
+    let prompt_tokens = prompt_tokens.unwrap_or_else(|| {
+        generation
+            .messages
+            .iter()
+            .map(|m| approx_tokens(&m.content))
+            .sum::<i64>() as u64
+    });
 
     Ok(Json(ChatCompletionResponse {
         id: chatcmpl_id(),
