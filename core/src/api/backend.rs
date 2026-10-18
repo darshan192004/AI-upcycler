@@ -20,6 +20,9 @@ pub struct GenerationRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// The chat session id (the API's session namespace). The backend keys
+    /// worker KV session ids off it; llama-server ignores it.
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +115,7 @@ mod tests {
             }],
             temperature: 0.7,
             max_tokens: 512,
+            session_id: "s-test".into(),
         }
     }
 

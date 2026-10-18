@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod chat;
 pub mod cluster;
+pub mod distributed;
 pub mod downloads;
 mod error;
 pub mod llama;
@@ -101,6 +102,13 @@ impl AppState {
         self
     }
 
+    /// Overrides the security state (bootstrap shares one CA/enrollment
+    /// registry between [`AppState`] and the adaptive chat backend).
+    pub fn with_security(mut self, security: Arc<SecurityState>) -> Self {
+        self.security = security;
+        self
+    }
+
     /// Overrides the GGUF download directory.
     pub fn with_models_dir(mut self, models_dir: PathBuf) -> Self {
         self.models_dir = models_dir;
@@ -119,10 +127,10 @@ impl AppState {
         telemetry: TelemetryBus,
         models_dir: PathBuf,
     ) -> Self {
-        let backend: Arc<dyn GenerationBackend> =
+        let fallback: Arc<dyn GenerationBackend> =
             match llama::LlamaCppBackend::discover(&models_dir) {
                 Some(engine) => {
-                    tracing::info!("generation backend: {}", engine.describe());
+                    tracing::info!("fallback generation backend: {}", engine.describe());
                     Arc::new(engine)
                 }
                 None => {
@@ -135,6 +143,16 @@ impl AppState {
                     Arc::new(StubBackend::new())
                 }
             };
+        // Cluster-first chat serving (design D1): the pairing-registry-backed
+        // adaptive backend serves through LoadedPipeline when enrolled workers
+        // exist; llama-server stays the fallback of last resort.
+        let security = Arc::new(SecurityState::default());
+        let backend: Arc<dyn GenerationBackend> = Arc::new(distributed::AdaptiveBackend::new(
+            registry.clone(),
+            store.clone(),
+            security.clone(),
+            fallback,
+        ));
         Self::new(
             cluster_id,
             registry,
@@ -143,6 +161,7 @@ impl AppState {
             telemetry,
             HostInfo::default(),
         )
+        .with_security(security)
         .with_models_dir(models_dir)
     }
 }

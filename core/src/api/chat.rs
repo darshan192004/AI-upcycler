@@ -95,10 +95,11 @@ pub async fn chat_completions(
     }
 
     let generation = GenerationRequest {
-        model: model.model_id,
+        model: model.model_id.clone(),
         messages: request.messages.clone(),
         temperature: request.temperature,
         max_tokens: request.max_tokens,
+        session_id: session_id.clone(),
     };
 
     if request.stream {
@@ -401,6 +402,7 @@ mod tests {
             messages: request(false).messages,
             temperature: 0.7,
             max_tokens: 64,
+            session_id: session_id.clone(),
         };
         let Json(response) = buffered_response(state.clone(), session_id.clone(), generation)
             .await
