@@ -361,6 +361,102 @@ fn special_tokens_are_matched_before_bpe_like_llama_cpp() {
 }
 
 #[test]
+fn apply_chatml_renders_the_qwen_template_bit_exactly() {
+    let (_dir, tok) = tokenizer();
+    let chat = tok
+        .apply_chatml(&[
+            ChatMessage {
+                role: "system",
+                content: "You are a helpful assistant.",
+            },
+            ChatMessage {
+                role: "user",
+                content: "Who won the series in 2020?",
+            },
+        ])
+        .expect("chatml");
+    assert_eq!(
+        chat,
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+         <|im_start|>user\nWho won the series in 2020?<|im_end|>\n\
+         <|im_start|>assistant\n"
+    );
+    // No messages at all is still valid: the generation prompt alone.
+    assert_eq!(
+        tok.apply_chatml(&[]).expect("empty chat"),
+        "<|im_start|>assistant\n"
+    );
+    // The rendered template round-trips: with specials present the markers
+    // BECOME their special ids, and their decode is the literal marker.
+    let (_dir2, tok_sp) = tokenizer_with(TokenizerFixture {
+        specials: vec![
+            "<|im_start|>assistant".to_string(),
+            "<|im_start|>".to_string(),
+            "<|im_end|>".to_string(),
+        ],
+        ..Default::default()
+    });
+    let chat2 = tok_sp
+        .apply_chatml(&[ChatMessage {
+            role: "user",
+            content: "hi",
+        }])
+        .expect("chatml with specials");
+    assert_eq!(
+        chat2,
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+    );
+    let ids = tok_sp.encode(&chat2).expect("encode chatml");
+    assert_eq!(
+        tok_sp.decode(&ids).expect("decode chatml"),
+        chat2,
+        "specials render through decode"
+    );
+    // Longest-first ordering made "<|im_start|>" fire as a whole special id
+    // instead of byte pieces - so the first id is NOT byte '<' (0x3C).
+    assert_ne!(ids.first(), Some(&0x3C), "must be a special id, not a byte");
+}
+
+#[test]
+fn chatml_refuses_wrong_roles_and_wrong_architecture() {
+    let (_dir, tok) = tokenizer();
+    // Unknown roles are refused with the role in the message.
+    assert!(matches!(
+        tok.apply_chatml(&[ChatMessage { role: "tool", content: "" }]),
+        Err(TokenizerError::UnsupportedRole(role)) if role == "tool"
+    ));
+    // A system turn mid-conversation is refused (template semantics).
+    assert!(matches!(
+        tok.apply_chatml(&[
+            ChatMessage {
+                role: "user",
+                content: "a"
+            },
+            ChatMessage {
+                role: "system",
+                content: "b"
+            },
+        ]),
+        Err(TokenizerError::UnsupportedRole(_))
+    ));
+    // And a non-qwen2 model never REACHES the template: the loader refuses.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let fx = write_tiny_model(
+        tempdir.path(),
+        TinyModelConfig {
+            architecture: "llama".to_string(),
+            ..Default::default()
+        },
+    );
+    match Tokenizer::from_gguf(&fx.path) {
+        Err(TokenizerError::Gguf(GgufError::UnsupportedArchitecture(arch))) => {
+            assert_eq!(arch, "llama");
+        }
+        other => panic!("expected architecture refusal, got {other:?}"),
+    }
+}
+
+#[test]
 fn bos_and_eos_ids_surface_when_written() {
     let (_dir, tok) = tokenizer_with(TokenizerFixture {
         bos: Some(0),

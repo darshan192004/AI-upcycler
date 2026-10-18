@@ -36,6 +36,15 @@ const QWEN2_SPLIT: &str = concat!(
     "|\\s+",
 );
 
+/// One turn of a ChatML conversation, as the Qwen2.5 template understands
+/// it: a role ("system" once as the first turn, then "user" / "assistant")
+/// and verbatim content.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatMessage<'a> {
+    pub role: &'a str,
+    pub content: &'a str,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
     #[error("not a byte-level BPE model: tokenizer.ggml.model = {0:?}")]
@@ -44,6 +53,8 @@ pub enum TokenizerError {
     UnsupportedPre(String),
     #[error("piece {0:?} is not in the vocabulary")]
     UnknownPiece(String),
+    #[error("invalid ChatML role {0:?} (system once as the first message, then user/assistant)")]
+    UnsupportedRole(String),
     #[error("id {0} outside the vocabulary of {1} pieces")]
     IdOutOfRange(u32, usize),
     #[error("gguf: {0}")]
@@ -155,6 +166,38 @@ impl Tokenizer {
     /// Number of vocabulary pieces (== the real file's `n_vocab`).
     pub fn n_pieces(&self) -> usize {
         self.pieces.len()
+    }
+
+    /// Renders a chat as the Qwen2.5 ChatML template, hard-coded for the
+    /// one model family this repo ships: each turn is
+    /// `<|im_start|>{role}\n{content}<|im_end|>\n`, followed by the
+    /// generation prompt `<|im_start|>assistant\n`.
+    ///
+    /// The qwen2-only guarantee is enforced ONCE, at load: `GgufFile::open`
+    /// refuses any other `general.architecture`, so a `Tokenizer` cannot
+    /// exist for a model this template does not fit (proven by
+    /// `chatml_refuses_wrong_roles_and_wrong_architecture`). The helper
+    /// deliberately does not re-check.
+    ///
+    /// Content is embedded verbatim, matching the reference template - no
+    /// escaping applies inside ChatML content.
+    pub fn apply_chatml(&self, messages: &[ChatMessage<'_>]) -> Result<String, TokenizerError> {
+        let mut out = String::with_capacity(2048);
+        for (i, msg) in messages.iter().enumerate() {
+            match msg.role {
+                "system" if i == 0 => {}
+                "user" | "assistant" => {}
+                // covers mid-conversation system turns and unknown roles
+                role => return Err(TokenizerError::UnsupportedRole(role.to_string())),
+            }
+            out.push_str("<|im_start|>");
+            out.push_str(msg.role);
+            out.push('\n');
+            out.push_str(msg.content);
+            out.push_str("<|im_end|>\n");
+        }
+        out.push_str("<|im_start|>assistant\n");
+        Ok(out)
     }
 
     /// Full text -> token ids: scan for special-token strings first
