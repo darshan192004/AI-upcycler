@@ -115,6 +115,48 @@ sequenceDiagram
 > qwen2.5-0.5b-instruct-q4_k_m.gguf + llama.cpp build 11429). Workers keep
 > consuming pre-tokenized ids over `ExecuteForward` - they never see text.
 
+### 3.0 Serving a live chat request (2026-10-18)
+
+Chat requests no longer delegate to the host `llama-server` when the cluster
+exists. `/v1/chat/completions` (`core/src/api/chat.rs`) runs on
+`AdaptiveBackend` (`core/src/api/distributed.rs`), which decides **once, before
+the first streamed byte**: cluster serving iff at least one enrolled, currently
+registered worker + a validated `compute_plan` + a readable tokenizer for the
+model's store row; otherwise the pre-existing `llama-server` backend is the
+fallback of last resort (the stub backend remains the final fallback and
+desktop debug path). No mid-stream fallbacks - a request either ends on the
+cluster or on the fallback.
+
+On the cluster path the master:
+
+1. Renders ChatML (`Tokenizer::apply_chatml`) + encodes in-process to `{ids}`
+   (§ above; the wire stays id-only, D6).
+2. Prefills in ONE `ExecuteForward` (the head stage returns WHOLE prefill
+   logits `[n_tokens, n_vocab]`), then drives one-id decode `forward`s through
+   `PipelineDriver`/`LoadedPipelineDriver` (fresh worker KV session per
+   request+attempt; `UnloadLayers`-backed reset recovery, bounded: exactly one
+   transparent re-prefill while nothing has been emitted, otherwise the
+   request fails honestly with the worker's error message).
+3. Samples master-side from the final logits row: greedy argmax (ties to the
+   lowest id, llama.cpp order) or temperature+top-p with a seeded LCG (our
+   determinism, not llama's RNG), and stops on `<|im_end|>` in decoded text -
+   the marker is never emitted, trailing marker-prefix bytes are withheld from
+   the stream.
+4. Streams decoded-diff chunks as SSE `chat.completion.chunk` with
+   `tokens_emitted` = real ids per chunk and carries the TRUE prefill length
+   for `usage.prompt_tokens`; the buffered (non-stream) shape assembles the
+   same content.
+
+Acceptance gates are asset-gated parity runs in `core/tests/cluster_serving.rs`
+(real router + real worker subprocesses): greedy continuations match
+llama-server's raw `/completion` id-for-id for both single-stage and a planned
+12/12 two-worker split; hermetic suites cover the sampler, marker handling,
+recovery windows, metric truthing and the SSE failure shape. Shipped
+limitation: the whole-logits prefill contract bounds prompts at roughly 430
+tokens on the shipped model (the 256MiB RPC message limits in
+`core/src/rpc/client.rs`); serving long contexts needs a last-row-only wire
+contract - a proto change, deliberately deferred.
+
 ### 3.1 Distributed Split Lifecycle: Load → Forward → Unload
 
 The diagram above traces a single *token*. A **session** loads the cluster once and then

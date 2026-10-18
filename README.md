@@ -113,6 +113,8 @@ Chat runs on a clearly-labelled stub backend until a llama.cpp engine is present
 
 When both files exist, the desktop app spawns `llama-server` on a loopback port at the first chat request and streams real tokens through the OpenAI-compatible API. With either file missing, behaviour is unchanged (stub backend + warning log).
 
+> **Cluster-first serving (2026-10-18).** If at least one enrolled worker is registered and a valid layer plan exists for your model, chat bypasses `llama-server` entirely: the master tokenizes the prompt in-process, splits inference stages across the worker cluster (`LoadedPipeline`), and streams tokens sampled from the cluster's logits — worker subprocesses only ever see token ids. `llama-server` stays as the automatic fallback whenever no cluster is available, and the choice is made per request before the first streamed byte. Whole-logits prefill currently bounds cluster-served prompts at roughly 430 tokens on the shipped model class.
+
 ---
 
 ## 🤝 Contributing
