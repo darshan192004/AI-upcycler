@@ -68,8 +68,45 @@ pub struct GgufFile {
     tensors: HashMap<String, TensorDesc>,
 }
 
+/// The `tokenizer.ggml.*` KVs the tokenizer needs, read through the same
+/// header/KV path as `open`, but with the four big arrays materialized
+/// instead of skipped. `bos_token_id`/`eos_token_id` are optional (their
+/// defaults are exercised by the tokenizer tests when absent).
+#[derive(Debug, Clone)]
+pub struct TokenizerKvs {
+    pub model: Option<String>,
+    pub pre: Option<String>,
+    pub vocab: Vec<String>,
+    pub merges: Vec<String>,
+    pub scores: Vec<f32>,
+    pub token_types: Vec<u32>,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+}
+
 impl GgufFile {
     pub fn open(path: &Path) -> Result<Self, GgufError> {
+        Ok(Self::open_inner(path, false)?.0)
+    }
+
+    /// Opens the file and additionally materializes the `tokenizer.ggml.*`
+    /// KVs (the four arrays are kept instead of skipped - a few MB for a
+    /// real vocabulary). The scalar-only `open` path is exactly what it was
+    /// before: unknown KVs are skipped without materializing anything.
+    pub fn open_with_tokenizer(path: &Path) -> Result<(Self, TokenizerKvs), GgufError> {
+        let (file, tok) = Self::open_inner(path, true)?;
+        Ok((
+            file,
+            tok.ok_or(GgufError::Malformed(
+                "tokenizer KVs missing despite want flag",
+            ))?,
+        ))
+    }
+
+    fn open_inner(
+        path: &Path,
+        want_tokenizer: bool,
+    ) -> Result<(Self, Option<TokenizerKvs>), GgufError> {
         let file = std::fs::File::open(path)?;
         // SAFETY: the file is only read; models are never mutated concurrently.
         let map = unsafe { Mmap::map(&file)? };
@@ -97,14 +134,77 @@ impl GgufFile {
         let mut key_length: Option<u32> = None;
         let mut rms_eps: Option<f32> = None;
         let mut rope_theta: Option<f32> = None;
+        let mut tokenizer = TokenizerKvs {
+            model: None,
+            pre: None,
+            vocab: Vec::new(),
+            merges: Vec::new(),
+            scores: Vec::new(),
+            token_types: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let mut tok_read = |key: &str, ty: u64, r: &mut Cursor| -> Result<bool, GgufError> {
+            if !want_tokenizer {
+                return Ok(false);
+            }
+            match (key, ty) {
+                ("tokenizer.ggml.tokens", 9) => {
+                    tokenizer.vocab = r.string_array()?;
+                    Ok(true)
+                }
+                ("tokenizer.ggml.tokens", _) => {
+                    Err(GgufError::WrongKeyType("tokenizer.ggml.tokens".into()))
+                }
+                ("tokenizer.ggml.merges", 9) => {
+                    tokenizer.merges = r.string_array()?;
+                    Ok(true)
+                }
+                ("tokenizer.ggml.merges", _) => {
+                    Err(GgufError::WrongKeyType("tokenizer.ggml.merges".into()))
+                }
+                ("tokenizer.ggml.scores", 9) => {
+                    tokenizer.scores = r.f32_array()?;
+                    Ok(true)
+                }
+                ("tokenizer.ggml.scores", _) => {
+                    Err(GgufError::WrongKeyType("tokenizer.ggml.scores".into()))
+                }
+                ("tokenizer.ggml.token_type", 9) => {
+                    tokenizer.token_types = r.u32_array()?;
+                    Ok(true)
+                }
+                ("tokenizer.ggml.token_type", _) => {
+                    Err(GgufError::WrongKeyType("tokenizer.ggml.token_type".into()))
+                }
+                _ => Ok(false),
+            }
+        };
 
         for _ in 0..n_kv {
             let key = r.string()?;
             // value_type is an int32/uint32-wide enum on disk (gguf.md spec
             // and llama.cpp's reference reader/writer both use 4 bytes).
             let ty = r.u32()? as u64;
+            if tok_read(&key, ty, &mut r)? {
+                continue;
+            }
             let value = r.skip_value(ty)?;
             match key.as_str() {
+                "tokenizer.ggml.model" => {
+                    tokenizer.model = Some(as_string(ty, &value, "tokenizer.ggml.model")?)
+                }
+                "tokenizer.ggml.pre" => {
+                    tokenizer.pre = Some(as_string(ty, &value, "tokenizer.ggml.pre")?)
+                }
+                "tokenizer.ggml.bos_token_id" => {
+                    tokenizer.bos_token_id =
+                        Some(as_u64(ty, &value, "tokenizer.ggml.bos_token_id")? as u32)
+                }
+                "tokenizer.ggml.eos_token_id" => {
+                    tokenizer.eos_token_id =
+                        Some(as_u64(ty, &value, "tokenizer.ggml.eos_token_id")? as u32)
+                }
                 "general.name" => model_name = Some(as_string(ty, &value, "general.name")?),
                 "general.architecture" => {
                     architecture = Some(as_string(ty, &value, "general.architecture")?)
@@ -192,23 +292,41 @@ impl GgufFile {
             }
         }
 
-        Ok(Self {
-            map,
-            data_offset,
-            model_name,
-            hparams: ModelHparams {
-                block_count,
-                embedding_length,
-                feed_forward_length,
-                head_count,
-                head_count_kv,
-                head_dim,
-                rms_eps,
-                rope_theta,
-                context_length,
+        if want_tokenizer {
+            // Required tokenizer keys, aligned with llama.cpp's own reader:
+            // only the vocab (always) and the merges (for BPE models). The
+            // real converted file this system ships LACKS `scores` - recent
+            // gguf-py writers omit it - and llama.cpp treats scores /
+            // token_type / model / pre / bos / eos as optional. An empty
+            // materialization means the key was absent, or present-and-empty.
+            if tokenizer.vocab.is_empty() {
+                return Err(GgufError::MissingKey("tokenizer.ggml.tokens"));
+            }
+            if tokenizer.merges.is_empty() {
+                return Err(GgufError::MissingKey("tokenizer.ggml.merges"));
+            }
+        }
+
+        Ok((
+            Self {
+                map,
+                data_offset,
+                model_name,
+                hparams: ModelHparams {
+                    block_count,
+                    embedding_length,
+                    feed_forward_length,
+                    head_count,
+                    head_count_kv,
+                    head_dim,
+                    rms_eps,
+                    rope_theta,
+                    context_length,
+                },
+                tensors,
             },
-            tensors,
-        })
+            want_tokenizer.then_some(tokenizer),
+        ))
     }
 
     pub fn model_name(&self) -> &str {
@@ -311,6 +429,69 @@ impl Cursor<'_> {
         let len = usize::try_from(len).map_err(|_| GgufError::Malformed("string length"))?;
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| GgufError::Malformed("non-utf-8 string"))
+    }
+
+    /// Reads a STRING-elements GGUF array (the `tokenizer.ggml.tokens` /
+    /// `merges` shape). The caller checked the array type id before.
+    fn string_array(&mut self) -> Result<Vec<String>, GgufError> {
+        let elem_ty = self.u32()? as u64;
+        if elem_ty != 8 {
+            return Err(GgufError::Malformed(
+                "string array must hold string elements",
+            ));
+        }
+        let count = self.u64()?;
+        let count = usize::try_from(count).map_err(|_| GgufError::Malformed("array length"))?;
+        let mut out = Vec::with_capacity(count.min(1 << 21));
+        for _ in 0..count {
+            out.push(self.string()?);
+        }
+        Ok(out)
+    }
+
+    /// Reads the `tokenizer.ggml.token_type` array. Real GGUF writers emit
+    /// INT32 elements (gguf-py always writes i32), so both u32 and i32
+    /// element widths are accepted; the type enum's values are small
+    /// non-negative integers (UNKNOWN=0..BYTE=5), so the i32 width is
+    /// widened with a documented `as u32`.
+    fn u32_array(&mut self) -> Result<Vec<u32>, GgufError> {
+        let elem_ty = self.u32()? as u64;
+        if elem_ty != 4 && elem_ty != 5 {
+            return Err(GgufError::Malformed(
+                "integer array must hold 32-bit integer elements",
+            ));
+        }
+        let count = self.u64()?;
+        let count = usize::try_from(count).map_err(|_| GgufError::Malformed("array length"))?;
+        let mut out = Vec::with_capacity(count.min(1 << 21));
+        match elem_ty {
+            4 => {
+                for _ in 0..count {
+                    out.push(self.u32()?);
+                }
+            }
+            _ => {
+                for _ in 0..count {
+                    out.push(i32::from_le_bytes(self.take(4)?.try_into().unwrap()) as u32);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads an F32-elements GGUF array (`tokenizer.ggml.scores`).
+    fn f32_array(&mut self) -> Result<Vec<f32>, GgufError> {
+        let elem_ty = self.u32()? as u64;
+        if elem_ty != 6 {
+            return Err(GgufError::Malformed("f32 array must hold f32 elements"));
+        }
+        let count = self.u64()?;
+        let count = usize::try_from(count).map_err(|_| GgufError::Malformed("array length"))?;
+        let mut out = Vec::with_capacity(count.min(1 << 21));
+        for _ in 0..count {
+            out.push(f32::from_le_bytes(self.take(4)?.try_into().unwrap()));
+        }
+        Ok(out)
     }
 
     /// Skips a KV value of the given type, materializing scalars/strings so
