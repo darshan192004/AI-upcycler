@@ -122,30 +122,58 @@ docs/...            this plan + the spec
       owner of the shared GGUF reader.
 
 ### Task 2: Tokenizer data reader — PR2
-- [ ] `tokenizer.ggml.model`, `.pre`, `.tokens`, `.scores`, `.token_type`,
+- [x] `tokenizer.ggml.model`, `.pre`, `.tokens`, `.scores`, `.token_type`,
       `.merges`, `.bos_token_id`, `.eos_token_id` read with typed loud errors;
-      an unknown `pre` value refuses with the value in the message.
-- [ ] Unit tests on a synthetic tokenizer fixture (small vocab plus 3 merges, written
-      by an extended fixture writer) covering refusals: missing merges, mismatched
-      token-type length, non-STRING tokens array (same refusal style as the existing
-      tensor/type gates).
+      an unknown `pre` value refuses with the value in the message. *(Done PR2:
+      llm-style scalars + the four arrays materialized via
+      `GgufFile::open_with_tokenizer` sharing the engine's KV loop - real-file
+      evidence adjusted two requirements: scores/token_type are OPTIONAL
+      exactly like llama.cpp's reader - the shipped q4_k_m omits scores - and
+      token_type accepts both i32 (what gguf-py writes) and u32 widths.*
+- [x] Unit tests on a synthetic tokenizer fixture (small vocab plus 5 merges + 2
+      specials, written by an extended fixture writer) covering refusals:
+      missing merges, missing tokens section, non-STRING tokens array
+      (Malformed), wrong model marker, unsupported `pre`, out-of-range ids,
+      invalid UTF-8 decode. 12 unit tests green (`tokenizer::tests`).
 
 ### Task 3: Byte encoder — PR2
-- [ ] 256-byte round-trip table (encode then decode is identity, both directions).
-- [ ] Known reference values unit-gated, exactly the classic `byte_to_unicode`
+- [x] 256-byte round-trip table (encode then decode is identity, both
+      directions); high bytes are single-byte-refused by the strict decoder
+      and round-trip only inside real multi-byte text (CJK, emoji ZWJ). *(Done
+      PR2, `all_256_bytes_round_trip_through_the_piece_table`.)*
+- [x] Known reference values unit-gated, exactly the classic `byte_to_unicode`
       table: byte 0x00 -> U+0100 (A with macron), byte 0x0A -> U+010A (C with dot),
-      byte 0x20 -> U+0120 (the well-known dotted-G piece encoding the space).
+      byte 0x20 -> U+0120 (the well-known dotted-G piece encoding the space). *(Done
+      PR2, `byte_table_matches_the_gpt2_map`.)*
 
 ### Task 4: `encode` (pre-tokenizer + BPE) — PR2
-- [ ] Hermetic hand examples on the synthetic vocab (single-token pieces,
+- [x] Hermetic hand examples on the synthetic vocab (single-token pieces,
       merge-ordered composition, contractions via the case-insensitive branch).
-- [ ] Pre-tokenizer span spot-checks asserted on hand-computed splits: digit runs
-      never exceed 3, punctuation-with-attached-space behaves like the server's,
-      LF-only runs split separately from trailing spaces.
+      *(Done PR2: `merge_order_picks_the_lowest_rank_first` - lowest rank wins,
+      re-scan after every merge - and `pre_tokenizer_splits_like_the_qwen2_rules`:
+      `I'll` splits `I` + `'ll`, `)abc` is one chunk so the (a,b) merge applies
+      inside it.)*
+- [x] Pre-tokenizer span spot-checks asserted on hand-computed splits: digits are
+      ONE pre-token each (`\p{N}` single, the Qwen2 rule llama.cpp dispatches -
+      unlike GPT-2/llama-3 `\p{N}{1,3}`, verified in llama.cpp `unicode.cpp`), letter
+      runs admit one arbitrary non-CR/LF non-digit prefix (not just a space),
+      punctuation runs absorb trailing CRLF, LF-only runs split separately from
+      trailing spaces.
+- [x] Special strings (token_type CONTROL/USER_DEFINED) match literal text
+      leftmost-longest BEFORE the regex - llama.cpp's parse-special step; verified
+      against the real model: without this, `<|im_end|>` literal text tokenized
+      differently from the server (33/35 corpus classes matched without it; with it
+      35/35). *(Hermetic gate `special_tokens_are_matched_before_bpe_like_llama_cpp`,
+      real-file gate `tokenizer_parity`.)*
 
 ### Task 5: `decode` — PR2
-- [ ] Strict UTF-8 refusal (typed error); mutation check with a truncated byte.
-- [ ] Round-trip: `decode(encode(text)) == text` over the hermetic corpus.
+- [x] Strict UTF-8 refusal (typed error); mutation check with a truncated byte
+      (lone 0xE4 lead byte, and every byte >= 0x80 alone, refused as
+      `InvalidUtf8`; out-of-range ids `IdOutOfRange`). *(Done PR2,
+      `decode_refuses_out_of_range_and_invalid_utf8`.)*
+- [x] Round-trip: `decode(encode(text)) == text` over the hermetic corpus
+      (prose, contractions, numbers, JSON, whitespace runs, CRLF, 1000-char
+      word). *(Done PR2, `decode_round_trips_the_whole_hermetic_corpus`.)*
 
 ### Task 6: Asset-gated /tokenize + /detokenize parity — PR3
 - [ ] `model-io/tests/tokenizer_parity.rs`: spawn llama-server (ephemeral port,

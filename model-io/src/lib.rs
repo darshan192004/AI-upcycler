@@ -8,3 +8,4 @@
 
 pub mod fixture;
 pub mod gguf;
+pub mod tokenizer;
