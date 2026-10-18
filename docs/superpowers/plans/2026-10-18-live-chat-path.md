@@ -79,16 +79,22 @@ acceptance gate. D4 was revised during implementation (see the spec blockquote)
 
 ## PR-3: Docs sweep + task tick + release notes
 
-- [ ] `docs/tasks.md`: the "wire the live chat request path" follow-up ticked with
+- [x] `docs/tasks.md`: the "wire the live chat request path" follow-up ticked with
       evidence pointers (test names, PR numbers); Android engine port moves up as
       the remaining unchecked epic.
-- [ ] `docs/architecture.md`: replace/extend the serving description - master
+- [x] `docs/architecture.md`: replace/extend the serving description - master
       tokenizes in-process, serves through `LoadedPipeline`, llama-server is the
       documented fallback; keep the §3 lifecycle diagram (worker contract
-      unchanged).
-- [ ] `README.md` quickstart note: cluster serving condition + fallback behavior.
-- [ ] Spec-plan cross-check: every checkbox above ticked with evidence; any
-      deviating decision recorded in the spec's decision log with the reason.
+      unchanged). New §3.0 "Serving a live chat request" sits between the
+      tokenizer note and §3.1; the worker-side diagrams are untouched.
+- [x] `README.md` quickstart note: cluster serving condition + fallback behavior
+      (Cluster-first serving callout in "Enable Real Inference").
+- [x] Spec-plan cross-check: PR-1 and PR-2 checkboxes ticked with evidence in
+      the plan; every deviating decision recorded in the spec's decision log -
+      D4's fresh-session revision (blockquote + superseded-draft details) and
+      the D2 gate outcome notes (the `/completion` reference, measured
+      determinism, the timeout/wire-limit raises with the whole-logits bound).
+      No additional deviations surfaced during PR-3 (docs-only).
 
 ---
 
