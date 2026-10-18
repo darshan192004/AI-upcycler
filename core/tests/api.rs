@@ -1,6 +1,8 @@
 //! End-to-end tests exercising the HTTP router in-process (no sockets).
 
-use ai_upcycler_core::api::backend::StubBackend;
+use ai_upcycler_core::api::backend::{
+    GenerationBackend, GenerationChunk, GenerationRequest, StubBackend,
+};
 use ai_upcycler_core::api::downloads::StubFetcher;
 use ai_upcycler_core::api::{router, AppState, HostInfo};
 use ai_upcycler_core::discovery::mdns::{DiscoveredNode, NodeRegistry};
@@ -9,6 +11,7 @@ use ai_upcycler_core::telemetry::{DownloadStatus, TelemetryBus, TelemetryEvent};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
+use futures::stream::BoxStream;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,6 +158,85 @@ async fn streams_chat_as_sse() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("chat.completion.chunk"));
     assert!(text.contains("data: [DONE]"));
+}
+
+/// A backend whose stream refuses mid-generation: the documented failure
+/// (post-emission evictions/refusals fail honestly, plan PR-2) must surface
+/// as an SSE `error` event, not as a silently-truncated answer.
+struct RefusingBackend;
+
+impl GenerationBackend for RefusingBackend {
+    fn generate(
+        &self,
+        _request: GenerationRequest,
+    ) -> BoxStream<'static, Result<GenerationChunk, String>> {
+        Box::pin(async_stream::stream! {
+            yield Ok(GenerationChunk {
+                content: "partial".into(),
+                tokens_emitted: 1,
+                prompt_tokens: Some(3),
+            });
+            yield Err("session evicted mid-decode".into());
+        })
+    }
+}
+
+#[tokio::test]
+async fn stream_failures_surface_as_sse_error_events() {
+    let store = Arc::new(Store::open_in_memory().expect("store"));
+    store
+        .upsert_model(&NewModel {
+            model_id: "llama-8b".into(),
+            file_name: "llama.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 32,
+            weight_size_bytes: 32 * 1024 * 1024,
+            local_file_path: "/models/llama.gguf".into(),
+        })
+        .unwrap();
+    let state = AppState::new(
+        "cluster-1".into(),
+        Arc::new(NodeRegistry::new()),
+        store,
+        Arc::new(RefusingBackend),
+        TelemetryBus::new(64),
+        HostInfo {
+            node_id: "master".into(),
+            device_name: "Master".into(),
+            total_ram_mb: 2048,
+            cpu_cores: 4,
+        },
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "llama-8b",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "stream this" }]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("\"error\""),
+        "the refusal must surface as an SSE error event: {text}"
+    );
+    assert!(
+        text.contains("session evicted mid-decode"),
+        "the honest refusal message must reach the client: {text}"
+    );
 }
 
 #[tokio::test]

@@ -322,6 +322,7 @@ where
                         yield Ok(GenerationChunk {
                             content,
                             tokens_emitted: 1,
+                            prompt_tokens: None,
                         });
                     }
                     SseLine::Skip => {}

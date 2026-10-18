@@ -441,6 +441,9 @@ impl GenerationBackend for DistributedBackend {
                     }
                 };
                 positions = full_ids.len();
+                // Truth for `usage.prompt_tokens` (D5): the chunks carry the
+                // exact prefill length forward to the API layer.
+                let prefill_len = full_ids.len() as u32;
 
                 // ---- decode loop ----------------------------------------
                 let mut generated: Vec<u32> = Vec::new();
@@ -471,6 +474,7 @@ impl GenerationBackend for DistributedBackend {
                                 yield Ok(GenerationChunk {
                                     content: tail,
                                     tokens_emitted: 1,
+                                    prompt_tokens: Some(prefill_len),
                                 });
                             }
                             stop = true;
@@ -489,6 +493,7 @@ impl GenerationBackend for DistributedBackend {
                                 yield Ok(GenerationChunk {
                                     content: suffix,
                                     tokens_emitted: 1,
+                                    prompt_tokens: Some(prefill_len),
                                 });
                             }
                         }
@@ -628,6 +633,17 @@ impl AdaptiveBackend {
             activation_bytes: 0,
             quantization: row.quantization_format.clone(),
         };
+        // The scheduler fills nodes in the ORDER IT IS HAND them, and the
+        // registry's map order is arbitrary: sort deterministically (small
+        // free RAM first) so multi-stage plans are stable - a node with room
+        // for everything must not starve the smaller ones just because the
+        // HashMap listed it first.
+        let mut nodes = nodes;
+        nodes.sort_by(|a, b| {
+            a.free_ram_bytes
+                .cmp(&b.free_ram_bytes)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
         let plan = LayerScheduler::compute_plan(&spec, &nodes);
         if plan.assignments.is_empty() {
             return None;
@@ -1045,5 +1061,62 @@ mod tests {
         let backend = DistributedBackend::new("tiny", tokenizer, Arc::new(FailingAfterReset));
         let (_, _, error) = drained(backend.generate(request("s1", 2))).await;
         assert!(error.unwrap().contains("after retry"));
+    }
+
+    /// A worker destroying the session mid-decode is RECOVERABLE only while
+    /// nothing has been emitted (D4: a re-prefill after emitted text would
+    /// duplicate it). Schedule: the prefill picks byte id 128, whose decode
+    /// alone is invalid UTF-8 - so the first sampled id emits NOTHING, the
+    /// first decode forward refuses, and the retry re-prefills with a row
+    /// that picks 'A' (id 65). One transparent recovery, zero duplicated
+    /// content, honest accounting of two true emitted ids.
+    #[tokio::test]
+    async fn evicted_session_recovers_through_one_re_prefill() {
+        let refusal = Err("session evicted mid-decode".into());
+        let mut hidden = vec![0.0f32; 256];
+        hidden[128] = 9.0;
+        let visible = pick_row(65); // 'A'
+        let driver = FakeDriver::new(vec![
+            FakeDriver::logits(&hidden),  // prefill
+            refusal,                      // decode step 1: evicted (nothing emitted)
+            FakeDriver::logits(&visible), // re-prefill
+            FakeDriver::logits(&visible), // decode step (attempt 1)
+        ]);
+        let (tokenizer, dir) = tiny_tokenizer();
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        // max_tokens 2: attempt 0 samples the hidden id, the first decode
+        // forward is refused, the retry re-prefills and emits two 'A's.
+        let (content, tokens, error) = drained(backend.generate(request("s1", 2))).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(content, "AA");
+        assert_eq!(tokens, 2, "exactly two real ids were emitted");
+        assert_eq!(driver.resets(), 1, "exactly one reset before the retry");
+        drop(dir);
+    }
+
+    /// Metric truthing (D5): every chunk carries the TRUE prefill length so
+    /// `usage.prompt_tokens` stops being the whitespace approximation.
+    #[tokio::test]
+    async fn chunks_carry_the_true_prefill_token_count() {
+        let mut row = vec![0.0f32; 256];
+        row[87] = 9.0; // 'W'
+        let driver = FakeDriver::new(vec![FakeDriver::logits(&row)]);
+        let (tokenizer, dir) = tiny_tokenizer();
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let request = request("s1", 1);
+        let expected_prefill =
+            DistributedBackend::prompt_ids(&backend, &request.messages).expect("prompt ids");
+        let mut chunks = Vec::new();
+        let mut stream = backend.generate(request);
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("chunk"));
+        }
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].prompt_tokens,
+            Some(expected_prefill.len() as u32),
+            "the chunk must carry the exact prefill length"
+        );
+        drop(dir);
     }
 }

@@ -55,16 +55,27 @@ acceptance gate. D4 was revised during implementation (see the spec blockquote)
 
 ## PR-2: Multi-stage splits + metrics truthing
 
-- [ ] Two-stage serving test (asset-gated): two local workers, planner splits the
-      real 24-layer model, same greedy parity assert through the real router.
-- [ ] `tokens_emitted`/telemetry: publish_metrics counts REAL ids; add a hermetic
-      assert that a streamed response's `completion_tokens` equals the emitted id
-      count (fixes today's "fragments==tokens" fudge, `chat.rs:122-131`).
-- [ ] Buffered (non-stream) path: full assembly + `usage.prompt_tokens == prefill
-      len`; asset-gated parity assert on the buffered shape too (same prompt).
-- [ ] Eviction/evict-then-re-prefill hermetic test: mock worker destroys the
-      session mid-decode; assert one transparent re-prefill; second refusal ->
-      documented failure surfaced as a 5xx-style SSE error event.
+- [x] Two-stage serving test (asset-gated, PASSED 2026-10-18, release
+      profile): two local workers split the real 24-block model 12/12 (RAM
+      declarations tuned; a hermetic pin test locks the planner arithmetic so
+      the split cannot degenerate), streamed greedy continuation id-for-id
+      equal to llama's `/completion` reference. Enabling fix: `try_cluster`
+      orders nodes deterministically (ascending free RAM) - the registry's
+      map order previously made multi-stage plans hash-luck.
+- [x] `tokens_emitted`/telemetry: completion counting was already real (one
+      emitted id per chunk); PR-2 closes the prompt side: chunks carry the
+      TRUE prefill length (`GenerationChunk.prompt_tokens`), buffered
+      `usage.prompt_tokens` uses it, the whitespace estimate stays the
+      llama/stub fallback. Hermetic: chunks_carry_the_true_prefill_token_count.
+- [x] Buffered (non-stream) path: full assembly +(asset-gated assert, passed
+      as part of the single-stage test run) content == reference and
+      `usage.prompt_tokens` present.
+- [x] Eviction/evict-then-re-prefill hermetic test: a mid-decode refusal
+      before the first emitted token triggers exactly one reset + re-prefill
+      (`evicted_session_recovers_through_one_re_prefill`); post-emission
+      refusal surfaces as an SSE error event with the honest message
+      (`stream_failures_surface_as_sse_error_events`), second refusal keeps
+      failing the request (`second_refusal_fails_the_request_honestly`).
 
 ## PR-3: Docs sweep + task tick + release notes
 

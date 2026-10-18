@@ -29,6 +29,11 @@ pub struct GenerationRequest {
 pub struct GenerationChunk {
     pub content: String,
     pub tokens_emitted: u32,
+    /// The TRUE count of prompt tokens (the prefill length) set by backends
+    /// that encode the prompt themselves. `None` leaves the API's estimate
+    /// (`approx_tokens`) in `usage` - the llama fallback has no token-level
+    /// view of its JSON streaming.
+    pub prompt_tokens: Option<u32>,
 }
 
 /// Produces a stream of token chunks for a chat request.
@@ -85,6 +90,7 @@ impl GenerationBackend for StubBackend {
                 yield Ok(GenerationChunk {
                     content: word.to_string(),
                     tokens_emitted: 1,
+                    prompt_tokens: None,
                 });
             }
         })
