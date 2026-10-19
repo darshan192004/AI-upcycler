@@ -30,3 +30,31 @@ tasks.register("checkProtoInSync") {
         }
     }
 }
+
+// The dequant goldens the Android engine tests consume are copies of the
+// committed `worker/tests/goldens/*.txt` fixtures cut from the shipped model
+// file. This guard is the proto-guard pattern applied to them: the Rust
+// golden files stay the canonical source, and any edit to one must be
+// mirrored byte-identically into the Android test resources or the build
+// fails loudest.
+val goldenNames = listOf("q4_k", "q5_0", "q6_k", "q8_0")
+tasks.register("checkEngineFixtureSync") {
+    description = "Fails if the mirrored dequant goldens drift from worker/tests/goldens/."
+    group = "verification"
+    doLast {
+        for (name in goldenNames) {
+            val canonical = rootDir.resolve("../../worker/tests/goldens/$name.txt").normalize()
+            val mirrored =
+                rootDir.resolve("app/src/test/resources/engine/goldens/$name.txt").normalize()
+            if (!canonical.exists()) {
+                throw GradleException("Canonical golden not found: $canonical")
+            }
+            if (!mirrored.exists() || canonical.readBytes().contentEquals(mirrored.readBytes()).not()) {
+                throw GradleException(
+                    "app/src/test/resources/engine/goldens/$name.txt is out of sync with " +
+                        "worker/tests/goldens/$name.txt. Copy the canonical file over the mirrored copy.",
+                )
+            }
+        }
+    }
+}
