@@ -1,6 +1,7 @@
 package org.aiupcycler.worker.engine
 
 import java.io.File
+import org.aiupcycler.worker.rpc.EngineSource
 
 /**
  * Worker engine state machine behind the `WorkerService` compute RPCs —
@@ -42,11 +43,16 @@ class ForwardResult(
  * a file that fails validation throws and the caller must not wire the engine
  * into the RPC service (the local Rust binary exits 1 before announcing READY;
  * the phone equivalent is to serve metadata-only with compute `UNIMPLEMENTED`).
+ *
+ * Implements `EngineSource` (the RPC layer's seam, spec 2026-10-19
+ * android-compute-rpcs): the three compute RPCs delegate straight through,
+ * so validation order, refusals and byte accounting are the wire contract
+ * without a translation layer.
  */
 class WorkerEngine private constructor(
     private val model: GgufFile,
     val modelName: String,
-) {
+) : EngineSource {
     private var loaded: LoadedRange? = null
     private val sessions = HashMap<String, Session>()
 
@@ -119,7 +125,7 @@ class WorkerEngine private constructor(
     /** The number of key/value elements per layer row (mirrors the Rust engine's `kv_dim`). */
     private fun kvDim(): Int = hparams.headCountKv * hparams.headDim
 
-    fun loadLayers(modelId: String, startLayer: Int, endLayer: Int): EngineOutcome {
+    override fun loadLayers(modelId: String, startLayer: Int, endLayer: Int): EngineOutcome {
         val blockCount = hparams.blockCount
 
         // Validation order: cheap refusals before any tensor materialization.
@@ -193,7 +199,7 @@ class WorkerEngine private constructor(
         return LoadSuccess(allocatedRamBytes = bytes, startLayer, endLayer)
     }
 
-    fun unloadLayers(modelId: String): EngineOutcome {
+    override fun unloadLayers(modelId: String): EngineOutcome {
         if (modelId != modelName) {
             return UnloadFailure(
                 "unknown model_id \"$modelId\"; this worker holds \"$modelName\"",
@@ -213,7 +219,7 @@ class WorkerEngine private constructor(
      * real math. `timingUs` comes from the caller (wall-clock is owned by
      * the RPC layer).
      */
-    fun execute(
+    override fun execute(
         sessionId: String,
         startLayer: Int,
         endLayer: Int,

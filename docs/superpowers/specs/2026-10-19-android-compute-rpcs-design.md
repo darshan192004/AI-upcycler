@@ -1,8 +1,10 @@
 # Android Worker Compute RPCs — Design (2026-10-19)
 
-Status: **SPEC — awaiting review** (epic: tasks.md §5 "Port the engine to the
-Android worker", first half). The mTLS/QR pairing worker half is spec'd and
-shipped separately afterwards; this epic deliberately excludes it.
+Status: **IMPLEMENTED** (2026-10-19; epic: tasks.md §5 "Port the engine to the
+Android worker", first half; PRs #65 spec, #66 parser/dequant, #67 refusal
+matrix, #68 forward parity, #70 RPC wiring). The mTLS/QR pairing worker half
+is spec'd and shipped separately afterwards; this epic deliberately excludes
+it.
 
 Predecessors: `2026-10-16-worker-engine-design.md` (the Rust engine this one
 mirrors) and `2026-10-18-live-chat-path-design.md` (the serving path that

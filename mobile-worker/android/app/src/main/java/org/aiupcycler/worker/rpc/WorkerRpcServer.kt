@@ -13,6 +13,8 @@ import java.util.concurrent.TimeUnit
 class WorkerRpcServer(
     private val identity: WorkerIdentitySource,
     private val metrics: DeviceMetricsSource,
+    /** Compute backend; `null` until a GGUF is side-loaded (spec D-A4). */
+    private val engine: EngineSource? = null,
     private val port: Int = WorkerProtocol.RPC_PORT,
 ) {
     private var server: Server? = null
@@ -20,7 +22,7 @@ class WorkerRpcServer(
     fun start() {
         if (server != null) return
         server = ServerBuilder.forPort(port)
-            .addService(WorkerRpcService(identity, metrics))
+            .addService(WorkerRpcService(identity, metrics, engine))
             .build()
             .start()
     }
