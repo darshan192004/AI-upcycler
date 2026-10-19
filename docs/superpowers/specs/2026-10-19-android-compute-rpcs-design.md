@@ -71,6 +71,17 @@ straight into that directory; outputs never hand-edited):
   dequant goldens). Coverage: stage-0 prefill + decode, mid-stage forward,
   head-stage forward, and the refusal matrix (bad range, wrong shape,
   out-of-order `sequence_position`, unsupported quant type id 7).
+- Bit-exactness is the bar where it is honestly attainable: **dequant**, the
+  byte accounting, and every ordered multiply-accumulate are pure bitwise
+  deterministic and pinned exactly. Forward *outputs* additionally cross one
+  libm boundary (`powf`/`sinf`/`cosf`/`expf` in RoPE/softmax/SiLU differ by
+  1–2 ulp between MSVC, glibc and fdlibm even among Rust hosts), so those
+  comparisons use a strict, documented tolerance (relative ≤ 1e-5, about
+  2 ulp of the typical value range) against the Rust-cut vectors — with the
+  tolerance named, bounded, and justified in the test file itself, never a
+  blanket epsilon. The route to full bit parity (porting one fdlibm
+  `expf/sinf/cosf/powf` family to both engines) is recorded as a follow-up,
+  not silently dropped.
 - Both sides consume the same fixtures: Rust side pins them as regression
   guards (a Rust test reads the committed vectors back), the Kotlin engine must
   reproduce them bit-for-bit (same IEEE-754 ops in the same order — achievable
