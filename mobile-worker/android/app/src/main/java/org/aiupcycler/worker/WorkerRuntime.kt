@@ -38,9 +38,13 @@ class WorkerRuntime(private val context: Context) {
     fun credentials(): WorkerCredentials? = credentials.load()
 
     fun start() {
-        rpcServer.start()
+        rpcServer.start(credentials.load())
         advertiser.start()
-        Log.i(TAG, "worker $workerId serving gRPC on 0.0.0.0:$port")
+        Log.i(
+            TAG,
+            "worker $workerId serving gRPC on 0.0.0.0:$port" +
+                if (rpcServer.isTls) " (mTLS)" else " (plaintext ADB path)",
+        )
     }
 
     fun stop() {
@@ -99,7 +103,12 @@ class WorkerRuntime(private val context: Context) {
         if (result is EnrollmentResult.Enrolled) {
             try {
                 credentials.save(result.credentials)
-                Log.i(TAG, "paired with the master; credentials stored")
+                // Only now, with the credentials on disk, does the port stop
+                // accepting plaintext (spec D-B5). A failure to restart leaves
+                // the worker serving plaintext rather than half-configured, and
+                // says so - the next start() picks TLS up from the store.
+                restartServing()
+                Log.i(TAG, "paired with the master; credentials stored, serving mTLS")
             } catch (e: Exception) {
                 return EnrollmentResult.Failed("Could not store credentials: ${e.message}")
             }
@@ -107,10 +116,19 @@ class WorkerRuntime(private val context: Context) {
         return result
     }
 
-    /** Forgets the pairing (spec D-B4); the worker keeps serving ADB plaintext. */
+    /** Re-reads the pairing and re-starts the server in the mode it implies. */
+    private fun restartServing() {
+        rpcServer.stop()
+        rpcServer.start(credentials.load())
+    }
+
+    /** Forgets the pairing (spec D-B4); the worker returns to plaintext ADB. */
     fun forgetPairing() {
         credentials.clear()
-        Log.i(TAG, "pairing forgotten")
+        // The port must stop serving mTLS with credentials we no longer hold;
+        // restarting is how the mode changes without a reconnect (D-B5).
+        restartServing()
+        Log.i(TAG, "pairing forgotten; serving plaintext on the ADB path again")
     }
 
     private fun nodeId(): String = advertiser.nodeId()
