@@ -74,7 +74,22 @@
 - [x] Implement mDNS service registration (`_aiupcycler-worker._tcp` via `NsdManager`, publishing the TXT records the master parses) — implemented; needs a device to verify on-LAN.
 - [x] Implement battery and temperature telemetry monitor — `Handshake`/`GetHealthStatus` return real RAM/battery/thermal readings; needs a device to verify sysfs values.
 - [x] Verify the worker wire contract without a device — in-process gRPC test (`WorkerRpcContractTest`) runs the real `WorkerRpcService` through the generated stub, asserting the metadata replies and that the compute RPCs stay `UNIMPLEMENTED`.
-- [ ] Serve the compute RPCs: cross-compile native C++ `llama.cpp` RPC worker server for ARM64 (`libllama-rpc.so`) and implement `LoadLayers`/`ExecuteForward`/`UnloadLayers` (currently `UNIMPLEMENTED`). The master-side driver that will call them is already done and mock-verified (`core/tests/distributed.rs`), so this is the remaining half of the distributed split.
+- [x] Serve the compute RPCs: the Android worker runs a pure-Kotlin engine port
+      mirroring `worker/src` (GGUF reader, dequant, qwen2 block math,
+      load/forward/unload state machine; spec
+      `docs/superpowers/specs/2026-10-19-android-compute-rpcs-design.md` — the
+      earlier "cross-compile llama.cpp rpc-server" idea was rejected there in
+      favour of a device-free-testable port). `WorkerRpcService` delegates
+      `LoadLayers`/`ExecuteForward`/`UnloadLayers` through `EngineSource`
+      (honest `UNIMPLEMENTED` while no engine is wired, spec D-A4; FP32-only
+      wire guard at the wrapper, D-A2b). Device-free proof on the
+      `android-worker.yml` lane: dequant goldens, forward parity against
+      Rust-cut vectors at <= 1e-5 relative (`ForwardParityTest`), the refusal
+      matrix (`WorkerRpcEngineTest`), and a full split lifecycle over
+      in-process gRPC (`WorkerRpcContractTest`, D-A6). The master-side driver
+      it serves is already done and mock-verified (`core/tests/distributed.rs`).
+      PRs: #65 (spec), #66 (parser/dequant), #67 (refusal matrix), #68
+      (forward parity), #70 (RPC wiring).
 - [x] Add a foreground service so the worker survives backgrounding (Android 13+ `POST_NOTIFICATIONS`) — `WorkerForegroundService` (`foregroundServiceType="dataSync"`) owns the runtime so the gRPC server + mDNS advert outlive the UI; needs a device to verify survival across backgrounding.
 - [ ] Implement the worker half of mTLS/QR pairing (on-device mTLS server, QR display, trust of the master fingerprint). The master side is complete: enrollment now issues the worker a CA-signed **server** certificate (SANs = the addresses it declared) alongside its client certificate, and the master presents its own client identity, so the on-device server has a usable certificate to serve behind. It must declare the same `node_id` the master discovers it as, or the driver refuses to dial it (`EnrolledWorkerSource`), and it must present a CA-signed server certificate and enforce client auth — `LoadedPipeline::load_secure` verifies that certificate against the address it dials (`core/tests/distributed.rs`, `core/tests/api.rs`).
 - [ ] Create iOS Swift agent in `mobile-worker/ios/`.

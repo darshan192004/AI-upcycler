@@ -1,6 +1,7 @@
 package org.aiupcycler.worker.engine
 
 import java.io.File
+import org.aiupcycler.worker.rpc.EngineSource
 
 /**
  * Worker engine state machine behind the `WorkerService` compute RPCs —
@@ -42,11 +43,23 @@ class ForwardResult(
  * a file that fails validation throws and the caller must not wire the engine
  * into the RPC service (the local Rust binary exits 1 before announcing READY;
  * the phone equivalent is to serve metadata-only with compute `UNIMPLEMENTED`).
+ *
+ * Implements `EngineSource` (the RPC layer's seam, spec 2026-10-19
+ * android-compute-rpcs): the three compute RPCs delegate straight through,
+ * so validation order, refusals and byte accounting are the wire contract
+ * without a translation layer.
+ *
+ * Concurrency: every state-touching entry point (`loadLayers`, `execute`,
+ * `unloadLayers`, `close`) is `@Synchronized` - one monitor guarding
+ * `loaded` + `sessions` for the whole call, the exact shape of the Rust
+ * reference's `Arc<Mutex<EngineState>>` with one `MutexGuard` per RPC
+ * (engine.rs). gRPC dispatches on a thread pool; the in-process test
+ * transport using `directExecutor` does not remove that.
  */
 class WorkerEngine private constructor(
     private val model: GgufFile,
     val modelName: String,
-) {
+) : EngineSource {
     private var loaded: LoadedRange? = null
     private val sessions = HashMap<String, Session>()
 
@@ -110,6 +123,7 @@ class WorkerEngine private constructor(
     private val hparams: ModelHparams
         get() = model.hparams
 
+    @Synchronized
     fun close() {
         model.close()
         loaded = null
@@ -119,7 +133,8 @@ class WorkerEngine private constructor(
     /** The number of key/value elements per layer row (mirrors the Rust engine's `kv_dim`). */
     private fun kvDim(): Int = hparams.headCountKv * hparams.headDim
 
-    fun loadLayers(modelId: String, startLayer: Int, endLayer: Int): EngineOutcome {
+    @Synchronized
+    override fun loadLayers(modelId: String, startLayer: Int, endLayer: Int): EngineOutcome {
         val blockCount = hparams.blockCount
 
         // Validation order: cheap refusals before any tensor materialization.
@@ -193,7 +208,8 @@ class WorkerEngine private constructor(
         return LoadSuccess(allocatedRamBytes = bytes, startLayer, endLayer)
     }
 
-    fun unloadLayers(modelId: String): EngineOutcome {
+    @Synchronized
+    override fun unloadLayers(modelId: String): EngineOutcome {
         if (modelId != modelName) {
             return UnloadFailure(
                 "unknown model_id \"$modelId\"; this worker holds \"$modelName\"",
@@ -213,7 +229,8 @@ class WorkerEngine private constructor(
      * real math. `timingUs` comes from the caller (wall-clock is owned by
      * the RPC layer).
      */
-    fun execute(
+    @Synchronized
+    override fun execute(
         sessionId: String,
         startLayer: Int,
         endLayer: Int,

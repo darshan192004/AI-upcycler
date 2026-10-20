@@ -270,12 +270,21 @@ vendors a copy and its `checkProtoInSync` task fails the build on drift.
 |---|---|---|---|
 | `Handshake` | metadata | used by `load` | live |
 | `GetHealthStatus` | metadata | `WorkerRpcClient::health` | live |
-| `LoadLayers` | compute | used by `load` | `UNIMPLEMENTED` |
-| `ExecuteForward` | compute | used by `forward` | `UNIMPLEMENTED` |
-| `UnloadLayers` | compute | used by `unload` and load rollback | `UNIMPLEMENTED` |
+| `LoadLayers` | compute | used by `load` | engine-backed (Kotlin port); `UNIMPLEMENTED` while no engine is wired |
+| `ExecuteForward` | compute | used by `forward` | engine-backed; FP32-only wire guard at the wrapper |
+| `UnloadLayers` | compute | used by `unload` and load rollback | engine-backed |
 
 `LoadLayersRequest.weights_chunk_data` is left empty: weights are resolved worker-side for
 now, and pushing a contiguous GGUF chunk is future work.
+
+The Android worker serves this same contract through a pure-Kotlin engine port
+(`mobile-worker/android/.../engine/`, mirroring `worker/src`), delegated to via
+`EngineSource`; a phone with no side-loaded GGUF serves metadata only and keeps the
+honest `UNIMPLEMENTED` surface (spec `2026-10-19-android-compute-rpcs-design.md`,
+IMPLEMENTED via PRs #65-#68 and #70). The contract is pinned device-free on the
+`android-worker.yml` lane: refusal matrix + byte accounting (`WorkerRpcEngineTest`),
+forward parity against Rust-cut vectors at <= 1e-5 relative (`ForwardParityTest`), and
+a full split lifecycle over in-process gRPC (`WorkerRpcContractTest`).
 
 #### 3.1.4 What the worker engine must implement
 
