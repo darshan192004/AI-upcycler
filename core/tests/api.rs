@@ -506,6 +506,97 @@ async fn enrolling_rejects_wrong_reused_and_invalid_pins() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The pairing-only listener (spec 2026-10-20, D-B2): exactly one route.
+/// A phone holding only the ADB reverse tunnel redeems a PIN minted on the
+/// main API — and can do nothing else: no session minting, no cluster or
+/// model endpoints.
+#[tokio::test]
+async fn pairing_listener_serves_enroll_and_nothing_else() {
+    let state = state();
+    let main = router(state.clone());
+    let pairing = ai_upcycler_core::api::pairing_router(state.clone());
+
+    let (status, session) = send(main.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().unwrap().to_string();
+
+    // Enroll works through the pairing-only router with the same session
+    // state the main API minted.
+    let (status, body) = send(
+        pairing.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({
+            "pin": pin,
+            "device_name": "Pixel 8",
+            "node_id": "phone-a",
+            "addresses": ["192.168.1.50"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["ca_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+    assert_eq!(
+        body["fingerprint"].as_str().unwrap(),
+        session["fingerprint"].as_str().unwrap()
+    );
+
+    // The PIN is spent for both routers — one shared session registry.
+    let (status, _) = send(
+        pairing.clone(),
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({ "pin": pin, "device_name": "Pixel 8", "node_id": "phone-b" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Nothing else answers on the pairing listener: session minting must not
+    // be reachable through the tunnel, and neither must the rest of the API.
+    let (status, _) = send(pairing.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(pairing.clone(), "GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(pairing, "GET", "/api/cluster/topology", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `serve_pairing` binds and answers over a real socket on loopback — the
+/// transport the `adb reverse` tunnel lands on.
+#[tokio::test]
+async fn serve_pairing_answers_over_a_real_loopback_socket() {
+    let addr: std::net::SocketAddr = "127.0.0.1:18082".parse().unwrap();
+    let state = state();
+    let main = router(state.clone());
+    tokio::spawn(ai_upcycler_core::api::serve_pairing(addr, state));
+    // The listener binds inside the spawned task; give it a beat before dialing.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let (status, session) = send(main, "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{addr}/api/pairing/enroll"))
+        .json(&json!({
+            "pin": session["pin"],
+            "device_name": "Pixel 8",
+            "node_id": "phone-a",
+        }))
+        .send()
+        .await
+        .expect("enroll over real socket");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("enroll json");
+    assert_eq!(
+        body["fingerprint"].as_str().unwrap(),
+        session["fingerprint"].as_str().unwrap()
+    );
+}
+
 #[tokio::test]
 async fn download_conflicts_while_in_flight() {
     let state = state();

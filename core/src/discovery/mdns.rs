@@ -10,6 +10,19 @@ use tracing::{info, warn};
 /// Service type advertised by AI Upcycler worker nodes over mDNS-SD.
 pub const SERVICE_TYPE: &str = "_aiupcycler-worker._tcp.local.";
 
+/// The `node_id` the master assigns to a worker advertising `instance_name`
+/// over DNS-SD: the instance fullname, matching
+/// [`DiscoveredNode::from_service_info`]'s choice of `info.get_fullname()`.
+///
+/// The Android worker composes the same string from its NSD-registered
+/// instance name before enrolling, so `EnrolledWorkerSource` finds its
+/// credentials under the id discovery produces (spec 2026-10-20, D-B6). The
+/// exact format is pinned by golden on both sides — it is a cross-language
+/// contract, not an implementation detail.
+pub fn worker_node_id(instance_name: &str) -> String {
+    format!("{instance_name}.{SERVICE_TYPE}")
+}
+
 #[allow(dead_code)]
 const TXT_PROTOCOL_VERSION: &str = "protocol_version";
 const TXT_TOTAL_RAM_BYTES: &str = "total_ram_bytes";
@@ -252,6 +265,20 @@ mod tests {
         assert_eq!(node.free_ram_bytes, 4_294_967_296);
         assert_eq!(node.connection_type, "WIFI_MDNS");
         assert!(node.device_name.starts_with("worker-1"));
+    }
+
+    #[test]
+    fn worker_node_id_matches_the_discovered_id_format() {
+        // Cross-language contract (spec 2026-10-20, D-B6): the string a
+        // worker composes from its registered instance name must equal the
+        // `node_id` the master's browser assigns — checked against the real
+        // mdns-sd fullname, not a hand-copied constant.
+        let info = sample_service_info();
+        assert_eq!(worker_node_id("worker-1"), info.get_fullname());
+        assert_eq!(
+            worker_node_id("worker-1"),
+            "worker-1._aiupcycler-worker._tcp.local."
+        );
     }
 
     #[test]
