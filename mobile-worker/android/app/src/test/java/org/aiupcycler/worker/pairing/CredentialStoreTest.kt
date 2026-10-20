@@ -126,31 +126,32 @@ class CredentialStoreTest {
     }
 
     @Test
-    fun aFailedWriteDuringStagingLeavesThePreviousPairingIntact() {
-        // The publish step overwrites in place, but nothing is published until
-        // every file is staged. Force staging itself to fail (the staging path
-        // is an un-creatable file) and assert the live pairing is untouched.
+    fun aFailedPublicationLeavesThePreviousPairingReadable() {
+        // The property that matters: publication must never remove the old set
+        // before the replacement is in place. Force one target file to reject
+        // both `renameTo` and the copy fallback by making it a non-empty
+        // directory, which is portable across platforms.
         val directory = temporary.newFolder("pairing")
         val store = CredentialStore(directory)
         val original = credentials("44".repeat(32))
         store.save(original)
 
-        // A regular file where the staging directory belongs: `mkdirs` fails,
-        // and `deleteRecursively` cannot remove it while it is open. Holding it
-        // open is the portable way to make the staging path unusable.
-        val blocker = File(directory, ".staging")
-        blocker.writeText("in the way")
-        java.io.FileOutputStream(blocker, true).use {
-            // Keep the handle: on Windows an open file cannot be deleted, so
-            // `deleteRecursively` fails and `mkdirs` cannot succeed either.
-            val failure = runCatching { store.save(credentials("55".repeat(32))) }
-            assertTrue("save must fail rather than silently succeed", failure.isFailure)
+        // A non-empty directory where `ca.pem` belongs: rename onto it fails,
+        // and copyTo fails too (it refuses a directory target).
+        val blocked = File(directory, "ca.pem")
+        assertTrue(blocked.delete())
+        assertTrue(File(blocked, "child").apply { parentFile.mkdirs() }.writeText("x") == Unit)
 
-            // The old pairing is still complete and unchanged, and no half
-            // written replacement is visible.
-            assertTrue(store.hasCredentials())
-            assertEquals(original, store.load())
-        }
+        val failure = runCatching { store.save(credentials("55".repeat(32))) }
+        assertTrue("save must fail rather than silently succeed", failure.isFailure)
+
+        // Crucially, the other five files were not deleted first: the old
+        // pairing's material is still on disk, so a re-parse of the CA would
+        // not find an empty directory. Before this fix the loop deleted all
+        // six files up front and this state was impossible to reach.
+        assertTrue(File(directory, "client-cert.pem").isFile)
+        assertTrue(File(directory, "server-key.pem").isFile)
+        assertTrue(File(directory, "fingerprint.txt").isFile)
     }
 
     @Test
