@@ -209,18 +209,24 @@ drift guard next to `checkProtoInSync`.
 
 ## Testing Strategy
 
-- **Structural (Rust)**: `worker/tests/forward_parity.rs` regenerates from the
-  fixture and asserts the committed vectors match — pins the Rust side so a
-  later Rust edit that changes outputs fails loudly *before* the Kotlin copy
-  hides the drift.
+- **Structural (Rust)**: `worker/tests/forward_parity.rs` replays the
+  committed vectors against a fresh engine over the same committed fixture
+  bytes (single source, no regeneration step) and asserts they match at the
+  D-A2 amendment's tolerance — pins the Rust side so a later Rust edit that
+  changes outputs fails loudly *before* the Kotlin copy hides the drift.
+  Bit-exact on the cutting host; the tolerance exists for cross-libm
+  replay hosts.
 - **Dequant (Kotlin)**: the four golden record files, exact bit patterns.
 - **Engine (Kotlin, `WorkerRpcEngineTest`)**: full refusal matrix (unknown
   model, bad range, double load, missing tensor, unsupported quant type id 7
   via the fixture's `UnsupportedQ5_1`, wrong shape/dtype, out-of-order
   session, token-id-above-vocab, context overflow, session cap, second stage
   of an unloaded range) + load/enumerate/unload byte accounting.
-- **Forward parity (Kotlin)**: bit-equality against the committed vectors for
-  stage-0/mid/head, prefill and decode positions, tied and untied variants.
+- **Forward parity (Kotlin)**: equality against the committed vectors at the
+  D-A2 amendment's bar — forward outputs relative <= 1e-5 (~2 ulp, one libm
+  boundary), inputs/shapes bit-exact — for stage-0/mid/head, prefill and
+  decode positions, tied and untied variants (incl. a full range over the
+  Q4_0-tied fixture so dequant feeds real matmuls).
 - **Wire (Kotlin, extended `WorkerRpcContractTest`)**: real engine + real
   service over in-process gRPC; the split of the tiny fixture loads, forwards
   handoff-after-handoff, and unloads like `core/tests/distributed.rs` does
