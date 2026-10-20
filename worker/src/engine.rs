@@ -432,7 +432,7 @@ impl WorkerService for WorkerEngine {
                 .collect();
             if vals.len() != n_tokens * hidden {
                 return refuse(format!(
-                    "hidden payload {} f32 values != shape [{}Ãƒâ€”{hidden}]",
+                    "hidden payload {} f32 values != shape [{} x {hidden}]",
                     vals.len(),
                     n_tokens
                 ));
