@@ -4,4 +4,22 @@
     <string name="notification_text">gRPC :%1$d · worker %2$s</string>
     <string name="status_running">AI Upcycler worker running\n\nid:    %1$s\nname:  %2$s\ngRPC:  0.0.0.0:50052\nmDNS:  _aiupcycler-worker._tcp</string>
     <string name="action_stop">Stop worker</string>
+
+    <!-- Pairing screen (spec 2026-10-20, D-B3/D-B4/D-B5). -->
+    <string name="pairing_title">Pairing</string>
+    <string name="pairing_paired_headline">Paired with the master</string>
+    <string name="pairing_paired_body">This worker now serves the cluster over mutual TLS. Its certificate is the one the master issued during pairing.</string>
+    <string name="pairing_fingerprint_label">Master CA fingerprint</string>
+    <string name="pairing_forget">Forget pairing</string>
+    <string name="pairing_unpaired_headline">Not paired</string>
+    <string name="pairing_unpaired_body">Scan the QR code in the desktop app, or paste the pairing code it shows. Plug the phone in over USB first so the master can reach this app.</string>
+    <string name="pairing_code_label">Pairing code or fingerprint</string>
+    <string name="pairing_code_hint">aiupcycler://pair?fp=…&amp;token=…</string>
+    <string name="pairing_pin_label">PIN</string>
+    <string name="pairing_pin_hint">6-digit PIN</string>
+    <string name="pairing_action_pair">Pair</string>
+    <string name="pairing_working">Pairing…</string>
+    <string name="pairing_failed_headline">Pairing failed</string>
+    <string name="pairing_rejected_headline">Pairing code not accepted</string>
+    <string name="pairing_requires_modern_android">Mutual TLS needs Android 10 or newer. This device stays on the USB-only plaintext path.</string>
 </resources>
