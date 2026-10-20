@@ -1,5 +1,7 @@
 package org.aiupcycler.worker.rpc
 
+import org.aiupcycler.worker.mdns.NodeIds
+
 /**
  * Wire constants shared with the master orchestrator.
  *
@@ -23,8 +25,11 @@ object WorkerProtocol {
     /**
      * mDNS service type as consumed by Android's `NsdManager`; the trailing
      * `.local.` the master uses (`_aiupcycler-worker._tcp.local.`) is implied.
+     *
+     * Canonical value lives in `NodeIds.SERVICE_TYPE`, which also composes the
+     * `node_id` the master keys enrollment by.
      */
-    const val MDNS_SERVICE_TYPE: String = "_aiupcycler-worker._tcp."
+    const val MDNS_SERVICE_TYPE: String = NodeIds.SERVICE_TYPE
 
     const val TXT_PROTOCOL_VERSION: String = "protocol_version"
     const val TXT_TOTAL_RAM_BYTES: String = "total_ram_bytes"
