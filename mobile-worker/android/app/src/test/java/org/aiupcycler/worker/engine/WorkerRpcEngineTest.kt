@@ -6,6 +6,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * The engine-side contract behind the `LoadLayers` / `ExecuteForward` /
@@ -409,5 +412,82 @@ class WorkerRpcEngineTest {
         assertArrayEquals(longArrayOf(2, 256), (head as ForwardResult).shapeOut)
         assertTrue(head.isHead)
         engine.close()
+    }
+
+    /**
+     * The thread-safety half of the contract: gRPC dispatches calls on a
+     * thread pool, and the shared `loaded` + `sessions` state is guarded the
+     * way the Rust reference guards `Arc<Mutex<EngineState>>` - one
+     * `@Synchronized` entry point per RPC (engine.rs takes one `MutexGuard`
+     * the same way). The in-process contract test's `directExecutor` never
+     * races, so concurrency is exercised here directly: 8 threads walking
+     * 20-step position ladders (60 of the fixture's 64 context tokens) on
+     * one shared engine, every output required
+     * bit-identical to the serial baseline for the same ids (a torn session
+     * map or cross-session KV leak surfaces as a wrong or failed result),
+     * and the final unload must still report exactly what the load
+     * allocated. Races are probabilistic, so this is an exercise of the
+     * concurrent path rather than a proof of absence - the structural
+     * guarantee is the monitor mirroring the Rust Mutex. Sessions stay
+     * inside the engine's cap of 16 (1 reference + 8 workers): each worker
+     * owns one session and walks the same position ladder as the serial
+     * reference, so every per-position output must match it bit-for-bit.
+     */
+    @Test
+    fun parallelForwardsOnOneEngineMatchTheSerialBaseline() {
+        val engine = open(UNTIED)
+        assertTrue(engine.loadLayers(UNTIED, 0, 0) is LoadSuccess)
+        try {
+            val tokenIds = ids(1f, 3f, 2f)
+
+            // Serial reference: one session stepping the position ladder the
+            // workers will walk (3 tokens per step, position = cached KV len).
+            val iterations = 20
+            val expected = ArrayList<FloatArray>(iterations)
+            var refPosition = 0
+            repeat(iterations) {
+                val step = engine.execute("ref", 0, 0, longArrayOf(1, 3), tokenIds, refPosition, 0L)
+                expected += (step as ForwardResult).out
+                refPosition += 3
+            }
+
+            val threads = 8
+            val failures = ConcurrentLinkedQueue<String>()
+            val go = CountDownLatch(1)
+            val done = CountDownLatch(threads)
+            repeat(threads) { t ->
+                Thread {
+                    try {
+                        go.await()
+                        repeat(iterations) { i ->
+                            val outcome =
+                                engine.execute("t$t", 0, 0, longArrayOf(1, 3), tokenIds, i * 3, 0L)
+                            val result = outcome as? ForwardResult
+                            when {
+                                result == null ->
+                                    failures.add("t$t/$i refused: ${(outcome as ForwardFailure).reason}")
+
+                                !result.shapeOut.contentEquals(longArrayOf(3, 64)) ->
+                                    failures.add("t$t/$i shape: ${result.shapeOut.toList()}")
+
+                                !result.out.contentEquals(expected[i]) ->
+                                    failures.add("t$t/$i diverged from the serial baseline")
+                            }
+                        }
+                    } finally {
+                        done.countDown()
+                    }
+                }.start()
+            }
+            go.countDown()
+            assertTrue("workers did not finish in time", done.await(60, TimeUnit.SECONDS))
+            assertTrue("parallel dispatch failures: ${failures.take(3)}", failures.isEmpty())
+
+            // token_embd (16384) + block 0 (37024) f32s for range 0..0.
+            val unloaded = engine.unloadLayers(UNTIED) as UnloadSuccess
+            assertEquals(213_632L, unloaded.freedRamBytes)
+        } finally {
+            engine.close()
+        }
     }
 }
