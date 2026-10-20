@@ -112,6 +112,50 @@ impl AdbTunnelManager {
         }
     }
 
+    /// Exposes the master's pairing-only listener on the device's own loopback
+    /// (`adb -s <serial> reverse tcp:8081 tcp:8081`), so the worker app can
+    /// POST `/api/pairing/enroll` at `127.0.0.1:8081` without the API leaving
+    /// host loopback (spec 2026-10-20, D-B2; docs/security.md §3).
+    pub fn reverse_pairing(&self, serial: &str) -> Result<(), String> {
+        let args = reverse_pairing_args(serial);
+        let output = Command::new("adb")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("failed to run 'adb reverse' for {serial}: {e}"))?;
+
+        if output.status.success() {
+            info!(
+                "ADB: pairing reverse tunnel up for {serial} -> 127.0.0.1:{}",
+                crate::api::PAIRING_PORT
+            );
+            Ok(())
+        } else {
+            Err(format!(
+                "'adb reverse' failed for {serial}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    /// Removes the pairing reverse tunnel (session completed or expired).
+    pub fn remove_reverse_pairing(&self, serial: &str) -> Result<(), String> {
+        let args = remove_reverse_pairing_args(serial);
+        let output = Command::new("adb")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("failed to run 'adb reverse --remove' for {serial}: {e}"))?;
+
+        if output.status.success() {
+            info!("ADB: removed pairing reverse tunnel for {serial}");
+            Ok(())
+        } else {
+            Err(format!(
+                "'adb reverse --remove' failed for {serial}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
     /// Sets up a port forward for every authorized USB device, giving each
     /// device a distinct loopback port so multiple phones can be bridged at
     /// once. Returns the devices that now have a tunnel alongside their local
@@ -237,6 +281,31 @@ fn node_from_handshake(
     }
 }
 
+/// Argument vector for the pairing reverse tunnel, factored out so unit tests
+/// pin the exact `adb` invocation without a device (spec 2026-10-20, D-B2).
+fn reverse_pairing_args(serial: &str) -> Vec<String> {
+    let port = crate::api::PAIRING_PORT;
+    vec![
+        "-s".into(),
+        serial.into(),
+        "reverse".into(),
+        format!("tcp:{port}"),
+        format!("tcp:{port}"),
+    ]
+}
+
+/// Argument vector for removing the pairing reverse tunnel.
+fn remove_reverse_pairing_args(serial: &str) -> Vec<String> {
+    let port = crate::api::PAIRING_PORT;
+    vec![
+        "-s".into(),
+        serial.into(),
+        "reverse".into(),
+        "--remove".into(),
+        format!("tcp:{port}"),
+    ]
+}
+
 fn parse_devices(output: &str) -> Vec<AdbDevice> {
     output
         .lines()
@@ -297,6 +366,22 @@ mod tests {
     #[test]
     fn forward_port_matches_worker_rpc_port() {
         assert_eq!(ADB_FORWARD_PORT, 50052);
+    }
+
+    #[test]
+    fn reverse_pairing_args_pin_the_device_and_host_ports() {
+        // `adb -s <serial> reverse tcp:8081 tcp:8081`: the phone's own
+        // loopback 8081 lands on the master's pairing-only listener.
+        assert_eq!(
+            reverse_pairing_args("R3CN30ABCDE"),
+            vec!["-s", "R3CN30ABCDE", "reverse", "tcp:8081", "tcp:8081"]
+        );
+        assert_eq!(
+            remove_reverse_pairing_args("R3CN30ABCDE"),
+            vec!["-s", "R3CN30ABCDE", "reverse", "--remove", "tcp:8081"]
+        );
+        // The tunnel must land on the pairing listener's port, whatever it is.
+        assert_eq!(crate::api::PAIRING_PORT, 8081);
     }
 
     fn device(serial: &str, model: &str) -> AdbDevice {

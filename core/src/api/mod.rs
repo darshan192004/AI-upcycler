@@ -190,11 +190,39 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Loopback port for the pairing-only listener (spec 2026-10-20, D-B2): one
+/// route, reachable from a phone through `adb reverse` only.
+pub const PAIRING_PORT: u16 = 8081;
+
+/// Builds the pairing-only router: exactly `POST /api/pairing/enroll`, no
+/// session minting.
+///
+/// A phone holding only the ADB reverse tunnel can redeem a single-use PIN
+/// and nothing else — session creation stays on the main loopback API so a
+/// device on the far side of the tunnel can never mint its own pairing
+/// session (spec 2026-10-20, D-B8).
+pub fn pairing_router(state: AppState) -> Router {
+    Router::new()
+        .route("/api/pairing/enroll", post(pairing::enroll))
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
 /// Binds `addr` and serves until the future is dropped.
 pub async fn serve(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("AI Upcycler API listening on http://{addr}");
     axum::serve(listener, router(state)).await
+}
+
+/// Binds the pairing-only listener ([`pairing_router`]) and serves until the
+/// future is dropped. Bind address stays loopback: the phone reaches it
+/// through `adb reverse`, never over the LAN.
+pub async fn serve_pairing(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("AI Upcycler pairing listener on http://{addr}");
+    axum::serve(listener, pairing_router(state)).await
 }
 
 fn host_name() -> String {

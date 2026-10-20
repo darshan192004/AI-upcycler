@@ -86,10 +86,21 @@ pub fn run() {
                 data_dir.join("models"),
             );
 
+            let state_for_api = state.clone();
             tauri::async_runtime::spawn(async move {
                 let addr = SocketAddr::from(([127, 0, 0, 1], API_PORT));
-                if let Err(e) = api::serve(addr, state).await {
+                if let Err(e) = api::serve(addr, state_for_api).await {
                     error!("local API server stopped: {e}");
+                }
+            });
+
+            // Pairing-only listener (spec 2026-10-20, D-B2): one enroll route
+            // on loopback, reached by a phone through `adb reverse` — never
+            // bound beyond loopback itself.
+            tauri::async_runtime::spawn(async move {
+                let addr = SocketAddr::from(([127, 0, 0, 1], api::PAIRING_PORT));
+                if let Err(e) = api::serve_pairing(addr, state).await {
+                    error!("pairing listener stopped: {e}");
                 }
             });
 
