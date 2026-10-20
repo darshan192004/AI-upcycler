@@ -8,7 +8,7 @@
 ## 2. CI/CD Automated Build Workflows
 - [x] Create `.github/workflows/ci.yml` for pull request linting and cargo test runs.
 - [x] Create `.github/workflows/release.yml` for automated cross-platform desktop installer builds (Windows `.msi`/`.exe`, macOS `.dmg`, Linux `.deb`/`.rpm`/`.AppImage`) on version tag.
-- [ ] Package and publish the Android `.apk` worker asset (blocked on the Android worker agent in section 5).
+- [x] Package and publish the Android `.apk` worker asset: `release.yml` gained a `publish-android-apk` job that builds the side-loadable debug APK with the same toolchain recipe as the `android-worker` CI job, publishes it as the `worker-apk` workflow artifact on every run, and attaches it to tag releases as `aiupcycler-worker-<tag>-debug.apk` (the desktop matrix owns release creation; the job waits for that release rather than racing it).
 
 ## 3. Master Orchestrator Engine (Rust + Tauri)
 - [x] Initialize Tauri 2.0 Rust app in `src-tauri/` (config v2 schema, capability-based permissions).
