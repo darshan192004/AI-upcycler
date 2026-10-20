@@ -17,13 +17,30 @@ class MdnsAdvertiser(
     private val instanceName: String,
 ) {
     private var listener: NsdManager.RegistrationListener? = null
+    private var registeredName: String? = null
+
+    /**
+     * The DNS-SD instance fullname the master's browser reports as this node's
+     * `node_id` - the exact string `core::discovery::mdns::DiscoveredNode` keeps
+     * and `EnrolledWorkerSource` keys credentials by.
+     *
+     * Before NSD confirms registration this is the *requested* name; Android may
+     * rename the instance on a collision, so after [start] the
+     * [onServiceRegistered][NsdManager.RegistrationListener.onServiceRegistered]
+     * callback's actual name wins. Enrollment has to declare this value, which
+     * is why pairing must not run before registration resolves (spec D-B6).
+     */
+    fun nodeId(): String = NodeIds.fullname(registeredName ?: instanceName)
+
+    /** Whether NSD has confirmed the advertised instance name. */
+    fun isRegistered(): Boolean = registeredName != null
 
     fun start() {
         if (listener != null) return
         val snapshot = metrics.snapshot()
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = instanceName
-            serviceType = WorkerProtocol.MDNS_SERVICE_TYPE
+            serviceType = NodeIds.SERVICE_TYPE
             port = WorkerProtocol.RPC_PORT
             WorkerProtocol.txtRecords(snapshot.totalRamBytes, snapshot.freeRamBytes)
                 .forEach { (key, value) -> setAttribute(key, value) }
@@ -32,7 +49,9 @@ class MdnsAdvertiser(
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         val registrationListener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) {
-                Log.i(TAG, "mDNS: registered ${info.serviceName}")
+                // May differ from the requested name: NSD renames on collision.
+                registeredName = info.serviceName
+                Log.i(TAG, "mDNS: registered ${info.serviceName} (node_id ${nodeId()})")
             }
 
             override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {
@@ -40,6 +59,7 @@ class MdnsAdvertiser(
             }
 
             override fun onServiceUnregistered(info: NsdServiceInfo) {
+                registeredName = null
                 Log.i(TAG, "mDNS: unregistered ${info.serviceName}")
             }
 
@@ -54,6 +74,7 @@ class MdnsAdvertiser(
     fun stop() {
         val registered = listener ?: return
         listener = null
+        registeredName = null
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         // `unregisterService` throws IllegalArgumentException when the
         // registration never completed (or already failed); swallow teardown

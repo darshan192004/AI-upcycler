@@ -28,10 +28,11 @@ max_model_tokens = 8000
 # Generated lockfiles add thousands of unreviewable lines to the diff and push
 # reviews into partial mode; keep them out of the review surface. The same
 # applies to the committed engine fixtures (goldens, tiny GGUFs, forward
-# vectors): machine-cut data whose only meaningful review target is the code
-# that produces and replays them. Excluding them also keeps the prompt inside
-# the fallback providers' request-size caps (groq on-demand allows a single
-# request of at most 8000 tokens), so the fallback chain stays usable when
-# Gemini is quota-blocked.
+# vectors) and the committed pairing fixtures (test CA / cert / key PEMs and
+# the golden enroll response): machine-cut data whose only meaningful review
+# target is the code that produces and replays them. Excluding them also keeps
+# the prompt inside the fallback providers' request-size caps (groq on-demand
+# allows a single request of at most 8000 tokens), so the fallback chain stays
+# usable when Gemini is quota-blocked.
 [ignore]
-glob = ["Cargo.lock", "**/Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "mobile-worker/android/app/src/test/resources/engine/**"]
+glob = ["Cargo.lock", "**/Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "mobile-worker/android/app/src/test/resources/engine/**", "mobile-worker/android/app/src/test/resources/pairing/**"]

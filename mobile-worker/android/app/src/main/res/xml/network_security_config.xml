@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pairing enrollment reaches the master over the ADB reverse tunnel: plain
+  HTTP to the worker's own loopback, never to a network host
+  (spec 2026-10-20-android-mtls-pairing-design.md, D-B2).
+
+  Android blocks cleartext for apps targeting API 28+ by default, so the
+  loopback origin has to be named explicitly. Everything else keeps the
+  platform default, which is why this is a `domain-config` rather than
+  `usesCleartextTraffic="true"` on the manifest: a LAN address must still
+  require TLS, because the enrollment response carries the worker's fresh
+  private keys.
+
+  TLS itself stays governed by the platform trust store here; certificate
+  pinning to the QR fingerprint is the wireless-pairing follow-up.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- ADB reverse tunnel target: the worker's own loopback. -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>
