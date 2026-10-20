@@ -115,40 +115,45 @@ class WorkerMtlsServerTest {
         // worker trusts exactly the CA the user enrolled. Trusting the real CA
         // here means the client side verifies the server fine, so any failure
         // is the server rejecting this client on its own trust anchor.
-        val refusal = expectRefused(
+        val refusal = isRefused(
             port = startTlsServer(),
             certPem = ROGUE_CERT,
             keyPem = ROGUE_KEY,
             caPem = CA,
         )
-        assertTrue("a rogue-CA client must be refused, got $refusal", refusal)
+        assertTrue("a rogue-CA client must be refused", refusal)
     }
 
     @Test
     fun aClientWithNoCertificateIsRefused() {
         // Client auth is REQUIRED, so "no certificate" is not "trusted by
         // default" - a client that offers nothing must be rejected.
-        val refusal = expectRefused(
+        val refusal = isRefused(
             port = startTlsServer(),
             certPem = null,
             keyPem = null,
             caPem = CA,
         )
-        assertTrue("a client with no certificate must be refused, got $refusal", refusal)
+        assertTrue("a client with no certificate must be refused", refusal)
     }
 
     @Test
     fun theNegotiatedProtocolIsTls13() {
-        // The version is asserted on the fixture context's own protocol list
-        // (below) and on a live session here: a server that negotiated 1.2
-        // would fail the master's TLS-1.3-only rustls client regardless.
-        val port = startTlsServer()
-        val channel = tlsChannel(port, CLIENT_CERT, CLIENT_KEY, CA)
-        channels += channel
-        WorkerServiceGrpc.newBlockingStub(channel)
-            .withDeadlineAfter(20, TimeUnit.SECONDS)
-            .getHealthStatus(HealthRequest.getDefaultInstance())
+        // Asserted on the live session, not on the constant: a server that
+        // negotiated TLS 1.2 would have to fail this line. The master's rustls
+        // client speaks 1.3 only, so the version is a compatibility
+        // requirement, not a preference.
+        val session = connect(
+            port = startTlsServer(),
+            certPem = CLIENT_CERT,
+            keyPem = CLIENT_KEY,
+            caPem = CA,
+        ).getOrThrow()
 
+        assertEquals("TLSv1.3", session.protocol)
+        // Belt and braces: the configured list is also pinned, so a context
+        // built to offer 1.2 would fail here even if the JDK happened to
+        // negotiate 1.3 with it.
         assertEquals(listOf("TLSv1.3"), WorkerTls.TLS_V1_3)
     }
 
@@ -206,12 +211,26 @@ class WorkerMtlsServerTest {
 
     @Test
     fun theFixtureServerContextBuildsAndPinsTls13() {
-        // A direct check on the context builder, independent of the socket
-        // tests: the protocol list is what a downgrade attempt would have to
-        // defeat, so it is asserted explicitly.
+        // Asserted on the built context's own engine, not on a constant: this
+        // is the artifact the server hands to netty, so a context configured to
+        // offer 1.2 fails here.
+        //
+        // The socket tests above cannot catch an offered 1.2 - both ends prefer
+        // 1.3, so it would still negotiate 1.3 and look correct. That is why
+        // this assertion is on the enabled list rather than the negotiated one.
         val context = WorkerTls.serverContext(fixtureCredentials())
         assertNotNull("the committed fixtures must build a context", context)
-        assertEquals(listOf("TLSv1.3"), WorkerTls.TLS_V1_3)
+
+        val engine = context!!.newEngine(io.netty.buffer.ByteBufAllocator.DEFAULT)
+        assertEquals(
+            "the server must enable only TLS 1.3",
+            listOf("TLSv1.3"),
+            engine.enabledProtocols.toList(),
+        )
+        // Client auth is deliberately not asserted here: netty applies
+        // `clientAuth(REQUIRE)` on the SSLEngine when the handler initialises
+        // it, not on a fresh engine. Its proof is behavioural, in the
+        // anonymous-client and rogue-CA tests above.
     }
 
     // ---- helpers ----------------------------------------------------------
@@ -239,25 +258,31 @@ class WorkerMtlsServerTest {
         )
         .build()
 
+    /** What a completed TLS connection negotiated. */
+    private data class SessionInfo(val protocol: String)
+
     /**
-     * Returns true when a TLS client with the given material is refused by the
-     * server, false when it gets through.
+     * Connects a TLS client with the given material and returns the negotiated
+     * session.
      *
      * A raw `SSLSocket` rather than a gRPC channel, deliberately: the question
-     * is whether the *handshake* is refused, and a raw socket makes a failure
+     * is what the *handshake* negotiated, and a raw socket makes a failure
      * unambiguously a TLS-layer refusal rather than a gRPC status mapping.
      *
      * The post-handshake write matters. In TLS 1.3 a client-side handshake
      * completes as soon as the client has sent its certificate; the server's
      * verdict arrives afterwards, as an alert on the first I/O. Without that
      * step a client the server rejected would look successful.
+     *
+     * SSL failures are rethrown as-is rather than swallowed, so the negative
+     * tests can tell a real refusal from a missing fixture or a dead port.
      */
-    private fun expectRefused(
+    private fun connect(
         port: Int,
         certPem: String?,
         keyPem: String?,
         caPem: String,
-    ): Boolean = try {
+    ): Result<SessionInfo> = runCatching {
         val trust = TrustManagerFactory.getInstance(
             TrustManagerFactory.getDefaultAlgorithm(),
         ).apply {
@@ -276,10 +301,38 @@ class WorkerMtlsServerTest {
             socket.outputStream.write(0x16)
             socket.outputStream.flush()
             socket.inputStream.read()
-            false
+            SessionInfo(protocol = socket.session.protocol)
         }
-    } catch (e: Exception) {
-        true
+    }
+
+    /**
+     * Whether the server refused a client with this material, failing loudly on
+     * anything that is not a TLS-layer refusal.
+     *
+     * The narrow catch is the point: treating every exception as "refused"
+     * would let a missing fixture or an unreachable port pass the negative
+     * tests while proving nothing about client auth.
+     */
+    private fun isRefused(
+        port: Int,
+        certPem: String?,
+        keyPem: String?,
+        caPem: String,
+    ): Boolean {
+        val outcome = connect(port, certPem, keyPem, caPem)
+        val failure = outcome.exceptionOrNull() ?: return false
+        return when (failure) {
+            // What a TLS-layer refusal looks like: the handshake, the alert we
+            // provoked, or the connection the server tore down.
+            is javax.net.ssl.SSLException,
+            is java.io.EOFException,
+            is java.net.SocketException,
+            -> true
+            else -> throw AssertionError(
+                "expected a TLS refusal, got ${failure::class.java.name}: ${failure.message}",
+                failure,
+            )
+        }
     }
 
     /** A trust store holding only [pemName] as a certificate entry. */
