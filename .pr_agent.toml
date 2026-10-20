@@ -11,11 +11,19 @@
 # custom_model_max_tokens caps the output budget: without it, reasoning
 # models on the chain burn the whole budget on thinking and return empty
 # content with finish_reason "length".
+#
+# Groq is the only fallback that answers at all when Gemini is quota-blocked,
+# and the on-demand tier it is used with rejects any single request over 8000
+# tokens. max_model_tokens bounds the prompt the reviewer builds, so the
+# excluded generated fixtures plus this cap keep the request inside that
+# limit. Without it PR-Agent happily builds a 12k-16k-token prompt and every
+# provider in the chain fails at once (observed on #74, 2026-10-20).
 
 [config]
 model = "gemini/gemini-3.8-flash"
 fallback_models = ["groq/openai/gpt-oss-120b", "openrouter/free"]
 custom_model_max_tokens = 20000
+max_model_tokens = 8000
 
 # Generated lockfiles add thousands of unreviewable lines to the diff and push
 # reviews into partial mode; keep them out of the review surface. The same
