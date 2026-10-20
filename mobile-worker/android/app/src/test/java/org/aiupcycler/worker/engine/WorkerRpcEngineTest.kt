@@ -2,6 +2,7 @@ package org.aiupcycler.worker.engine
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -392,14 +393,14 @@ class WorkerRpcEngineTest {
         assertTrue(engine.loadLayers(UNTIED, 0, 0) is LoadSuccess)
         val partial = engine.execute("part", 0, 0, longArrayOf(1, 3), ids(1f, 3f, 2f), 0, 0L)
         assertArrayEquals(longArrayOf(3, 64), (partial as ForwardResult).shapeOut)
-        assertTrue(!partial.isHead)
+        assertFalse(partial.isHead)
         engine.unloadLayers(UNTIED)
 
         // A mid stage consumes and returns hidden: [n, hidden].
         assertTrue(engine.loadLayers(UNTIED, 2, 2) is LoadSuccess)
         val mid = engine.execute("mid", 2, 2, longArrayOf(3, 64), hidden(3), 0, 0L)
         assertArrayEquals(longArrayOf(3, 64), (mid as ForwardResult).shapeOut)
-        assertTrue(!mid.isHead)
+        assertFalse(mid.isHead)
         engine.unloadLayers(UNTIED)
 
         // The head stage alone turns hidden into logits: [n, vocab].
