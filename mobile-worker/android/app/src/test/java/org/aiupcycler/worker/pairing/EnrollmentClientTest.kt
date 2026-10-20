@@ -296,6 +296,24 @@ class EnrollmentClientTest {
     }
 
     @Test
+    fun readsUnicodeEscapesWithoutSkippingTheFollowingCharacter() {
+        // A `\uXXXX` escape must consume exactly the escape. A review flagged
+        // that the shared `index++` skips one character too many; this test
+        // proves the opposite by putting the escape immediately before a real
+        // field, where a skipped character would swallow that field's opening
+        // quote and break the parse.
+        val body = golden.replaceFirst("{", "{\"note\":\"\\u0041\",")
+        val server = server(200, body, errorEnvelope = false)
+        server.use {
+            val result = EnrollmentClient().enroll(request(server, goldenFingerprint))
+            assertTrue(
+                "a well-formed \\u escape must not corrupt the following field: $result",
+                result is EnrollmentResult.Enrolled,
+            )
+        }
+    }
+
+    @Test
     fun reportsAMissingCertificateFieldInsteadOfEnrolling() {
         val truncated = golden.replace(
             Regex("\"client_key_pem\"\\s*:\\s*\"[^\"]*\""),

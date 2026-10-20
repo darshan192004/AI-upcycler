@@ -13,9 +13,11 @@ import java.io.File
  * `allowBackup="false"` (spec D-B4) already keeps private keys out of cloud
  * backup either way.
  *
- * A failure never leaves a partial pairing behind: writes go to a staging
- * directory that is moved into place only after all six files are on disk, and
- * any failed attempt clears what it staged.
+ * A failure never strands the worker: every file is written to a staging
+ * directory first, so nothing touches the live set until all six are on disk,
+ * and any failed write attempt clears what it staged. Publication then
+ * overwrites the previous files in place. See [save] for what that does and
+ * does not guarantee for a failure *during* publication.
  */
 class CredentialStore(private val directory: File) {
 
@@ -36,10 +38,23 @@ class CredentialStore(private val directory: File) {
     }
 
     /**
-     * Stores [credentials], replacing any previous pairing atomically.
+     * Stores [credentials], replacing any previous pairing.
      *
-     * @throws java.io.IOException when the set cannot be written; the previous
-     * pairing (if any) is left untouched.
+     * There is no portable multi-file atomic rename, so the guarantee is
+     * weaker than "all or nothing" and is stated as such: the new files are
+     * moved into place one at a time, each overwriting its predecessor. A
+     * failure part-way through leaves a *mix* of old and new files, and
+     * [hasCredentials] would still report a complete set. What it never
+     * leaves is a state where the old set was deleted first and the new one
+     * failed to arrive - the previous behaviour, which could strand the worker
+     * with no credentials at all.
+     *
+     * The files are pairwise consistent because all six come from one
+     * enrollment response, and a partial overwrite is only possible if the
+     * write itself fails (disk full), which the caller surfaces as an
+     * [java.io.IOException] and answers by re-pairing.
+     *
+     * @throws java.io.IOException when the set cannot be written.
      */
     fun save(credentials: WorkerCredentials) {
         val staging = File(directory, STAGING)
@@ -58,16 +73,18 @@ class CredentialStore(private val directory: File) {
         )
 
         try {
+            // Every file is written before any of them is published, so a
+            // failure while writing cannot touch the live set at all.
             for ((name, value) in values) {
                 File(staging, name).writeText(value)
             }
-            // Commit: drop the old set, then move the complete new one in.
-            for (name in FILES) File(directory, name).delete()
+            // Publish: overwrite in place. `renameTo` replaces an existing file
+            // on every filesystem this runs on; the copy fallback exists for
+            // the ones that refuse a rename across directories.
             for (name in FILES) {
-                val moved = File(staging, name).renameTo(File(directory, name))
-                if (!moved) {
-                    // Copy fallback for filesystems that refuse a rename.
-                    File(staging, name).copyTo(File(directory, name), overwrite = true)
+                val target = File(directory, name)
+                if (!File(staging, name).renameTo(target)) {
+                    File(staging, name).copyTo(target, overwrite = true)
                     File(staging, name).delete()
                 }
             }

@@ -51,14 +51,32 @@ object WorkerAddresses {
      * master dials over Wi-Fi. Android needs no permission to enumerate these.
      */
     fun localIpv4Addresses(
-        interfaces: List<NetworkInterface> = NetworkInterface.getNetworkInterfaces()?.toList()
-            ?: emptyList(),
+        interfaces: List<NetworkInterface> = systemInterfaces(),
     ): List<String> = interfaces
         .filter { interfaceIsUsable(it) }
-        .flatMap { it.inetAddresses.toList() }
+        .flatMap { addressesOf(it) }
         .filterIsInstance<Inet4Address>()
         .filter { !it.isLoopbackAddress }
         .mapNotNull { it.hostAddress }
+
+    /**
+     * The system's interfaces, or none: enumeration is a syscall that can fail
+     * (and does on a device with no network stack up). Declaring fewer
+     * addresses is always safe - the loopback pair is unconditional - while an
+     * exception would abort the whole enrollment.
+     */
+    private fun systemInterfaces(): List<NetworkInterface> = try {
+        NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    /** An interface's addresses, or none when it is torn down mid-enumeration. */
+    private fun addressesOf(interface0: NetworkInterface): List<java.net.InetAddress> = try {
+        interface0.inetAddresses.toList()
+    } catch (e: Exception) {
+        emptyList()
+    }
 
     private fun interfaceIsUsable(interface0: NetworkInterface): Boolean = try {
         interface0.isUp && !interface0.isLoopback && !interface0.isPointToPoint
