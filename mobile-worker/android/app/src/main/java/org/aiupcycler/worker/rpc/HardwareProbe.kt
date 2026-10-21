@@ -92,6 +92,10 @@ object HardwareProbe {
      * Single-threaded f32 fused multiply-add rate, in FLOP/s (2 FLOPs per FMA).
      *
      * The chain is data-dependent, so it cannot be constant-folded.
+     * `Math.fma` is a *true* fused multiply-add, matching the Rust twin's
+     * `f32::mul_add`; plain `a * b + scale` rounds twice and the JIT is not
+     * required to fuse it, which would measure a different operation. `minSdk`
+     * is 26, so the API-24 `Math.fma` is always available and needs no gate.
      */
     @JvmStatic
     fun probeThroughputFlops(iterations: Long): Double {
@@ -102,7 +106,7 @@ object HardwareProbe {
         var index = 0L
         while (index < iterations) {
             val scale = 1.0f + ((index % 7L).toFloat()) * 1e-6f
-            a = a * b + scale
+            a = Math.fma(a, b, scale)
             b = b * 0.9999995f + 1e-9f
             index++
         }

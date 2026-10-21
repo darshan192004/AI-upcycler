@@ -91,6 +91,8 @@ class WorkerRpcService(
     private val identity: WorkerIdentitySource,
     private val metrics: DeviceMetricsSource,
     private val engine: EngineSource? = null,
+    /** Injected so a test can exercise the probe's failure mapping. */
+    private val probe: () -> HardwareProbe.Result = HardwareProbe::measure,
 ) : WorkerServiceGrpc.WorkerServiceImplBase() {
 
     override fun handshake(
@@ -256,7 +258,22 @@ class WorkerRpcService(
         // The probe is pure, bounded and synchronous, so it is safe to run
         // on the gRPC handler thread (spec 2026-10-21, D-C9). It measures
         // this worker's own hardware - never a value derived from a node id.
-        val measured = HardwareProbe.measure()
+        //
+        // The 32 MiB measurement buffer is the only allocation. If the device
+        // cannot spare it, failing the RPC is honest: an OutOfMemoryError
+        // escaping the callback would take the worker down, and the master
+        // could not count the node as failed (spec D-C6).
+        val measured = try {
+            probe()
+        } catch (error: OutOfMemoryError) {
+            responseObserver.onError(
+                Status.RESOURCE_EXHAUSTED
+                    .withDescription("hardware probe could not allocate its measurement buffer")
+                    .withCause(error)
+                    .asRuntimeException(),
+            )
+            return
+        }
         val response = BenchmarkResponse.newBuilder()
             .setMemoryBandwidthMbs(measured.memoryBandwidthMbs)
             .setThroughputFlops(measured.throughputFlops)

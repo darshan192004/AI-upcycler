@@ -4,12 +4,15 @@ import aiupcycler.rpc.ClusterRpc.BenchmarkRequest
 import aiupcycler.rpc.WorkerServiceGrpc
 import io.grpc.ManagedChannel
 import io.grpc.Server
+import io.grpc.Status
+import io.grpc.StatusRuntimeException
 import io.grpc.inprocess.InProcessChannelBuilder
 import io.grpc.inprocess.InProcessServerBuilder
 import org.aiupcycler.worker.metrics.DeviceMetrics
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 
@@ -93,6 +96,36 @@ class HardwareProbeTest {
         val buffer = FloatArray(16) { 1.0f }
         assertEquals(0.0, HardwareProbe.probeBandwidthMbs(buffer, 0), 0.0)
         assertEquals(0.0, HardwareProbe.probeThroughputFlops(0), 0.0)
+    }
+
+    /**
+     * An exhausted heap is answered, not fatal: the 32 MiB buffer is the probe's
+     * only allocation, and letting `OutOfMemoryError` escape the gRPC callback
+     * would take the worker down instead of letting the master count the node
+     * as failed (spec 2026-10-21, D-C6).
+     */
+    @Test
+    fun an_out_of_memory_probe_fails_the_rpc_instead_of_the_worker() {
+        val name = InProcessServerBuilder.generateName()
+        val failing = WorkerRpcService(identity, metrics) {
+            throw OutOfMemoryError("simulated exhaustion")
+        }
+        val failingServer = InProcessServerBuilder.forName(name)
+            .directExecutor()
+            .addService(failing)
+            .build()
+            .start()
+        val failingChannel = InProcessChannelBuilder.forName(name).directExecutor().build()
+        try {
+            WorkerServiceGrpc.newBlockingStub(failingChannel)
+                .benchmark(BenchmarkRequest.getDefaultInstance())
+            fail("a probe that cannot allocate must not return a measurement")
+        } catch (error: StatusRuntimeException) {
+            assertEquals(Status.Code.RESOURCE_EXHAUSTED, error.status.code)
+        } finally {
+            failingChannel.shutdownNow()
+            failingServer.shutdownNow()
+        }
     }
 
     @Test
