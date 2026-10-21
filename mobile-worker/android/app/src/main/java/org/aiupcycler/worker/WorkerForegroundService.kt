@@ -28,7 +28,7 @@ class WorkerForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        runtime = WorkerRuntime(applicationContext)
+        runtime = instance ?: WorkerRuntime(applicationContext).also { instance = it }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,6 +76,31 @@ class WorkerForegroundService : Service() {
         private const val TAG = "WorkerService"
         private const val CHANNEL_ID = "ai-upcycler-worker"
         private const val NOTIFICATION_ID = 1
+
+        /**
+         * The one runtime this process serves from.
+         *
+         * The activity and the service must share it: pairing saves
+         * credentials and restarts the *serving* server, and a second runtime
+         * in the activity would restart a server nobody is listening on while
+         * the service kept serving plaintext. Set in [onCreate], so it is the
+         * service's runtime that wins whenever the service has started.
+         */
+        @Volatile
+        private var instance: WorkerRuntime? = null
+
+        /**
+         * The runtime the UI should pair against.
+         *
+         * Before the service has started this constructs one so the pairing
+         * screen works on a cold app open. [start] is called by the activity
+         * immediately afterwards, and the service then adopts this instance
+         * rather than creating a second.
+         */
+        fun runtime(context: Context): WorkerRuntime =
+            instance ?: synchronized(this) {
+                instance ?: WorkerRuntime(context.applicationContext).also { instance = it }
+            }
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, WorkerForegroundService::class.java))

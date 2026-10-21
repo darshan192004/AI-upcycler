@@ -11,6 +11,7 @@ import org.aiupcycler.worker.pairing.CredentialStore
 import org.aiupcycler.worker.pairing.EnrollmentClient
 import org.aiupcycler.worker.pairing.EnrollmentRequest
 import org.aiupcycler.worker.pairing.EnrollmentResult
+import org.aiupcycler.worker.pairing.PairingState
 import org.aiupcycler.worker.pairing.PairingUri
 import org.aiupcycler.worker.pairing.WorkerAddresses
 import org.aiupcycler.worker.pairing.WorkerCredentials
@@ -36,6 +37,30 @@ class WorkerRuntime(private val context: Context) {
 
     /** The stored pairing, or `null` when this worker has never paired. */
     fun credentials(): WorkerCredentials? = credentials.load()
+
+    /**
+     * The pairing state the screen should show now, derived from what is on
+     * disk (spec D-B4). A stored pairing whose fingerprint file is missing
+     * still counts as paired - [CredentialStore.hasCredentials] decides that -
+     * and the fingerprint is simply shown as unknown rather than the worker
+     * pretending not to be paired.
+     */
+    fun pairingState(): PairingState = if (credentials.hasCredentials()) {
+        PairingState.Paired(credentials.load()?.fingerprint.orEmpty())
+    } else {
+        PairingState.Unpaired
+    }
+
+    /**
+     * [result] as the screen should show it: a successful enrollment is a
+     * [PairingState.Paired] read back *from the store*, not from the response,
+     * so what the screen shows is what the next start() will actually serve.
+     */
+    fun pairingState(result: EnrollmentResult): PairingState = when (result) {
+        is EnrollmentResult.Enrolled -> pairingState()
+        is EnrollmentResult.Rejected -> PairingState.Rejected(result.reason)
+        is EnrollmentResult.Failed -> PairingState.Failed(result.reason)
+    }
 
     fun start() {
         rpcServer.start(credentials.load())
