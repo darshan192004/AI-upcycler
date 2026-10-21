@@ -531,23 +531,43 @@ impl WorkerService for WorkerEngine {
 
     /// Measures this host's memory bandwidth and single-threaded f32 FMA
     /// rate with the bounded probes in [`crate::probe`] (spec 2026-10-21,
-    /// D-C2). Synchronous work inside an async method is acceptable here
-    /// because the probe is deliberately short (~0.5 s) and the worker runs
-    /// one inference session at a time; no threads are spawned so the probe
-    /// cannot compete with serving.
+    /// D-C2).
+    ///
+    /// The buffer is allocated *before* the timer starts: `probe_duration_ms`
+    /// is meant to let a master sanity-check a degenerate measurement (spec
+    /// D-C2), so it must cover the probe loops only — not the 32 MiB
+    /// allocation. The individual measurements are unaffected either way,
+    /// since each probe times its own loop internally.
+    ///
+    /// The probe is pure and borrows nothing from `self`, so it runs on the
+    /// runtime's blocking pool: the ~half-second of CPU work never occupies an
+    /// async worker thread. That keeps the worker answering health checks and
+    /// inference while a benchmark is in flight, without the probe spawning
+    /// competing threads of its own (spec D-C2).
     async fn benchmark(
         &self,
         _request: Request<BenchmarkRequest>,
     ) -> Result<Response<BenchmarkResponse>, Status> {
-        let started = std::time::Instant::now();
-        let mut buffer = vec![1.0f32; crate::probe::BANDWIDTH_BUFFER_ELEMENTS];
-        let memory_bandwidth_mbs =
-            crate::probe::probe_bandwidth_mbs(&mut buffer, crate::probe::BANDWIDTH_PASSES);
-        let throughput_flops = crate::probe::probe_throughput_flops(crate::probe::FLOPS_ITERATIONS);
+        let measured = tokio::task::spawn_blocking(|| {
+            let mut buffer = vec![1.0f32; crate::probe::BANDWIDTH_BUFFER_ELEMENTS];
+            let started = std::time::Instant::now();
+            let memory_bandwidth_mbs =
+                crate::probe::probe_bandwidth_mbs(&mut buffer, crate::probe::BANDWIDTH_PASSES);
+            let throughput_flops =
+                crate::probe::probe_throughput_flops(crate::probe::FLOPS_ITERATIONS);
+            (
+                memory_bandwidth_mbs,
+                throughput_flops,
+                started.elapsed().as_secs_f64() * 1000.0,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("benchmark probe task failed: {e}")))?;
+
         Ok(Response::new(BenchmarkResponse {
-            memory_bandwidth_mbs,
-            throughput_flops,
-            probe_duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            memory_bandwidth_mbs: measured.0,
+            throughput_flops: measured.1,
+            probe_duration_ms: measured.2,
         }))
     }
 }

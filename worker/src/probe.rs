@@ -87,6 +87,34 @@ mod tests {
         assert!(buffer.iter().all(|v| *v > 1.0), "buffer was written");
     }
 
+    /// The engine dispatches the probe through `tokio::task::spawn_blocking`
+    /// (`WorkerEngine::benchmark`) so the CPU-bound work never occupies an
+    /// async worker thread. This pins the property that motivates it: an async
+    /// task keeps making progress on the same runtime while a probe runs on
+    /// the blocking pool. A single-thread runtime is the strict case — if the
+    /// probe blocked the runtime, the ticker could not advance at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_probe_on_the_blocking_pool_does_not_starve_the_runtime() {
+        let probe = tokio::task::spawn_blocking(|| {
+            let mut buffer = vec![1.0f32; BANDWIDTH_BUFFER_ELEMENTS];
+            probe_bandwidth_mbs(&mut buffer, BANDWIDTH_PASSES)
+        });
+
+        // The ticker shares the runtime with the probe dispatch.
+        let mut ticks = 0u32;
+        while !probe.is_finished() {
+            tokio::task::yield_now().await;
+            ticks += 1;
+            if ticks > 1_000_000 {
+                break; // the probe is slower than 1e6 yields: still "did not starve"
+            }
+        }
+
+        let mbps = probe.await.expect("probe task panicked");
+        assert!(mbps.is_finite() && mbps > 0.0, "bandwidth {mbps}");
+        assert!(ticks > 0, "runtime made no progress while the probe ran");
+    }
+
     #[test]
     fn bandwidth_probe_reports_zero_for_a_degenerate_clock() {
         // Zero passes => zero elapsed guard must not divide by zero.
