@@ -113,9 +113,11 @@ export function AppShell({ activeTab, onTabChange, children }: AppShellProps) {
               transport
             </p>
             <p className="mt-1 text-xs text-slate-400">
-              Loopback API · plaintext LAN RPC
+              Loopback API · mTLS worker RPC
             </p>
-            <p className="mt-1 text-[10px] text-slate-600">mTLS planned (§7)</p>
+            <p className="mt-1 text-[10px] text-slate-600">
+              USB plaintext until paired (§3)
+            </p>
           </div>
         </aside>
 
