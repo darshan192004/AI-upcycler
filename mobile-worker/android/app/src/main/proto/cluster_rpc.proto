@@ -8,6 +8,7 @@ service WorkerService {
   rpc ExecuteForward (ExecuteForwardRequest) returns (ExecuteForwardResponse);
   rpc UnloadLayers (UnloadLayersRequest) returns (UnloadLayersResponse);
   rpc GetHealthStatus (HealthRequest) returns (HealthResponse);
+  rpc Benchmark (BenchmarkRequest) returns (BenchmarkResponse);
 }
 
 message HandshakeRequest {
@@ -79,4 +80,18 @@ message HealthResponse {
   float battery_percentage = 1;
   float cpu_temp_celsius = 2;
   int64 free_ram_bytes = 3;
+}
+
+// Measures this worker's own hardware: bounded, sub-second probes run on
+// demand by the master (spec 2026-10-21, D-C1/D-C2). No request fields: the
+// probe shape is fixed so two masters always compare like with like.
+message BenchmarkRequest {}
+
+message BenchmarkResponse {
+  // Sequential read+write throughput over a fixed buffer (MiB/s scale).
+  double memory_bandwidth_mbs = 1;
+  // Single-threaded f32 fused multiply-add rate (FLOP/s scale).
+  double throughput_flops = 2;
+  // The worker's own wall time for both probes, for degenerate-run sanity.
+  double probe_duration_ms = 3;
 }

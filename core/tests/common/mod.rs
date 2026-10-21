@@ -12,9 +12,9 @@ use ai_upcycler_core::rpc::proto::aiupcycler::rpc::worker_service_server::{
     WorkerService, WorkerServiceServer,
 };
 use ai_upcycler_core::rpc::proto::aiupcycler::rpc::{
-    ExecuteForwardRequest, ExecuteForwardResponse, HandshakeRequest, HandshakeResponse,
-    HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse, TensorBuffer,
-    UnloadLayersRequest, UnloadLayersResponse,
+    BenchmarkRequest, BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse,
+    HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
+    LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use ai_upcycler_core::scheduler::planner::LayerAssignment;
 use ai_upcycler_core::security::{NodeCa, ServerIdentity};
@@ -41,6 +41,9 @@ pub struct MockWorker {
     execution_time_us: i64,
     fail_load: bool,
     fail_forward: bool,
+    /// When false, `benchmark` answers `UNIMPLEMENTED` — the shape every
+    /// pre-benchmark-probe worker presents to the master (spec 2026-10-21).
+    serve_benchmark: bool,
     events: Events,
 }
 
@@ -57,6 +60,7 @@ impl MockWorker {
             execution_time_us,
             fail_load: false,
             fail_forward: false,
+            serve_benchmark: true,
             events,
         }
     }
@@ -68,6 +72,13 @@ impl MockWorker {
 
     pub fn refusing_forward(mut self) -> Self {
         self.fail_forward = true;
+        self
+    }
+
+    /// Makes this worker answer `UNIMPLEMENTED` to `Benchmark`, like every
+    /// worker built before the probe RPC existed.
+    pub fn without_benchmark(mut self) -> Self {
+        self.serve_benchmark = false;
         self
     }
 
@@ -165,6 +176,25 @@ impl WorkerService for MockWorker {
             battery_percentage: 80.0,
             cpu_temp_celsius: 40.0,
             free_ram_bytes: 1 << 29,
+        }))
+    }
+
+    /// Fixed, node-specific "measurements" so a test can assert the exact row
+    /// the master recorded came from the wire, not from a derivation.
+    async fn benchmark(
+        &self,
+        _request: tonic::Request<BenchmarkRequest>,
+    ) -> Result<tonic::Response<BenchmarkResponse>, tonic::Status> {
+        if !self.serve_benchmark {
+            return Err(tonic::Status::unimplemented(
+                "benchmark probe is not supported by this worker",
+            ));
+        }
+        let tag = f64::from(self.tag);
+        Ok(tonic::Response::new(BenchmarkResponse {
+            memory_bandwidth_mbs: 1000.0 + tag,
+            throughput_flops: 100.0 + tag,
+            probe_duration_ms: 4.0 + tag,
         }))
     }
 }

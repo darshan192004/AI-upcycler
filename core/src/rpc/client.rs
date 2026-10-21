@@ -1,8 +1,8 @@
 use crate::rpc::engine::{ActivationType, ExecutionResult, TensorPayload};
 use crate::rpc::proto::aiupcycler::rpc::{
-    worker_service_client::WorkerServiceClient, ExecuteForwardRequest, HandshakeRequest,
-    HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse,
-    TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
+    worker_service_client::WorkerServiceClient, BenchmarkRequest, BenchmarkResponse,
+    ExecuteForwardRequest, HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse,
+    LoadLayersRequest, LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::scheduler::planner::LayerAssignment;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -232,6 +232,19 @@ impl WorkerRpcClient {
             .get_health_status(HealthRequest {})
             .await
             .map_err(|e| format!("get_health_status failed: {e}"))?
+            .into_inner();
+        Ok(response)
+    }
+
+    /// Asks the worker to measure its own memory bandwidth and compute
+    /// throughput (spec 2026-10-21, D-C1/D-C2). A pre-probe worker answers
+    /// `UNIMPLEMENTED`, which the benchmark handler counts rather than fakes.
+    pub async fn benchmark(&mut self) -> Result<BenchmarkResponse, String> {
+        let response = self
+            .inner
+            .benchmark(BenchmarkRequest {})
+            .await
+            .map_err(|e| format!("benchmark failed: {e}"))?
             .into_inner();
         Ok(response)
     }

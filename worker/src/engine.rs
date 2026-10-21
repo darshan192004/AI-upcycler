@@ -8,9 +8,10 @@ use crate::gguf::GgufFile;
 use crate::layers::{embed_ids, lm_head, run_block, BlockWeights, KvLayer};
 use crate::math::rms_norm;
 use crate::proto::aiupcycler::rpc::{
-    tensor_buffer::DataType, worker_service_server::WorkerService, ExecuteForwardRequest,
-    ExecuteForwardResponse, HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse,
-    LoadLayersRequest, LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
+    tensor_buffer::DataType, worker_service_server::WorkerService, BenchmarkRequest,
+    BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse, HandshakeRequest,
+    HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse,
+    TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::quant::{dequantize, GgmlType};
 use std::collections::HashMap;
@@ -525,6 +526,28 @@ impl WorkerService for WorkerEngine {
             battery_percentage: 0.0,
             cpu_temp_celsius: 0.0,
             free_ram_bytes: free as i64,
+        }))
+    }
+
+    /// Measures this host's memory bandwidth and single-threaded f32 FMA
+    /// rate with the bounded probes in [`crate::probe`] (spec 2026-10-21,
+    /// D-C2). Synchronous work inside an async method is acceptable here
+    /// because the probe is deliberately short (~0.5 s) and the worker runs
+    /// one inference session at a time; no threads are spawned so the probe
+    /// cannot compete with serving.
+    async fn benchmark(
+        &self,
+        _request: Request<BenchmarkRequest>,
+    ) -> Result<Response<BenchmarkResponse>, Status> {
+        let started = std::time::Instant::now();
+        let mut buffer = vec![1.0f32; crate::probe::BANDWIDTH_BUFFER_ELEMENTS];
+        let memory_bandwidth_mbs =
+            crate::probe::probe_bandwidth_mbs(&mut buffer, crate::probe::BANDWIDTH_PASSES);
+        let throughput_flops = crate::probe::probe_throughput_flops(crate::probe::FLOPS_ITERATIONS);
+        Ok(Response::new(BenchmarkResponse {
+            memory_bandwidth_mbs,
+            throughput_flops,
+            probe_duration_ms: started.elapsed().as_secs_f64() * 1000.0,
         }))
     }
 }
