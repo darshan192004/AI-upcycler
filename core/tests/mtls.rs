@@ -6,9 +6,9 @@ use ai_upcycler_core::rpc::proto::aiupcycler::rpc::worker_service_server::{
     WorkerService, WorkerServiceServer,
 };
 use ai_upcycler_core::rpc::proto::aiupcycler::rpc::{
-    ExecuteForwardRequest, ExecuteForwardResponse, HandshakeRequest, HandshakeResponse,
-    HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse, UnloadLayersRequest,
-    UnloadLayersResponse,
+    BenchmarkRequest, BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse,
+    HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
+    LoadLayersResponse, UnloadLayersRequest, UnloadLayersResponse,
 };
 use ai_upcycler_core::security::{ClientIdentity, NodeCa, PairingManager, PAIRING_TTL};
 use std::net::SocketAddr;
@@ -65,6 +65,13 @@ impl WorkerService for TestWorker {
             cpu_temp_celsius: 35.0,
             free_ram_bytes: 1 << 29,
         }))
+    }
+
+    async fn benchmark(
+        &self,
+        _request: tonic::Request<BenchmarkRequest>,
+    ) -> Result<tonic::Response<BenchmarkResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not needed for mTLS test"))
     }
 }
 

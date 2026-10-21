@@ -8,9 +8,10 @@ use crate::gguf::GgufFile;
 use crate::layers::{embed_ids, lm_head, run_block, BlockWeights, KvLayer};
 use crate::math::rms_norm;
 use crate::proto::aiupcycler::rpc::{
-    tensor_buffer::DataType, worker_service_server::WorkerService, ExecuteForwardRequest,
-    ExecuteForwardResponse, HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse,
-    LoadLayersRequest, LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
+    tensor_buffer::DataType, worker_service_server::WorkerService, BenchmarkRequest,
+    BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse, HandshakeRequest,
+    HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse,
+    TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::quant::{dequantize, GgmlType};
 use std::collections::HashMap;
@@ -525,6 +526,48 @@ impl WorkerService for WorkerEngine {
             battery_percentage: 0.0,
             cpu_temp_celsius: 0.0,
             free_ram_bytes: free as i64,
+        }))
+    }
+
+    /// Measures this host's memory bandwidth and single-threaded f32 FMA
+    /// rate with the bounded probes in [`crate::probe`] (spec 2026-10-21,
+    /// D-C2).
+    ///
+    /// The buffer is allocated *before* the timer starts: `probe_duration_ms`
+    /// is meant to let a master sanity-check a degenerate measurement (spec
+    /// D-C2), so it must cover the probe loops only — not the 32 MiB
+    /// allocation. The individual measurements are unaffected either way,
+    /// since each probe times its own loop internally.
+    ///
+    /// The probe is pure and borrows nothing from `self`, so it runs on the
+    /// runtime's blocking pool: the ~half-second of CPU work never occupies an
+    /// async worker thread. That keeps the worker answering health checks and
+    /// inference while a benchmark is in flight, without the probe spawning
+    /// competing threads of its own (spec D-C2).
+    async fn benchmark(
+        &self,
+        _request: Request<BenchmarkRequest>,
+    ) -> Result<Response<BenchmarkResponse>, Status> {
+        let measured = tokio::task::spawn_blocking(|| {
+            let mut buffer = vec![1.0f32; crate::probe::BANDWIDTH_BUFFER_ELEMENTS];
+            let started = std::time::Instant::now();
+            let memory_bandwidth_mbs =
+                crate::probe::probe_bandwidth_mbs(&mut buffer, crate::probe::BANDWIDTH_PASSES);
+            let throughput_flops =
+                crate::probe::probe_throughput_flops(crate::probe::FLOPS_ITERATIONS);
+            (
+                memory_bandwidth_mbs,
+                throughput_flops,
+                started.elapsed().as_secs_f64() * 1000.0,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("benchmark probe task failed: {e}")))?;
+
+        Ok(Response::new(BenchmarkResponse {
+            memory_bandwidth_mbs: measured.0,
+            throughput_flops: measured.1,
+            probe_duration_ms: measured.2,
         }))
     }
 }

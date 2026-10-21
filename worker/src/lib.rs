@@ -4,6 +4,7 @@
 pub mod engine;
 pub mod layers;
 pub mod math;
+pub mod probe;
 pub mod proto;
 pub mod quant;
 
