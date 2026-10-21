@@ -1,5 +1,7 @@
 package org.aiupcycler.worker.rpc
 
+import aiupcycler.rpc.ClusterRpc.BenchmarkRequest
+import aiupcycler.rpc.ClusterRpc.BenchmarkResponse
 import aiupcycler.rpc.ClusterRpc.ExecuteForwardRequest
 import aiupcycler.rpc.ClusterRpc.ExecuteForwardResponse
 import aiupcycler.rpc.ClusterRpc.HandshakeRequest
@@ -243,6 +245,23 @@ class WorkerRpcService(
                 unexpectedOutcome("unloadLayers", outcome),
             )
         }
+        responseObserver.onNext(response)
+        responseObserver.onCompleted()
+    }
+
+    override fun benchmark(
+        request: BenchmarkRequest,
+        responseObserver: StreamObserver<BenchmarkResponse>,
+    ) {
+        // The probe is pure, bounded and synchronous, so it is safe to run
+        // on the gRPC handler thread (spec 2026-10-21, D-C9). It measures
+        // this worker's own hardware - never a value derived from a node id.
+        val measured = HardwareProbe.measure()
+        val response = BenchmarkResponse.newBuilder()
+            .setMemoryBandwidthMbs(measured.memoryBandwidthMbs)
+            .setThroughputFlops(measured.throughputFlops)
+            .setProbeDurationMs(measured.probeDurationMs)
+            .build()
         responseObserver.onNext(response)
         responseObserver.onCompleted()
     }

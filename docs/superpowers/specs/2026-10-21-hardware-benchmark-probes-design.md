@@ -1,6 +1,7 @@
 # Hardware Benchmark Probes — Design (2026-10-21)
 
-> **Status:** spec.
+> **Status:** IMPLEMENTED (2026-10-21) — slices #81 and this PR; real phone
+> *values* remain hardware-gated (tasks.md §6 checklist).
 > **Tracks:** `docs/plan.md` §5.1 "On-device benchmark probes (replace `StubBenchmarker`)";
 > `docs/tasks.md` §7 "`POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker`".
 > **Epic edge:** everything in this epic is implementable and verifiable device-free;

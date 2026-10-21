@@ -53,6 +53,12 @@ pub struct AppState {
     /// Devices holding a pairing reverse tunnel, keyed to the session that
     /// tunnel exists for (spec 2026-10-20, D-B8 cleanup).
     pub pairing_tunnels: Arc<PairingTunnelRegistry>,
+    /// Optional override for how `POST /api/cluster/benchmark` dials each
+    /// node. `None` (production) derives enrollment-aware transports from
+    /// `security` at call time, so a `with_security` swap can never leave the
+    /// benchmarker holding a stale CA. Tests set an explicit source for
+    /// loopback mock workers (spec 2026-10-21, D-C3).
+    pub benchmark_transports: Option<Arc<dyn crate::rpc::engine::WorkerTransportSource>>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -86,6 +92,7 @@ impl AppState {
         telemetry: TelemetryBus,
         host: HostInfo,
     ) -> Self {
+        let security = Arc::new(SecurityState::default());
         Self {
             cluster_id,
             registry,
@@ -96,9 +103,20 @@ impl AppState {
             host,
             models_dir: default_models_dir(),
             active_downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
-            security: Arc::new(SecurityState::default()),
+            security,
             pairing_tunnels: Arc::new(PairingTunnelRegistry::default()),
+            benchmark_transports: None,
         }
+    }
+
+    /// Overrides how nodes are dialed for benchmarking (tests inject a
+    /// plaintext loopback source; spec 2026-10-21, D-C3).
+    pub fn with_benchmark_transports(
+        mut self,
+        transports: Arc<dyn crate::rpc::engine::WorkerTransportSource>,
+    ) -> Self {
+        self.benchmark_transports = Some(transports);
+        self
     }
 
     /// Overrides the GGUF fetcher (tests inject [`downloads::StubFetcher`]).

@@ -268,11 +268,15 @@ async fn exposes_cluster_topology() {
 
 #[tokio::test]
 async fn runs_benchmark() {
+    // The discovered node in this fixture has nothing listening, so the probe
+    // cannot measure it. The endpoint must count it, not fake a row (D-C6) —
+    // this is the behaviour the epic exists to establish.
     let (status, body) = send(router(state()), "POST", "/api/cluster/benchmark", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "success");
-    assert_eq!(body["nodes_tested"], 1);
-    assert_eq!(body["rebalancing_triggered"], true);
+    assert_eq!(body["status"], "partial");
+    assert_eq!(body["nodes_tested"], 0);
+    assert_eq!(body["nodes_failed"], 1);
+    assert_eq!(body["rebalancing_triggered"], false);
 }
 
 #[tokio::test]

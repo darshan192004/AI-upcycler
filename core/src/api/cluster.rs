@@ -1,6 +1,7 @@
 //! Cluster management endpoints: topology view and hardware benchmarking.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
@@ -9,7 +10,10 @@ use serde::Serialize;
 
 use crate::api::{ApiResult, AppState, HostInfo};
 use crate::discovery::mdns::DiscoveredNode;
+use crate::rpc::client::WorkerRpcClient;
+use crate::rpc::engine::{WorkerTransport, WorkerTransportSource};
 use crate::scheduler::planner::{LayerScheduler, ModelSpec};
+use crate::security::SecurityState;
 use crate::store::{NewBenchmark, NewNode};
 
 /// How the master sees a node in the topology graph.
@@ -139,14 +143,25 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
 pub struct BenchmarkResponse {
     pub status: &'static str,
     pub nodes_tested: u32,
+    /// Nodes that could not be measured — dial failures, timeouts, and workers
+    /// that predate the probe RPC (gRPC `UNIMPLEMENTED`). Counted, never faked
+    /// (spec 2026-10-21, D-C6).
+    pub nodes_failed: u32,
     pub rebalancing_triggered: bool,
     pub execution_time_ms: u64,
 }
 
+/// Bounds a single node's probe. The worker's own probe is ~0.5 s by
+/// construction (D-C2); 2 s leaves room for a slow dial plus handshake without
+/// letting one unreachable node stall the endpoint (D-C6).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub async fn benchmark(State(state): State<AppState>) -> ApiResult<Json<BenchmarkResponse>> {
     let started = Instant::now();
-    let benchmarker = StubBenchmarker;
+    let benchmarker =
+        ProbeBenchmarker::new(state.security.clone(), state.benchmark_transports.clone());
     let mut nodes_tested = 0u32;
+    let mut nodes_failed = 0u32;
 
     for node in state.registry.list_nodes() {
         state.store.upsert_node(&NewNode {
@@ -159,22 +174,49 @@ pub async fn benchmark(State(state): State<AppState>) -> ApiResult<Json<Benchmar
             has_npu: false,
         })?;
 
-        let result = benchmarker.benchmark(&node);
-        state.store.record_benchmark(&NewBenchmark {
-            node_id: node.node_id.clone(),
-            memory_bandwidth_mbs: result.memory_bandwidth_mbs,
-            network_ping_ms: result.network_ping_ms,
-            throughput_flops: result.throughput_flops,
-        })?;
-        nodes_tested += 1;
+        match tokio::time::timeout(PROBE_TIMEOUT, benchmarker.benchmark(&node)).await {
+            Ok(Ok(result)) => {
+                state.store.record_benchmark(&NewBenchmark {
+                    node_id: node.node_id.clone(),
+                    memory_bandwidth_mbs: result.memory_bandwidth_mbs,
+                    network_ping_ms: result.network_ping_ms,
+                    throughput_flops: result.throughput_flops,
+                })?;
+                nodes_tested += 1;
+            }
+            Ok(Err(reason)) => {
+                tracing::warn!("benchmark probe failed for node {}: {reason}", node.node_id);
+                nodes_failed += 1;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "benchmark probe timed out for node {} after {:?}",
+                    node.node_id,
+                    PROBE_TIMEOUT
+                );
+                nodes_failed += 1;
+            }
+        }
     }
 
     Ok(Json(BenchmarkResponse {
-        status: "success",
+        status: benchmark_status(nodes_tested, nodes_failed),
         nodes_tested,
+        nodes_failed,
         rebalancing_triggered: nodes_tested > 0,
         execution_time_ms: started.elapsed().as_millis() as u64,
     }))
+}
+
+/// Reports what actually happened, so an operator can tell a real measurement
+/// from a silent no-op (D-C6): `no_nodes` when nothing was probed, `partial`
+/// when some probes failed, `success` only when every probed node answered.
+fn benchmark_status(nodes_tested: u32, nodes_failed: u32) -> &'static str {
+    match (nodes_tested, nodes_failed) {
+        (0, 0) => "no_nodes",
+        (_, 0) => "success",
+        _ => "partial",
+    }
 }
 
 /// Result of running a node through the hardware benchmarker.
@@ -186,28 +228,132 @@ pub struct NodeBenchmark {
 }
 
 /// Measures a node's usable compute/bandwidth characteristics.
+///
+/// Async because the real probe is an RPC (D-C5). Native async-fn-in-trait, not
+/// the `async-trait` crate: the workspace has no such dependency and this trait
+/// is never used as `dyn`, so monomorphization at each call site is enough.
+#[allow(async_fn_in_trait)]
 pub trait HardwareBenchmarker: Send + Sync {
-    fn benchmark(&self, node: &DiscoveredNode) -> NodeBenchmark;
+    async fn benchmark(&self, node: &DiscoveredNode) -> Result<NodeBenchmark, String>;
 }
 
-/// Deterministic placeholder benchmarker.
+/// Resolves a node's *benchmark* dial the way that node actually serves
+/// (D-C3): mTLS once it has completed pairing against this master's CA,
+/// plaintext until then.
 ///
-/// Values are derived from a hash of the node id so results are stable across
-/// runs, but they do not reflect real hardware. Replace with on-device probes
-/// before using these numbers for scheduling decisions.
-pub struct StubBenchmarker;
+/// This is deliberately **not** [`crate::security::EnrolledWorkerSource`], which
+/// refuses any unenrolled node. That refusal is right for the serving path —
+/// serving must never downgrade an unknown worker to plaintext — but wrong
+/// here: an unpaired mDNS worker, and the local Rust worker behind an ADB
+/// forward, genuinely serve plaintext, so a probe that refused them could never
+/// measure the very nodes the endpoint exists to compare. The exposure class is
+/// unchanged: discovery handshakes and ADB tunnel probes already speak
+/// plaintext to unpaired workers (spec D-C3).
+struct BenchmarkTransports {
+    security: Arc<SecurityState>,
+}
 
-impl HardwareBenchmarker for StubBenchmarker {
-    fn benchmark(&self, node: &DiscoveredNode) -> NodeBenchmark {
-        let hash = fnv1a(node.node_id.as_bytes());
-        NodeBenchmark {
-            memory_bandwidth_mbs: 400.0 + (hash % 600) as f64,
-            network_ping_ms: node.latency_ms as f64,
-            throughput_flops: 5.0 + (hash % 50) as f64,
+impl BenchmarkTransports {
+    fn new(security: Arc<SecurityState>) -> Self {
+        Self { security }
+    }
+}
+
+impl WorkerTransportSource for BenchmarkTransports {
+    fn transport_for(&self, node_id: &str) -> Result<WorkerTransport, String> {
+        if !self.security.enrollments.is_enrolled(node_id) {
+            return Ok(WorkerTransport::Plaintext);
+        }
+        Ok(WorkerTransport::MutualTls(
+            crate::rpc::engine::WorkerTlsConfig {
+                ca_pem: self.security.ca.ca_pem(),
+                client_cert_pem: self.security.ca.client_cert_pem().to_string(),
+                client_key_pem: self.security.ca.client_key_pem().to_string(),
+            },
+        ))
+    }
+}
+
+/// Probes each node over the transport it actually serves on (D-C3).
+pub struct ProbeBenchmarker {
+    transports: Arc<dyn WorkerTransportSource>,
+}
+
+impl ProbeBenchmarker {
+    /// Production wiring: derives transports from the live pairing enrollment
+    /// registry. `override_transports` exists only for tests, which dial
+    /// loopback mock workers and cannot complete a pairing.
+    pub fn new(
+        security: Arc<SecurityState>,
+        override_transports: Option<Arc<dyn WorkerTransportSource>>,
+    ) -> Self {
+        let transports =
+            override_transports.unwrap_or_else(|| Arc::new(BenchmarkTransports::new(security)));
+        Self { transports }
+    }
+
+    async fn connect(&self, node: &DiscoveredNode) -> Result<WorkerRpcClient, String> {
+        match self.transports.transport_for(&node.node_id)? {
+            WorkerTransport::Plaintext => {
+                let endpoint = crate::rpc::engine::http_endpoint(&node.ip_address, node.port);
+                WorkerRpcClient::connect(&endpoint).await
+            }
+            WorkerTransport::MutualTls(config) => {
+                let endpoint = crate::rpc::engine::https_endpoint(&node.ip_address, node.port);
+                WorkerRpcClient::connect_tls(
+                    &endpoint,
+                    &config.ca_pem,
+                    &config.client_cert_pem,
+                    &config.client_key_pem,
+                    crate::rpc::engine::host(&node.ip_address),
+                )
+                .await
+            }
         }
     }
 }
 
+impl HardwareBenchmarker for ProbeBenchmarker {
+    async fn benchmark(&self, node: &DiscoveredNode) -> Result<NodeBenchmark, String> {
+        let mut client = self.connect(node).await?;
+        let measured = client.benchmark().await?;
+        if !measured.memory_bandwidth_mbs.is_finite() || !measured.throughput_flops.is_finite() {
+            return Err(format!(
+                "worker {} returned a non-finite measurement",
+                node.node_id
+            ));
+        }
+        Ok(NodeBenchmark {
+            memory_bandwidth_mbs: measured.memory_bandwidth_mbs,
+            // Discovery latency is a real measured round-trip; the probe RPC's
+            // own round-trip is compute-dominated and would mislead (D-C4).
+            network_ping_ms: f64::from(node.latency_ms),
+            throughput_flops: measured.throughput_flops,
+        })
+    }
+}
+
+/// Deterministic placeholder benchmarker, **test-only** (D-C7).
+///
+/// Values are derived from a hash of the node id so results are stable across
+/// runs, but they do not reflect real hardware. Nothing in production may use
+/// this: the handler wires [`ProbeBenchmarker`]. Kept for tests and fixtures.
+#[cfg(test)]
+pub struct StubBenchmarker;
+
+#[cfg(test)]
+impl HardwareBenchmarker for StubBenchmarker {
+    async fn benchmark(&self, node: &DiscoveredNode) -> Result<NodeBenchmark, String> {
+        let hash = fnv1a(node.node_id.as_bytes());
+        Ok(NodeBenchmark {
+            memory_bandwidth_mbs: 400.0 + (hash % 600) as f64,
+            network_ping_ms: node.latency_ms as f64,
+            throughput_flops: 5.0 + (hash % 50) as f64,
+        })
+    }
+}
+
+#[cfg(test)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -369,7 +515,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn benchmark_records_each_worker_and_returns_metrics() {
+    async fn benchmark_counts_an_unreachable_node_as_failed_without_a_row() {
+        // A node with nothing listening: the probe must be counted, not faked
+        // (D-C6). No worker row is written, because nothing was measured.
         let registry = Arc::new(NodeRegistry::new());
         registry.register_or_update(node("w1", 4 * 1024 * 1024 * 1024));
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -377,17 +525,63 @@ mod tests {
 
         let Json(response) = benchmark(State(state)).await.unwrap();
 
-        assert_eq!(response.nodes_tested, 1);
-        assert!(response.rebalancing_triggered);
-        assert_eq!(store.list_benchmarks("w1").unwrap().len(), 1);
+        assert_eq!(response.nodes_tested, 0, "nothing was measured");
+        assert_eq!(response.nodes_failed, 1, "the unreachable node is counted");
+        assert_eq!(response.status, "partial");
+        assert!(!response.rebalancing_triggered);
+        assert_eq!(store.list_benchmarks("w1").unwrap().len(), 0, "no fake row");
+    }
+
+    #[tokio::test]
+    async fn benchmark_reports_no_nodes_when_nothing_is_discovered() {
+        let registry = Arc::new(NodeRegistry::new());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let state = state(registry, store);
+
+        let Json(response) = benchmark(State(state)).await.unwrap();
+
+        assert_eq!(response.status, "no_nodes");
+        assert_eq!(response.nodes_tested, 0);
+        assert_eq!(response.nodes_failed, 0);
     }
 
     #[test]
-    fn stub_benchmarker_is_deterministic_and_node_specific() {
+    fn benchmark_transports_pair_enrollment_with_mtls_and_leave_the_rest_plaintext() {
+        let security = Arc::new(SecurityState::default());
+        security.enrollments.enroll("paired", "phone", vec![]);
+        let source = BenchmarkTransports::new(security.clone());
+
+        match source.transport_for("paired").expect("enrolled") {
+            WorkerTransport::MutualTls(config) => {
+                assert_eq!(config.ca_pem, security.ca.ca_pem());
+                assert_eq!(config.client_cert_pem, security.ca.client_cert_pem());
+            }
+            WorkerTransport::Plaintext => panic!("an enrolled node must be dialed over mTLS"),
+        }
+
+        // Unpaired is plaintext, not an error: that is how the node serves.
+        assert!(matches!(
+            source
+                .transport_for("unpaired")
+                .expect("unpaired never errors"),
+            WorkerTransport::Plaintext
+        ));
+    }
+
+    #[test]
+    fn benchmark_status_separates_none_partial_and_success() {
+        assert_eq!(benchmark_status(0, 0), "no_nodes");
+        assert_eq!(benchmark_status(1, 0), "success");
+        assert_eq!(benchmark_status(0, 1), "partial");
+        assert_eq!(benchmark_status(2, 1), "partial");
+    }
+
+    #[tokio::test]
+    async fn stub_benchmarker_is_deterministic_and_node_specific() {
         let benchmarker = StubBenchmarker;
-        let a = benchmarker.benchmark(&node("w1", 0));
-        let b = benchmarker.benchmark(&node("w1", 0));
-        let c = benchmarker.benchmark(&node("w2", 0));
+        let a = benchmarker.benchmark(&node("w1", 0)).await.unwrap();
+        let b = benchmarker.benchmark(&node("w1", 0)).await.unwrap();
+        let c = benchmarker.benchmark(&node("w2", 0)).await.unwrap();
         assert_eq!(a, b);
         assert_ne!(a.memory_bandwidth_mbs, c.memory_bandwidth_mbs);
         assert_eq!(a.network_ping_ms, 1.5);
