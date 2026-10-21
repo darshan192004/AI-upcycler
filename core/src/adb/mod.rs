@@ -9,6 +9,7 @@ use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
 use crate::rpc::engine::http_endpoint;
 use crate::rpc::proto::aiupcycler::rpc::HandshakeResponse;
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,6 +252,67 @@ impl AdbTunnelManager {
     }
 }
 
+/// Which device serials currently hold a pairing reverse tunnel, keyed to the
+/// single-use session that tunnel exists for (spec 2026-10-20, D-B8: tunnels
+/// are removed when the session completes or expires).
+#[derive(Default)]
+pub struct PairingTunnelRegistry {
+    tunnels: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl PairingTunnelRegistry {
+    /// Records that `serial`'s reverse tunnel now backs `pin`'s session,
+    /// replacing any previous entry for that device.
+    pub fn track(&self, serial: &str, pin: &str) {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .insert(serial.to_string(), pin.to_string());
+    }
+
+    /// Drops and returns every serial whose session has been redeemed or has
+    /// expired, so its tunnel no longer exposes `POST /api/pairing/enroll`.
+    pub fn purge_inactive(&self, pairing: &crate::security::PairingManager) -> Vec<String> {
+        let mut tunnels = self.tunnels.lock().expect("pairing tunnel lock");
+        let inactive: Vec<String> = tunnels
+            .iter()
+            .filter(|(_, pin)| !pairing.session_usable(pin))
+            .map(|(serial, _)| serial.clone())
+            .collect();
+        tunnels.retain(|serial, _| !inactive.contains(serial));
+        inactive
+    }
+
+    /// Whether a tunnel for `serial` is currently tracked.
+    pub fn is_tracked(&self, serial: &str) -> bool {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .contains_key(serial)
+    }
+}
+
+/// Polls the registry and removes pairing reverse tunnels whose session has
+/// completed or expired (spec 2026-10-20, D-B8). Removal is best-effort: a
+/// failed `adb reverse --remove` is logged and the entry dropped so the poll
+/// does not retry a device that is gone forever; the device-side entry itself
+/// only ever reaches a listener that refuses every redemption (the session
+/// behind it is already dead).
+pub async fn pairing_tunnel_cleanup(
+    security: Arc<crate::security::SecurityState>,
+    tunnels: Arc<PairingTunnelRegistry>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        for serial in tunnels.purge_inactive(&security.pairing) {
+            if let Err(e) = AdbTunnelManager::new().remove_reverse_pairing(&serial) {
+                warn!("ADB: pairing tunnel cleanup for {serial}: {e}");
+            }
+        }
+    }
+}
+
 async fn probe_device(local_port: u16) -> Option<HandshakeResponse> {
     let endpoint = http_endpoint("127.0.0.1", local_port);
     let mut client = WorkerRpcClient::connect(&endpoint).await.ok()?;
@@ -366,6 +428,54 @@ mod tests {
     #[test]
     fn forward_port_matches_worker_rpc_port() {
         assert_eq!(ADB_FORWARD_PORT, 50052);
+    }
+
+    use crate::security::{PairingManager, PAIRING_TTL};
+    use std::time::Duration;
+
+    #[test]
+    fn tracked_tunnel_lives_until_its_session_ends() {
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (pin, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+
+        registry.track("R3CN30ABCDE", &pin);
+        assert!(registry.purge_inactive(&pairing).is_empty());
+        assert!(registry.is_tracked("R3CN30ABCDE"));
+
+        pairing.redeem(&pin).expect("redeem");
+        assert_eq!(registry.purge_inactive(&pairing), vec!["R3CN30ABCDE"]);
+        assert!(!registry.is_tracked("R3CN30ABCDE"));
+        // A second purge must not hand the same serial out again.
+        assert!(registry.purge_inactive(&pairing).is_empty());
+    }
+
+    #[test]
+    fn expired_session_purges_its_tunnel() {
+        let pairing = PairingManager::new(Duration::ZERO);
+        let (pin, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+
+        registry.track("emulator-5554", &pin);
+        assert_eq!(registry.purge_inactive(&pairing), vec!["emulator-5554"]);
+    }
+
+    #[test]
+    fn retracked_serial_follows_its_newest_session() {
+        // A second "create session" on the same device must not let the old
+        // session's teardown drop the new session's tunnel.
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (old_pin, _, _) = pairing.create_session("fp");
+        let (new_pin, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+        registry.track("R3CN30ABCDE", &old_pin);
+        registry.track("R3CN30ABCDE", &new_pin);
+
+        pairing.redeem(&old_pin).expect("old redeem");
+        assert!(registry.purge_inactive(&pairing).is_empty());
+
+        pairing.redeem(&new_pin).expect("new redeem");
+        assert_eq!(registry.purge_inactive(&pairing), vec!["R3CN30ABCDE"]);
     }
 
     #[test]

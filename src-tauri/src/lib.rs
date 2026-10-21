@@ -1,3 +1,4 @@
+use ai_upcycler_core::api::pairing::PairingSessionResponse;
 use ai_upcycler_core::api::{self, AppState};
 use ai_upcycler_core::discovery::mdns::NodeRegistry;
 use ai_upcycler_core::rpc::engine::{ExecutionResult, RpcPipelineEngine, TensorPayload};
@@ -39,6 +40,39 @@ async fn dispatch_rpc_step(
     payload: TensorPayload,
 ) -> Result<ExecutionResult, String> {
     RpcPipelineEngine::dispatch_forward_step(&assignment, payload).await
+}
+
+/// Prepares one device for pairing (spec 2026-10-20, D-B8): mints a
+/// single-use session from the shell's shared pairing state, bridges the
+/// pairing-only listener to the device with `adb reverse`, tracks the tunnel
+/// against that session so the cleanup task can retire it, and returns what
+/// the dashboard panel renders — `{pin, qr_payload, fingerprint}`.
+///
+/// The command is async and pushes the `adb` subprocess onto a blocking
+/// thread: Tauri runs synchronous commands on the main thread, and `adb`
+/// blocks while its server starts.
+#[tauri::command]
+async fn prepare_pairing(
+    serial: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<PairingSessionResponse, String> {
+    let fingerprint = state.security.ca.fingerprint().to_string();
+    let (pin, qr_payload, expires_in_secs) = state.security.pairing.create_session(&fingerprint);
+
+    let device = serial.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        ai_upcycler_core::adb::AdbTunnelManager::new().reverse_pairing(&device)
+    })
+    .await
+    .map_err(|e| format!("adb tunnel task failed: {e}"))??;
+
+    state.pairing_tunnels.track(&serial, &pin);
+    Ok(PairingSessionResponse {
+        pin,
+        qr_payload,
+        expires_in_secs,
+        fingerprint,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -86,6 +120,10 @@ pub fn run() {
                 data_dir.join("models"),
             );
 
+            // `prepare_pairing` resolves this shared state; its Arcs are the
+            // same instances the API listeners below serve from.
+            app.manage(state.clone());
+
             let state_for_api = state.clone();
             tauri::async_runtime::spawn(async move {
                 let addr = SocketAddr::from(([127, 0, 0, 1], API_PORT));
@@ -93,6 +131,14 @@ pub fn run() {
                     error!("local API server stopped: {e}");
                 }
             });
+
+            // Pairing tunnels die with their session (spec 2026-10-20, D-B8):
+            // a poll retires the `adb reverse` tunnel once its session has
+            // been redeemed or has expired.
+            tauri::async_runtime::spawn(ai_upcycler_core::adb::pairing_tunnel_cleanup(
+                state.security.clone(),
+                state.pairing_tunnels.clone(),
+            ));
 
             // Pairing-only listener (spec 2026-10-20, D-B2): one enroll route
             // on loopback, reached by a phone through `adb reverse` — never
@@ -110,7 +156,8 @@ pub fn run() {
             get_cluster_status,
             get_discovered_nodes,
             compute_layer_plan,
-            dispatch_rpc_step
+            dispatch_rpc_step,
+            prepare_pairing
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

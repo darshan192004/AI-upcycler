@@ -277,6 +277,17 @@ impl PairingManager {
             }
         }
     }
+
+    /// Whether `pin` still names an unredeemed, unexpired session — the
+    /// condition for keeping the pairing reverse tunnel that session backs
+    /// alive (spec 2026-10-20, D-B8: tunnels are removed when the session
+    /// completes or expires).
+    pub fn session_usable(&self, pin: &str) -> bool {
+        let sessions = self.sessions.lock().expect("pairing lock");
+        sessions
+            .get(pin)
+            .is_some_and(|s| !s.used && s.expires_at > Instant::now())
+    }
 }
 
 /// Workers that completed pairing, keyed by the `node_id` the master dials them
@@ -464,6 +475,27 @@ mod tests {
         let (pin, _, _) = pairing.create_session("fp");
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(pairing.redeem(&pin), Err(PairingError::Expired));
+    }
+
+    #[test]
+    fn session_is_usable_until_it_is_redeemed() {
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (pin, _, _) = pairing.create_session("fp");
+        assert!(pairing.session_usable(&pin));
+        pairing.redeem(&pin).expect("redeem");
+        assert!(!pairing.session_usable(&pin));
+    }
+
+    #[test]
+    fn expired_and_unknown_sessions_are_not_usable() {
+        // Zero TTL: the session is already past `expires_at` on the next
+        // clock read, so this pins expiry without a sleep.
+        let expired = PairingManager::new(Duration::ZERO);
+        let (pin, _, _) = expired.create_session("fp");
+        assert!(!expired.session_usable(&pin));
+
+        let pairing = PairingManager::new(PAIRING_TTL);
+        assert!(!pairing.session_usable("000000"));
     }
 
     #[test]
