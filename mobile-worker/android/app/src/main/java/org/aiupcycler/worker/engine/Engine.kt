@@ -238,6 +238,7 @@ class WorkerEngine private constructor(
         activation: FloatArray,
         sequencePosition: Int,
         timingUs: Long,
+        lastLogitsOnly: Boolean,
     ): EngineOutcome {
         val rng = loaded
             ?: return forwardRefuse("no layers loaded")
@@ -346,10 +347,15 @@ class WorkerEngine private constructor(
 
         // ---- head stage (last block of the model) ---------------------------
         val isHead = rng.end == hparams.blockCount - 1
+        // Prefill only needs the last row's next-token distribution. Asking for
+        // it explicitly keeps the head matmul and the wire payload to one row
+        // (spec 2026-10-21-last-row-logits, L2); every layer above still ran
+        // for every token, so the KV cache is unaffected.
+        val firstRow = if (isHead && lastLogitsOnly) nTokens - 1 else 0
         return if (isHead) {
             val norm = rng.tensors["output_norm.weight"]
                 ?: return forwardRefuse("head stage requires output_norm.weight")
-            for (t in 0 until nTokens) {
+            for (t in firstRow until nTokens) {
                 rmsNorm(x, t * hidden, hidden, norm, hparams.rmsEps)
             }
             val headPart = when {
@@ -359,12 +365,14 @@ class WorkerEngine private constructor(
             }
             val head = rng.tensors[headPart]!!
             val nVocab = head.size / hidden
-            val logits = FloatArray(nTokens * nVocab)
-            for (t in 0 until nTokens) {
-                lmHead(x, t * hidden, head, hidden, logits, t * nVocab, nVocab)
+            val rows = nTokens - firstRow
+            val logits = FloatArray(rows * nVocab)
+            for (row in 0 until rows) {
+                val t = firstRow + row
+                lmHead(x, t * hidden, head, hidden, logits, row * nVocab, nVocab)
             }
             ForwardResult(
-                shapeOut = longArrayOf(nTokens.toLong(), nVocab.toLong()),
+                shapeOut = longArrayOf(rows.toLong(), nVocab.toLong()),
                 out = logits,
                 isHead = true,
             )

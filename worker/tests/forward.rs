@@ -8,7 +8,7 @@ use ai_upcycler_worker::engine::WorkerEngine;
 use ai_upcycler_worker::proto::aiupcycler::rpc::tensor_buffer::DataType;
 use ai_upcycler_worker::proto::aiupcycler::rpc::{
     worker_service_client::WorkerServiceClient, ExecuteForwardRequest, ExecuteForwardResponse,
-    LoadLayersRequest, TensorBuffer,
+    HandshakeRequest, LoadLayersRequest, TensorBuffer,
 };
 
 type Client = WorkerServiceClient<tonic::transport::Channel>;
@@ -47,6 +47,20 @@ async fn forward(
     tb: TensorBuffer,
     seq_pos: i32,
 ) -> ExecuteForwardResponse {
+    forward_with_last_row(client, sid, start, end, tb, seq_pos, false).await
+}
+
+/// Same as [`forward`], but lets the caller ask the head for the last logits
+/// row only (spec 2026-10-21-last-row-logits, L2).
+async fn forward_with_last_row(
+    client: &mut Client,
+    sid: &str,
+    start: i32,
+    end: i32,
+    tb: TensorBuffer,
+    seq_pos: i32,
+    last_logits_only: bool,
+) -> ExecuteForwardResponse {
     client
         .execute_forward(ExecuteForwardRequest {
             session_id: sid.to_string(),
@@ -54,10 +68,19 @@ async fn forward(
             end_layer: end,
             activation_tensor: Some(tb),
             sequence_position: seq_pos,
+            last_logits_only,
         })
         .await
         .expect("rpc")
         .into_inner()
+}
+
+fn f32_values(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect()
 }
 
 /// Row-major F32 input buffer, little-endian (the engine's byte order).
@@ -583,4 +606,111 @@ async fn single_block_matches_f64_reference() {
 #[tokio::test]
 async fn qkv_bias_block_matches_f64_reference() {
     assert_single_block_matches_f64(true).await;
+}
+
+// ---- last-row-only logits (spec 2026-10-21-last-row-logits) ------------------
+
+#[tokio::test]
+async fn handshake_advertises_last_row_logits() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = common::write_tiny_model(dir.path(), common::TinyModelConfig::default());
+    let mut client = connect(&fx).await;
+    let response = client
+        .handshake(HandshakeRequest {
+            master_id: "master".into(),
+            protocol_version: "1".into(),
+            timestamp: 0,
+        })
+        .await
+        .expect("handshake")
+        .into_inner();
+    assert!(
+        response.supports_last_row_logits,
+        "the Rust worker honours last_logits_only, so it must advertise it"
+    );
+}
+
+#[tokio::test]
+async fn last_row_only_matches_the_tail_of_whole_logits() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = common::write_tiny_model(
+        dir.path(),
+        common::TinyModelConfig {
+            n_layers: 1,
+            tied: true,
+            ..Default::default()
+        },
+    );
+    let mut client = connect(&fx).await;
+    load_ok(&mut client, &fx, 0, 0).await;
+
+    // Separate sessions: the KV cache would otherwise make the second request
+    // a decode step instead of the same prefill.
+    let whole = forward(&mut client, "whole", 0, 0, ids_buf(&[1, 2, 3]), 0).await;
+    let tail = forward_with_last_row(&mut client, "tail", 0, 0, ids_buf(&[1, 2, 3]), 0, true).await;
+    assert!(whole.success, "whole: {}", whole.execution_time_us);
+    assert!(tail.success, "tail: {}", tail.execution_time_us);
+
+    let whole = whole.output_activation_tensor.expect("whole output");
+    let tail = tail.output_activation_tensor.expect("tail output");
+    assert_eq!(whole.shape, vec![3, common::VOCAB as i64]);
+    assert_eq!(tail.shape, vec![1, common::VOCAB as i64]);
+    assert_eq!(tail.raw_data.len(), common::VOCAB * 4);
+
+    let whole_values = f32_values(&whole.raw_data);
+    let tail_values = f32_values(&tail.raw_data);
+    let expected = &whole_values[2 * common::VOCAB..];
+    assert_eq!(
+        tail_values, expected,
+        "the last-row contract must return exactly the row the whole contract would have returned"
+    );
+}
+
+#[tokio::test]
+async fn last_row_only_still_advances_the_kv_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = common::write_tiny_model(
+        dir.path(),
+        common::TinyModelConfig {
+            n_layers: 1,
+            tied: true,
+            ..Default::default()
+        },
+    );
+    let mut client = connect(&fx).await;
+    load_ok(&mut client, &fx, 0, 0).await;
+
+    let _ = forward(&mut client, "kv-whole", 0, 0, ids_buf(&[1, 2]), 0).await;
+    let _ = forward_with_last_row(&mut client, "kv-tail", 0, 0, ids_buf(&[1, 2]), 0, true).await;
+
+    // The next token must see the same KV state either way, so its logits row
+    // has to be identical.
+    let after_whole = forward(&mut client, "kv-whole", 0, 0, ids_buf(&[3]), 2).await;
+    let after_tail = forward(&mut client, "kv-tail", 0, 0, ids_buf(&[3]), 2).await;
+    assert!(after_whole.success && after_tail.success);
+    let left = f32_values(&after_whole.output_activation_tensor.expect("a").raw_data);
+    let right = f32_values(&after_tail.output_activation_tensor.expect("b").raw_data);
+    assert_eq!(
+        left, right,
+        "the flag may skip rows of output, never KV-cache work"
+    );
+}
+
+#[tokio::test]
+async fn a_non_head_stage_ignores_last_row_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = common::write_tiny_model(
+        dir.path(),
+        common::TinyModelConfig {
+            n_layers: 2,
+            ..Default::default()
+        },
+    );
+    let mut client = connect(&fx).await;
+    // 0..=0 is not the head of a two-block model.
+    load_ok(&mut client, &fx, 0, 0).await;
+    let resp = forward_with_last_row(&mut client, "mid", 0, 0, ids_buf(&[1, 2]), 0, true).await;
+    assert!(resp.success, "mid stage: {}", resp.execution_time_us);
+    let out = resp.output_activation_tensor.expect("output");
+    assert_eq!(out.shape, vec![2, common::HIDDEN as i64]);
 }

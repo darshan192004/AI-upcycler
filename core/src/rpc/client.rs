@@ -61,6 +61,7 @@ pub fn build_execute_request(
             raw_data: payload.data_bytes.clone(),
         }),
         sequence_position: payload.sequence_index as i32,
+        last_logits_only: false,
     }
 }
 

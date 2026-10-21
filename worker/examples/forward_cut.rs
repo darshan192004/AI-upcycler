@@ -250,6 +250,7 @@ fn main() {
                         end_layer: case.load.1,
                         activation_tensor: Some(f32_tb(&step.shape, &step.vals)),
                         sequence_position: step.pos,
+                        last_logits_only: false,
                     }))
                     .await
                     .expect("forward rpc")

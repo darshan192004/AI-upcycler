@@ -63,6 +63,7 @@ interface EngineSource {
         activation: FloatArray,
         sequencePosition: Int,
         timingUs: Long,
+        lastLogitsOnly: Boolean = false,
     ): EngineOutcome
 
     fun unloadLayers(modelId: String): EngineOutcome
@@ -107,6 +108,7 @@ class WorkerRpcService(
             .setFreeRamBytes(snapshot.freeRamBytes)
             .setCpuCores(Runtime.getRuntime().availableProcessors())
             .setHasNpuAcceleration(identity.hasNpuAcceleration)
+            .setSupportsLastRowLogits(true)
             .build()
         responseObserver.onNext(response)
         responseObserver.onCompleted()
@@ -197,6 +199,7 @@ class WorkerRpcService(
             activation = activation,
             sequencePosition = request.sequencePosition,
             timingUs = 0L,
+            lastLogitsOnly = request.lastLogitsOnly,
         )
         val elapsedUs = ((System.nanoTime() - t0) / 1_000).coerceAtLeast(1L)
         val response = when (outcome) {

@@ -511,6 +511,7 @@ mod tests {
             free_ram_bytes: 4_294_967_296,
             cpu_cores: 8,
             has_npu_acceleration: true,
+            supports_last_row_logits: false,
         };
 
         let node = node_from_handshake(&device("R3CN30ABCDE", "SM_G986B"), 50052, handshake);
@@ -533,6 +534,7 @@ mod tests {
             free_ram_bytes: 0,
             cpu_cores: 0,
             has_npu_acceleration: false,
+            supports_last_row_logits: false,
         };
 
         let node = node_from_handshake(&device("FA7B1XYZ", "Pixel_6a"), 50053, handshake);

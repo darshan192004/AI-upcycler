@@ -490,4 +490,50 @@ class WorkerRpcEngineTest {
             engine.close()
         }
     }
+    // ---- last-row-only logits (spec 2026-10-21-last-row-logits) -------------
+
+    @Test
+    fun lastRowOnlyReturnsExactlyTheLastPrefillRow() {
+        val engine = open(TIED_Q4)
+        assertTrue(engine.loadLayers(TIED_Q4, 0, 1) is LoadSuccess)
+        // Distinct sessions: a second forward on one session would be a decode
+        // step against an already-advanced KV cache, not the same prefill.
+        val whole = engine.execute(
+            "whole", 0, 1, longArrayOf(1, 3), ids(1f, 2f, 3f), 0, 0L,
+            lastLogitsOnly = false,
+        )
+        val tail = engine.execute(
+            "tail", 0, 1, longArrayOf(1, 3), ids(1f, 2f, 3f), 0, 0L,
+            lastLogitsOnly = true,
+        )
+        assertTrue("whole: $whole", whole is ForwardResult)
+        assertTrue("tail: $tail", tail is ForwardResult)
+        whole as ForwardResult
+        tail as ForwardResult
+
+        val vocab = 256 // tiny fixture RESERVED vocab, same as the Rust fixture
+        assertEquals(listOf(3L, vocab.toLong()), whole.shapeOut.toList())
+        assertEquals(listOf(1L, vocab.toLong()), tail.shapeOut.toList())
+        assertArrayEquals(
+            "last row must be the row the whole contract returns",
+            whole.out.copyOfRange(2 * vocab, 3 * vocab),
+            tail.out,
+            0.0f,
+        )
+        engine.close()
+    }
+
+    @Test
+    fun aNonHeadStageIgnoresLastRowOnly() {
+        val engine = open(UNTIED)
+        // 0..=1 is not the head of the four-block untied fixture.
+        assertTrue(engine.loadLayers(UNTIED, 0, 1) is LoadSuccess)
+        val fwd = engine.execute(
+            "mid", 0, 1, longArrayOf(1, 2), ids(1f, 2f), 0, 0L,
+            lastLogitsOnly = true,
+        )
+        assertTrue("mid: $fwd", fwd is ForwardResult)
+        assertEquals(listOf(2L, 64L), (fwd as ForwardResult).shapeOut.toList())
+        engine.close()
+    }
 }

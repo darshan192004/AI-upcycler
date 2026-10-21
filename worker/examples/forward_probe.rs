@@ -92,6 +92,7 @@ fn main() {
                     &ids.iter().map(|&i| i as f32).collect::<Vec<_>>(),
                 )),
                 sequence_position: 0,
+                last_logits_only: false,
             }))
             .await
             .unwrap();
