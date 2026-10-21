@@ -17,6 +17,7 @@ pub mod ws;
 
 pub use error::{ApiError, ApiResult};
 
+use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::NodeRegistry;
@@ -49,6 +50,9 @@ pub struct AppState {
     pub active_downloads: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Ephemeral CA + QR/PIN pairing state for mTLS worker enrollment.
     pub security: Arc<SecurityState>,
+    /// Devices holding a pairing reverse tunnel, keyed to the session that
+    /// tunnel exists for (spec 2026-10-20, D-B8 cleanup).
+    pub pairing_tunnels: Arc<PairingTunnelRegistry>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -93,6 +97,7 @@ impl AppState {
             models_dir: default_models_dir(),
             active_downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             security: Arc::new(SecurityState::default()),
+            pairing_tunnels: Arc::new(PairingTunnelRegistry::default()),
         }
     }
 

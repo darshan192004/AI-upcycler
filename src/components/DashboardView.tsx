@@ -6,6 +6,7 @@ import { NumberTicker } from './ui/NumberTicker';
 import { Sparkline } from './ui/Sparkline';
 import { StatusDot } from './ui/StatusDot';
 import { NodeCard } from './NodeCard';
+import { PairingPanel } from './PairingPanel';
 
 const container = {
   hidden: {},
@@ -209,6 +210,10 @@ export function DashboardView() {
             pool its memory.
           </p>
         )}
+      </motion.div>
+
+      <motion.div variants={item}>
+        <PairingPanel />
       </motion.div>
     </motion.div>
   );
