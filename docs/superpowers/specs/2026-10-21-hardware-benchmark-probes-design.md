@@ -1,6 +1,7 @@
 # Hardware Benchmark Probes — Design (2026-10-21)
 
-> **Status:** spec.
+> **Status:** IMPLEMENTED (2026-10-21) — slices #81 and this PR; real phone
+> *values* remain hardware-gated (tasks.md §6 checklist).
 > **Tracks:** `docs/plan.md` §5.1 "On-device benchmark probes (replace `StubBenchmarker`)";
 > `docs/tasks.md` §7 "`POST /api/cluster/benchmark` uses a deterministic `StubBenchmarker`".
 > **Epic edge:** everything in this epic is implementable and verifiable device-free;
@@ -135,9 +136,15 @@ it explicitly — decided in the implementation slice, not here.
 
 `WorkerRpcService` (`mobile-worker/android/.../rpc/WorkerRpcService.kt`) implements
 `benchmark()` with the same buffer size, pass count, and FMA shape as D-C2 — pure
-Kotlin, no JNI, unit-testable on the JVM. Device-free tests assert only positivity and
-plausibility bounds (bandwidth > 0, flops > 0, duration reported); the *values* stay
-hardware-gated, appended to the D-B10-style on-device checklist rather than asserted in CI.
+Kotlin, no JNI, unit-testable on the JVM. The fused multiply-add is `Math.fma`
+(API 24; `minSdk` is 26), the same single-rounding operation as the Rust twin's
+`f32::mul_add`, not a two-rounding `a * b + c`. Because the 32 MiB buffer is the
+probe's only allocation, an `OutOfMemoryError` becomes a `RESOURCE_EXHAUSTED` RPC
+error (D-C6 counts the node as failed) instead of escaping the callback and taking
+the worker down. Device-free tests assert only positivity and plausibility bounds
+(bandwidth > 0, flops > 0, duration reported, allocation failure mapped to that
+status); the *values* stay hardware-gated, appended to the D-B10-style on-device
+checklist rather than asserted in CI.
 
 ### D-C10 — Epic edge
 

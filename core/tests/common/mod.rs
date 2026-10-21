@@ -185,6 +185,7 @@ impl WorkerService for MockWorker {
         &self,
         _request: tonic::Request<BenchmarkRequest>,
     ) -> Result<tonic::Response<BenchmarkResponse>, tonic::Status> {
+        self.record(format!("benchmark:{}", self.node_id));
         if !self.serve_benchmark {
             return Err(tonic::Status::unimplemented(
                 "benchmark probe is not supported by this worker",
