@@ -180,6 +180,14 @@ export function DashboardView() {
                 mDNS unavailable
               </span>
             )}
+            {topology?.thermal_relaxed && (
+              <span
+                className="flex items-center gap-1.5 rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-300"
+                title="The cluster was too hot for any worker to rest, so the thermal cap had to be relaxed to place the model."
+              >
+                too hot to rest
+              </span>
+            )}
           </div>
           <span className="text-xs text-slate-500">
             {workerNodes.length} worker{workerNodes.length === 1 ? '' : 's'} connected
@@ -194,6 +202,7 @@ export function DashboardView() {
                 node={node}
                 index={index}
                 health={workerHealth[node.node_id]}
+                thermal={topology.thermal?.find((t) => t.node_id === node.node_id)}
               />
             ))}
           </div>
