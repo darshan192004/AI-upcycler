@@ -572,6 +572,9 @@ pub struct AdaptiveBackend {
     security: Arc<crate::security::SecurityState>,
     transports: Arc<dyn WorkerTransportSource>,
     fallback: Arc<dyn GenerationBackend>,
+    /// The freshest worker health, so a hot worker can be given a smaller
+    /// share of the model (spec 2026-10-22, D-F1).
+    thermal: Arc<crate::worker_health::TelemetryCache>,
     /// model id -> built backend (tokenizer + cached driver), one per model.
     /// Shared through every per-request clone so the cache accumulates.
     cluster: Arc<AsyncMutex<HashMap<String, Arc<DistributedBackend>>>>,
@@ -584,6 +587,7 @@ impl AdaptiveBackend {
         store: Arc<Store>,
         security: Arc<crate::security::SecurityState>,
         fallback: Arc<dyn GenerationBackend>,
+        thermal: Arc<crate::worker_health::TelemetryCache>,
     ) -> Self {
         let transports = Arc::new(crate::security::EnrolledWorkerSource::new(security.clone()));
         Self {
@@ -592,8 +596,16 @@ impl AdaptiveBackend {
             security,
             transports,
             fallback,
+            thermal,
             cluster: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// The last measured temperature of every worker, for the planner
+    /// (spec 2026-10-22, D-F1). A worker that has never answered contributes
+    /// nothing: unknown is never hot.
+    fn thermal_hints(&self) -> crate::scheduler::planner::ThermalHints {
+        crate::scheduler::planner::ThermalHints::from_temperatures(self.thermal.temperatures())
     }
 
     /// Overrides transport resolution: tests dial loopback worker processes
@@ -644,7 +656,7 @@ impl AdaptiveBackend {
                 .cmp(&b.free_ram_bytes)
                 .then_with(|| a.node_id.cmp(&b.node_id))
         });
-        let plan = LayerScheduler::compute_plan(&spec, &nodes);
+        let plan = LayerScheduler::compute_plan(&spec, &nodes, &self.thermal_hints());
         if plan.assignments.is_empty() {
             return None;
         }
@@ -698,6 +710,7 @@ impl GenerationBackend for AdaptiveBackend {
             security: self.security.clone(),
             transports: self.transports.clone(),
             fallback: self.fallback.clone(),
+            thermal: self.thermal.clone(),
             cluster: self.cluster.clone(),
         };
         Box::pin(async_stream::stream! {

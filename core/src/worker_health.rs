@@ -77,6 +77,18 @@ impl TelemetryCache {
         workers
     }
 
+    /// The last measured temperature of every worker that reported one, in
+    /// celsius (spec 2026-10-22, D-F1). A worker that cannot measure its
+    /// temperature contributes nothing: unknown is never hot.
+    pub fn temperatures(&self) -> HashMap<String, f64> {
+        self.workers
+            .lock()
+            .expect("telemetry cache lock")
+            .iter()
+            .filter_map(|(id, health)| health.temp_celsius.map(|celsius| (id.clone(), celsius)))
+            .collect()
+    }
+
     /// Records the master's own RAM utilization (`None` when unreadable).
     pub fn record_master_ram(&self, utilization_pct: Option<f64>) {
         *self.master.lock().expect("telemetry cache lock") =
