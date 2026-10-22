@@ -714,3 +714,34 @@ async fn a_non_head_stage_ignores_last_row_only() {
     let out = resp.output_activation_tensor.expect("output");
     assert_eq!(out.shape, vec![2, common::HIDDEN as i64]);
 }
+
+/// The last-row index must never underflow (review finding on #83).
+///
+/// The engine's shape guard refuses a zero-token prefill — ids must be
+/// `[1, n]` with `n >= 1` — so the head stage always sees at least one token.
+/// This test pins that guard, so a future relaxation of the shape check
+/// cannot turn into an underflow.
+#[tokio::test]
+async fn an_empty_prefill_is_refused_before_the_head_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = common::write_tiny_model(
+        dir.path(),
+        common::TinyModelConfig {
+            n_layers: 1,
+            tied: true,
+            ..Default::default()
+        },
+    );
+    let mut client = connect(&fx).await;
+    load_ok(&mut client, &fx, 0, 0).await;
+
+    // Zero rows: there is no last row to return.
+    let empty = f32_buf(&[1, 0], &[]);
+    let resp = forward_with_last_row(&mut client, "empty", 0, 0, empty, 0, true).await;
+
+    assert!(
+        !resp.success,
+        "a zero-token prefill is not a valid request, and must not reach the head stage"
+    );
+    assert!(resp.output_activation_tensor.is_none());
+}

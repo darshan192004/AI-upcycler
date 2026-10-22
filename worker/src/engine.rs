@@ -479,7 +479,11 @@ impl WorkerService for WorkerEngine {
         // (spec 2026-10-21-last-row-logits, L2); every layer above still ran
         // for every token, so the KV cache is unaffected.
         let first_row = if is_head && req.last_logits_only {
-            n_tokens - 1
+            // Saturating: the shape guard above already refuses a zero-token
+            // request (`[1, 0]` ids), so n_tokens is at least 1 here — but the
+            // head stage should not depend on a validation further up the
+            // function to avoid an underflow (review finding on #83).
+            n_tokens.saturating_sub(1)
         } else {
             0
         };
