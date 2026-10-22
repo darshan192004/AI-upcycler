@@ -84,6 +84,10 @@ class WorkerMtlsServerTest {
         )
         assertEquals("test-worker-id", handshake.workerId)
         assertEquals("Pixel 8", handshake.deviceName)
+        assertTrue(
+            "the Kotlin worker honours last_logits_only, so it must advertise it",
+            handshake.supportsLastRowLogits,
+        )
 
         val health = stub.getHealthStatus(aiupcycler.rpc.ClusterRpc.HealthRequest.getDefaultInstance())
         assertEquals(73f, health.batteryPercentage, 0.001f)

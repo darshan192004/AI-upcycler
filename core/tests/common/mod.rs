@@ -113,6 +113,7 @@ impl WorkerService for MockWorker {
             free_ram_bytes: 1 << 29,
             cpu_cores: 4,
             has_npu_acceleration: false,
+            supports_last_row_logits: false,
         }))
     }
 

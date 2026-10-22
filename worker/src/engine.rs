@@ -166,6 +166,7 @@ impl WorkerService for WorkerEngine {
                 .map(|n| n.get() as i32)
                 .unwrap_or(1),
             has_npu_acceleration: false,
+            supports_last_row_logits: true,
         }))
     }
 
@@ -473,35 +474,52 @@ impl WorkerService for WorkerEngine {
 
         // ---- head stage (last block of the model) ---------------------------
         let is_head = loaded.end == hprops.block_count - 1;
-        let (out, out_len) = if is_head {
+        // Prefill only needs the last row's next-token distribution. Asking for
+        // it explicitly keeps the head matmul and the wire payload to one row
+        // (spec 2026-10-21-last-row-logits, L2); every layer above still ran
+        // for every token, so the KV cache is unaffected.
+        let first_row = if is_head && req.last_logits_only {
+            // Saturating: the shape guard above already refuses a zero-token
+            // request (`[1, 0]` ids), so n_tokens is at least 1 here — but the
+            // head stage should not depend on a validation further up the
+            // function to avoid an underflow (review finding on #83).
+            n_tokens.saturating_sub(1)
+        } else {
+            0
+        };
+        let (out, out_len, out_rows) = if is_head {
             {
                 let Some(norm) = loaded.tensors.get("output_norm.weight") else {
                     return refuse("head stage requires output_norm.weight".to_string());
                 };
-                for t in 0..n_tokens {
+                for t in first_row..n_tokens {
                     rms_norm(&mut x[t * hidden..(t + 1) * hidden], norm, hprops.rms_eps);
                 }
+                let head_part = if loaded.tensors.contains_key("output.weight") {
+                    "output.weight"
+                } else if loaded.tensors.contains_key("token_embd.weight") {
+                    "token_embd.weight" // tied model: the embedding is the head
+                } else {
+                    return refuse(
+                        "head stage loaded, but no output embedding/head found".to_string(),
+                    );
+                };
+                let n_vocab = loaded.tensors[head_part].len() / hidden;
+                let rows = n_tokens - first_row;
+                let mut logits = vec![0.0f32; rows * n_vocab];
+                for (row, logits_row) in logits.chunks_exact_mut(n_vocab).enumerate() {
+                    let t = first_row + row;
+                    lm_head(
+                        &x[t * hidden..(t + 1) * hidden],
+                        &loaded.tensors[head_part],
+                        hidden,
+                        logits_row,
+                    );
+                }
+                (logits, n_vocab, rows)
             }
-            let head_part = if loaded.tensors.contains_key("output.weight") {
-                "output.weight"
-            } else if loaded.tensors.contains_key("token_embd.weight") {
-                "token_embd.weight" // tied model: the embedding is the head
-            } else {
-                return refuse("head stage loaded, but no output embedding/head found".to_string());
-            };
-            let n_vocab = loaded.tensors[head_part].len() / hidden;
-            let mut logits = vec![0.0f32; n_tokens * n_vocab];
-            for (t, logits_row) in logits.chunks_exact_mut(n_vocab).enumerate() {
-                lm_head(
-                    &x[t * hidden..(t + 1) * hidden],
-                    &loaded.tensors[head_part],
-                    hidden,
-                    logits_row,
-                );
-            }
-            (logits, n_vocab)
         } else {
-            (x, hidden)
+            (x, hidden, n_tokens)
         };
 
         let us = t0.elapsed().as_micros().max(1) as i64;
@@ -509,7 +527,7 @@ impl WorkerService for WorkerEngine {
         Ok(Response::new(ExecuteForwardResponse {
             success: true,
             output_activation_tensor: Some(TensorBuffer {
-                shape: vec![n_tokens as i64, out_len as i64],
+                shape: vec![out_rows as i64, out_len as i64],
                 data_type: DataType::Fp32 as i32,
                 raw_data: out.iter().flat_map(|v| v.to_le_bytes()).collect(),
             }),

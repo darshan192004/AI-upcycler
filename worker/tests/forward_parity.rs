@@ -255,6 +255,7 @@ async fn committed_vectors_replay_within_tolerance() {
                         raw_data: step.input.iter().flat_map(|v| v.to_le_bytes()).collect(),
                     }),
                     sequence_position: step.pos,
+                    last_logits_only: false,
                 }))
                 .await
                 .expect("forward rpc")

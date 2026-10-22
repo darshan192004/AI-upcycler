@@ -275,6 +275,7 @@ async fn next_token_matches_llama_server() {
                 raw_data: ids.iter().flat_map(|&i| (i as f32).to_le_bytes()).collect(),
             }),
             sequence_position: 0,
+            last_logits_only: false,
         }))
         .await
         .expect("rpc")

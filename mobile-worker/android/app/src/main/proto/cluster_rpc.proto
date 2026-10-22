@@ -24,6 +24,8 @@ message HandshakeResponse {
   int64 free_ram_bytes = 4;
   int32 cpu_cores = 5;
   bool has_npu_acceleration = 6;
+  // This worker honours ExecuteForwardRequest.last_logits_only.
+  bool supports_last_row_logits = 7;
 }
 
 message LoadLayersRequest {
@@ -66,6 +68,11 @@ message ExecuteForwardRequest {
   int32 end_layer = 3;
   TensorBuffer activation_tensor = 4;
   int32 sequence_position = 5;
+  // Return logits for the last input row only: the head stage answers with
+  // shape [1, n_vocab] instead of [n, n_vocab]. A stage that is not the head
+  // ignores it, and a worker without HandshakeResponse.supports_last_row_logits
+  // ignores it too (proto3 unknown field), falling back to whole logits.
+  bool last_logits_only = 6;
 }
 
 message ExecuteForwardResponse {
