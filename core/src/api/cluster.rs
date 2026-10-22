@@ -478,11 +478,19 @@ mod tests {
             })
             .unwrap();
         let state = state(registry, store);
+        state.security.enrollments.enroll("w1", "w1", vec![]);
 
         let topology = topology_of(state).await;
 
         assert_eq!(topology.status, "active");
         assert_eq!(topology.active_model.as_deref(), Some("llama-8b"));
+        // The master coordinates; the paired worker holds every layer.
+        let master = topology
+            .nodes
+            .iter()
+            .find(|n| n.role == "master")
+            .expect("master listed");
+        assert!(master.assigned_layers.is_empty());
         let assigned: usize = topology
             .nodes
             .iter()
