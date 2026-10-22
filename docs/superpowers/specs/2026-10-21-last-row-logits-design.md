@@ -1,7 +1,7 @@
 # Last-row-only logits wire contract - design
 
 **Date:** 2026-10-21
-**Status:** IMPLEMENTED (2026-10-22) - slice 1/2 #83 (`b92f8c0`), slice 2/2 #84
+**Status:** IMPLEMENTED (2026-10-22) - slice 1/2 #83 (`b92f8c0`), slice 2/2 #94
 **Supersedes (narrowly):** `2026-10-18-live-chat-path-design.md` D6, only for the
 prefill-logits response contract. Everything else in D6 stands.
 **Follows:** `2026-10-21-hardware-benchmark-probes-design.md` (same additive-proto
@@ -155,7 +155,7 @@ advertises the capability, Kotlin worker does the same, vendored proto resynced,
 worker + JVM tests. The master did not send the flag yet, so the chat path was
 unchanged apart from a new handshake bit.
 
-**Slice 2/2 - master uses the contract.** #84: `PipelineStage` capability,
+**Slice 2/2 - master uses the contract.** #94: `PipelineStage` capability,
 final-stage flag, conditional prompt guard, capability-aware tests, and docs:
 `tasks.md` bound rewritten, chat-path spec D6 annotated as superseded for this
 one point, this spec marked IMPLEMENTED.
