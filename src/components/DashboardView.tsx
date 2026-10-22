@@ -1,6 +1,8 @@
+import { useMemo } from 'react';
 import { motion } from 'motion/react';
 import { Activity, Cpu, HardDrive, Zap } from 'lucide-react';
 import { useClusterStore } from '../store/cluster';
+import type { TopologyThermal } from '../lib/types';
 import { GlowCard } from './ui/GlowCard';
 import { NumberTicker } from './ui/NumberTicker';
 import { Sparkline } from './ui/Sparkline';
@@ -31,6 +33,15 @@ export function DashboardView() {
   const masterRamPct = useClusterStore((s) => s.masterRamUtilizationPct);
 
   const workerNodes = topology?.nodes.filter((n) => n.role !== 'master') ?? [];
+  // One lookup per node, built once: scanning the thermal list inside the
+  // render loop would be quadratic in the cluster size.
+  const thermalByNode = useMemo(() => {
+    const byNode = new Map<string, TopologyThermal>();
+    for (const entry of topology?.thermal ?? []) {
+      byNode.set(entry.node_id, entry);
+    }
+    return byNode;
+  }, [topology?.thermal]);
   const totalGb = topology ? topology.total_pooled_ram_mb / 1024 : 0;
   const usedGb = topology ? topology.used_pooled_ram_mb / 1024 : 0;
   const tokS = latestMetrics?.tokens_per_second ?? 0;
@@ -180,6 +191,14 @@ export function DashboardView() {
                 mDNS unavailable
               </span>
             )}
+            {topology?.thermal_relaxed && (
+              <span
+                className="flex items-center gap-1.5 rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-300"
+                title="The cluster was too hot for any worker to rest, so the thermal cap had to be relaxed to place the model."
+              >
+                too hot to rest
+              </span>
+            )}
           </div>
           <span className="text-xs text-slate-500">
             {workerNodes.length} worker{workerNodes.length === 1 ? '' : 's'} connected
@@ -194,6 +213,7 @@ export function DashboardView() {
                 node={node}
                 index={index}
                 health={workerHealth[node.node_id]}
+                thermal={thermalByNode.get(node.node_id)}
               />
             ))}
           </div>

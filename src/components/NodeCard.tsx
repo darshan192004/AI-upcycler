@@ -2,7 +2,7 @@ import { motion } from 'motion/react';
 import { Battery, Thermometer } from 'lucide-react';
 import { ProgressBar } from './ui/ProgressBar';
 import { StatusDot } from './ui/StatusDot';
-import type { TopologyNode, WorkerHealth } from '../lib/types';
+import type { TopologyNode, TopologyThermal, WorkerHealth } from '../lib/types';
 
 /**
  * A snapshot older than this is shown dimmed: the value was really measured,
@@ -29,9 +29,11 @@ interface NodeCardProps {
   index: number;
   /** The worker's latest measured health, when the master has one. */
   health?: WorkerHealth;
+  /** The thermal state the layer plan was computed against. */
+  thermal?: TopologyThermal;
 }
 
-export function NodeCard({ node, index, health }: NodeCardProps) {
+export function NodeCard({ node, index, health, thermal }: NodeCardProps) {
   const ramRatio = node.ram_total_mb > 0 ? node.ram_assigned_mb / node.ram_total_mb : 0;
   const isMaster = node.role === 'master';
   const stale =
@@ -131,6 +133,16 @@ export function NodeCard({ node, index, health }: NodeCardProps) {
           {stale && (
             <span className="text-[10px] uppercase tracking-wider text-slate-600">stale</span>
           )}
+        </div>
+      )}
+
+      {thermal?.capped && (
+        <div className="mt-2 flex items-center gap-1.5 text-[11px] text-amber-300">
+          <Thermometer className="h-3 w-3" aria-hidden="true" />
+          <span>
+            resting — {thermal.temp_celsius.toFixed(1)} °C, so it takes a smaller share of the
+            model
+          </span>
         </div>
       )}
 

@@ -8,6 +8,18 @@ export interface DiscoveryStatus {
   mdns: 'active' | 'unavailable';
 }
 
+/**
+ * The thermal state one node was planned against.
+ *
+ * `capped: true` means the node's share of the model was limited because it
+ * is hot — it is resting while the cooler workers carry the load.
+ */
+export interface TopologyThermal {
+  node_id: string;
+  temp_celsius: number;
+  capped: boolean;
+}
+
 export interface TopologyNode {
   node_id: string;
   role: string;
@@ -28,6 +40,10 @@ export interface Topology {
   nodes: TopologyNode[];
   storage_mmap: StorageMmap;
   discovery?: DiscoveryStatus;
+  /** One entry per worker with a measured temperature. */
+  thermal?: TopologyThermal[];
+  /** True when the cluster was hot enough that resting was not an option. */
+  thermal_relaxed?: boolean;
 }
 
 export interface ModelMeta {
