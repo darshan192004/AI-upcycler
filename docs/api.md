@@ -100,8 +100,8 @@ data: [DONE]
       "device_name": "Dell XPS 13 (8GB RAM)",
       "connection": "native",
       "ram_total_mb": 8192,
-      "ram_assigned_mb": 4096,
-      "assigned_layers": [0, 16],
+      "ram_assigned_mb": 0,
+      "assigned_layers": [],
       "ping_ms": 0.0
     },
     {
@@ -111,7 +111,7 @@ data: [DONE]
       "connection": "usb_adb",
       "ram_total_mb": 4096,
       "ram_assigned_mb": 3200,
-      "assigned_layers": [17, 32],
+      "assigned_layers": [0, 24],
       "ping_ms": 1.2
     },
     {
@@ -121,7 +121,7 @@ data: [DONE]
       "connection": "wifi_5g",
       "ram_total_mb": 4096,
       "ram_assigned_mb": 3200,
-      "assigned_layers": [33, 48],
+      "assigned_layers": [25, 48],
       "ping_ms": 8.4
     }
   ],
@@ -150,13 +150,25 @@ data: [DONE]
 ```
 `discovery.mdns` is `"active"` when the mDNS browser daemon is running and `"unavailable"` when it failed to start (Wi-Fi discovery offline; USB/ADB workers unaffected).
 
+`assigned_layers` is the plan a real cluster request would use, not a
+hypothetical one: only **paired** workers receive layers, in the scheduler's
+order (least free RAM first, node id as the tie-break). The master is a
+coordinator — it tokenizes and samples, so it lists its real capacity but
+`assigned_layers` is always empty. A discovered-but-unpaired phone is listed
+with its capacity too, but it cannot be dialed, so it also holds no layers; a
+cluster with nothing paired reports no split at all and the host serves the
+model locally. `active_model` names the model in the library that is being
+served (locally or split), so it is set even when the plan is empty.
+
 `thermal` reports the state the layer plan was computed against: one entry per
-worker with a measured CPU temperature, and `capped: true` when that worker's
+worker **in the plan** with a measured CPU temperature, and `capped: true` when
+that worker's
 share of the model was limited because it is hot (at or above 40 °C) — it is
 resting while the cooler workers carry the load. `thermal_relaxed` is `true`
 when the cluster was hot enough that resting was not an option and the cap had
 to be relaxed to place the model. A worker with no measurement is absent from
-`thermal`; the master is never listed (it is not a polled worker).
+`thermal`; an unpaired worker is never listed (it is not in the plan), and
+neither is the master (it is not a polled worker).
 
 ### 3.2 Trigger Hardware Re-Benchmarking
 - **Endpoint**: `POST /api/cluster/benchmark`

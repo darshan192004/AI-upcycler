@@ -12,7 +12,7 @@ use crate::api::{ApiResult, AppState, HostInfo};
 use crate::discovery::mdns::DiscoveredNode;
 use crate::rpc::client::WorkerRpcClient;
 use crate::rpc::engine::WorkerTransportSource;
-use crate::scheduler::planner::{order_plan_nodes, LayerScheduler, ModelSpec, ThermalHints};
+use crate::scheduler::planner::{LayerScheduler, ModelSpec, ThermalHints};
 use crate::store::{NewBenchmark, NewNode};
 
 /// How the master sees a node in the topology graph.
@@ -27,7 +27,9 @@ pub struct Topology {
     pub storage_mmap: StorageMmap,
     pub discovery: DiscoveryStatus,
     /// The thermal state the layer plan was computed against: one entry per
-    /// worker with a measured temperature (spec 2026-10-22, D-F4).
+    /// worker **in the plan** that has a measured temperature (spec 2026-10-22,
+    /// D-F4). A discovered-but-unpaired worker is not planned over, so it has
+    /// no entry here even though its temperature is still measured.
     pub thermal: Vec<TopologyThermal>,
     /// Whether the hot-worker cap had to be relaxed to place the model
     /// (spec D-F3): the cluster was hot enough that resting was not an option.
@@ -74,7 +76,13 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
     workers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
     let master = master_node(&state.host);
-    let plan_nodes = display_plan_nodes(master.clone(), &workers);
+    // The layer assignments must be the plan a real request would use, so they
+    // come from the same helper as the serving path: paired workers only, in
+    // scheduler order (spec 2026-10-22, D-F4). The master tokenizes and samples
+    // but holds no layers, and an unpaired phone cannot be dialed, so neither
+    // is planned over — they are still listed, with their real capacity.
+    let plan_nodes =
+        crate::api::distributed::serving_plan_nodes(&state.registry, &state.security.enrollments);
 
     let model = state.store.list_models()?.into_iter().next();
 
@@ -84,6 +92,11 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
     let mut thermal: Vec<TopologyThermal> = Vec::new();
     let mut thermal_relaxed = false;
     if let Some(model) = &model {
+        // The model's name is a fact about the library, not about the split: a
+        // host with nothing paired still serves this model locally, so the
+        // dashboard must not say "None loaded" merely because the cluster plan
+        // is empty.
+        active_model = Some(model.model_id.clone());
         if model.total_layers > 0 && model.weight_size_bytes > 0 {
             let spec = ModelSpec {
                 model_id: model.model_id.clone(),
@@ -115,11 +128,6 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
                 *ram_assigned.entry(assignment.node_id.clone()).or_default() +=
                     assignment.total_ram_used_bytes;
             }
-            if plan.total_layers_assigned > 0 {
-                active_model = Some(model.model_id.clone());
-            }
-        } else {
-            active_model = Some(model.model_id.clone());
         }
     }
 
@@ -338,18 +346,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The node list the topology display plans against: the master first (the host
-/// fallback holder), then the workers in the **same order the serving path
-/// uses** (`order_plan_nodes`), so a mixed cluster cannot show ranges nobody
-/// serves. The JSON node list keeps its own node-id order for a stable UI.
-fn display_plan_nodes(master: DiscoveredNode, workers: &[DiscoveredNode]) -> Vec<DiscoveredNode> {
-    let mut plan_nodes = Vec::with_capacity(workers.len() + 1);
-    plan_nodes.push(master);
-    plan_nodes.extend(workers.iter().cloned());
-    order_plan_nodes(&mut plan_nodes[1..]);
-    plan_nodes
-}
-
 fn master_node(host: &HostInfo) -> DiscoveredNode {
     let ram_bytes = host.total_ram_mb * 1024 * 1024;
     DiscoveredNode {
@@ -549,22 +545,5 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a.memory_bandwidth_mbs, c.memory_bandwidth_mbs);
         assert_eq!(a.network_ping_ms, 1.5);
-    }
-
-    /// The display and the serving path must hand layers out in the same node
-    /// order; otherwise a mixed cluster shows ranges nobody serves (tasks.md,
-    /// item 5). The master keeps the fallback slot, the workers follow RAM.
-    #[test]
-    fn the_displayed_plan_orders_workers_by_ram_like_serving() {
-        let plan_nodes = display_plan_nodes(
-            node("master", 32 << 30),
-            &[node("big", 8 << 30), node("small", 1 << 30)],
-        );
-        let ids: Vec<&str> = plan_nodes.iter().map(|n| n.node_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["master", "small", "big"],
-            "smallest free RAM first, then node id: the order fill_layers uses"
-        );
     }
 }
