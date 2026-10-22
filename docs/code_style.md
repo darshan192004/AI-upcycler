@@ -39,6 +39,7 @@
 ### 3.1 Rust (Master Orchestrator Core)
 
 - **Style Guide**: Follow official `rustfmt` formatting (`cargo fmt`).
+- **Toolchain**: pinned in `rust-toolchain.toml` — rustup installs it automatically for a checkout, and CI installs that exact version. Format and lint with it rather than whatever `stable` happens to be: a rustfmt change between releases is how #89 failed CI while passing locally.
 - **Linter**: Zero warnings policy on `cargo clippy --all-targets -- -D warnings`.
 - **Error Handling**: Use `thiserror` for library error definitions and `anyhow` for binary application entry points.
 
