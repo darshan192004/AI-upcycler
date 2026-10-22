@@ -53,12 +53,20 @@ pub struct AppState {
     /// Devices holding a pairing reverse tunnel, keyed to the session that
     /// tunnel exists for (spec 2026-10-20, D-B8 cleanup).
     pub pairing_tunnels: Arc<PairingTunnelRegistry>,
-    /// Optional override for how `POST /api/cluster/benchmark` dials each
-    /// node. `None` (production) derives enrollment-aware transports from
+    /// Optional override for how the master dials each node — the benchmark
+    /// probe and the health poller share it, so the "enrolled → mTLS, else
+    /// plaintext" rule cannot drift between them (spec 2026-10-22, D-E4).
+    /// `None` (production) derives enrollment-aware transports from
     /// `security` at call time, so a `with_security` swap can never leave the
-    /// benchmarker holding a stale CA. Tests set an explicit source for
-    /// loopback mock workers (spec 2026-10-21, D-C3).
-    pub benchmark_transports: Option<Arc<dyn crate::rpc::engine::WorkerTransportSource>>,
+    /// dials holding a stale CA. Tests set an explicit source for loopback
+    /// mock workers (spec 2026-10-21, D-C3).
+    pub worker_transports: Option<Arc<dyn crate::rpc::engine::WorkerTransportSource>>,
+    /// The freshest worker health and master RAM reading (spec 2026-10-22,
+    /// D-E2). Written by the poll loop, read by the chat path and the
+    /// dashboard.
+    pub telemetry_cache: Arc<crate::worker_health::TelemetryCache>,
+    /// How the master reads its own memory (spec 2026-10-22, D-E6).
+    pub host_memory: Arc<dyn crate::worker_health::HostMemorySource>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -105,17 +113,51 @@ impl AppState {
             active_downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             security,
             pairing_tunnels: Arc::new(PairingTunnelRegistry::default()),
-            benchmark_transports: None,
+            worker_transports: None,
+            telemetry_cache: Arc::new(crate::worker_health::TelemetryCache::new()),
+            host_memory: Arc::new(crate::worker_health::SysinfoHostMemory),
         }
     }
 
-    /// Overrides how nodes are dialed for benchmarking (tests inject a
-    /// plaintext loopback source; spec 2026-10-21, D-C3).
-    pub fn with_benchmark_transports(
+    /// The transport to use for each node: the test override when one is set,
+    /// otherwise the enrollment-aware rule (mTLS once paired, plaintext until
+    /// then — spec 2026-10-21, D-C3). Resolved at call time so a
+    /// `with_security` swap is always honoured.
+    pub fn transports(&self) -> Arc<dyn crate::rpc::engine::WorkerTransportSource> {
+        self.worker_transports.clone().unwrap_or_else(|| {
+            Arc::new(crate::security::EnrollmentAwareTransports::new(
+                self.security.clone(),
+            ))
+        })
+    }
+
+    /// Overrides how nodes are dialed (tests inject a plaintext loopback
+    /// source; spec 2026-10-21, D-C3 / spec 2026-10-22, D-E4).
+    pub fn with_worker_transports(
         mut self,
         transports: Arc<dyn crate::rpc::engine::WorkerTransportSource>,
     ) -> Self {
-        self.benchmark_transports = Some(transports);
+        self.worker_transports = Some(transports);
+        self
+    }
+
+    /// Overrides how the master reads its own memory (tests inject a fixed
+    /// reading; spec 2026-10-22, D-E6).
+    pub fn with_host_memory(
+        mut self,
+        host_memory: Arc<dyn crate::worker_health::HostMemorySource>,
+    ) -> Self {
+        self.host_memory = host_memory;
+        self
+    }
+
+    /// Overrides the telemetry cache the poll loop writes into (tests inject
+    /// their own so they can inspect it; spec 2026-10-22, D-E2).
+    pub fn with_telemetry_cache(
+        mut self,
+        cache: Arc<crate::worker_health::TelemetryCache>,
+    ) -> Self {
+        self.telemetry_cache = cache;
         self
     }
 
@@ -236,6 +278,14 @@ pub fn pairing_router(state: AppState) -> Router {
 pub async fn serve(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("AI Upcycler API listening on http://{addr}");
+
+    // Worker health polling (spec 2026-10-22, D-E1): one background task
+    // asks every discovered worker how it is doing, so the dashboard shows
+    // measured battery/temperature instead of placeholders. It lives here
+    // rather than in the desktop shell so every embedder of the core API gets
+    // live telemetry.
+    tokio::spawn(crate::worker_health::worker_health_poll(state.clone()));
+
     axum::serve(listener, router(state)).await
 }
 

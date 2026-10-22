@@ -22,6 +22,7 @@ use crate::store::{NewChatMessage, Store};
 use crate::telemetry::{
     now_epoch_secs, GenerationMetrics, TelemetryBus, TelemetryEvent, WorkerTelemetry,
 };
+use crate::worker_health::TelemetryCache;
 
 const ROLE_ASSISTANT: &str = "assistant";
 
@@ -144,6 +145,7 @@ async fn buffered_response(
     publish_metrics(
         &state.telemetry,
         &state.registry,
+        &state.telemetry_cache,
         completion_tokens,
         elapsed,
     );
@@ -187,6 +189,7 @@ fn stream_response(
     let store = state.store.clone();
     let telemetry = state.telemetry.clone();
     let registry = state.registry.clone();
+    let cache = state.telemetry_cache.clone();
 
     let stream = async_stream::stream! {
         let started = Instant::now();
@@ -200,7 +203,7 @@ fn stream_response(
                 Ok(chunk) => {
                     completion_tokens += u64::from(chunk.tokens_emitted);
                     content.push_str(&chunk.content);
-                    publish_metrics(&telemetry, &registry, completion_tokens, started.elapsed().as_secs_f64());
+                    publish_metrics(&telemetry, &registry, &cache, completion_tokens, started.elapsed().as_secs_f64());
                     yield Ok(sse_event(chunk_value(&id, &model, json!({ "content": chunk.content }), None)));
                 }
                 Err(error) => {
@@ -263,6 +266,7 @@ fn persist_assistant(
 fn publish_metrics(
     telemetry: &TelemetryBus,
     registry: &NodeRegistry,
+    cache: &TelemetryCache,
     current_token: u64,
     elapsed_secs: f64,
 ) {
@@ -271,19 +275,26 @@ fn publish_metrics(
     } else {
         0.0
     };
+    // Read the cache, never dial: this runs per streaming token, and the poll
+    // loop is the only thing that talks to the workers (spec 2026-10-22,
+    // D-E1). A worker that has never answered has no snapshot, which is
+    // "unknown" — not a zero.
     let worker_nodes = registry
         .list_nodes()
         .iter()
-        .map(|node| WorkerTelemetry {
-            id: node.node_id.clone(),
-            temp_celsius: 0.0,
-            battery_pct: 0.0,
+        .map(|node| {
+            let health = cache.worker(&node.node_id);
+            WorkerTelemetry {
+                id: node.node_id.clone(),
+                temp_celsius: health.as_ref().and_then(|h| h.temp_celsius),
+                battery_pct: health.as_ref().and_then(|h| h.battery_pct),
+            }
         })
         .collect();
     telemetry.publish(TelemetryEvent::generation_metrics(GenerationMetrics {
         tokens_per_second,
         current_token,
-        master_ram_utilization_pct: 0.0,
+        master_ram_utilization_pct: cache.master_ram().and_then(|(value, _)| value),
         worker_nodes,
     }));
 }
@@ -322,6 +333,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::mdns::DiscoveredNode;
     use crate::store::{NewModel, Store};
     use std::sync::Arc;
 
@@ -366,6 +378,90 @@ mod tests {
         assert_eq!(value["object"], "chat.completion.chunk");
         assert_eq!(value["choices"][0]["delta"]["content"], "hi");
         assert!(value["choices"][0]["finish_reason"].is_null());
+    }
+
+    /// The generation metrics carry the worker's **measured** health, and the
+    /// master's real RAM utilization (spec 2026-10-22, D-E5/D-E6).
+    #[test]
+    fn generation_metrics_carry_the_cached_worker_health() {
+        let state = seeded_state();
+        state.registry.register_or_update(DiscoveredNode {
+            node_id: "w1".into(),
+            device_name: "Pixel 8".into(),
+            ip_address: "127.0.0.1".into(),
+            port: 50052,
+            total_ram_bytes: 8 * 1024 * 1024 * 1024,
+            free_ram_bytes: 4 * 1024 * 1024 * 1024,
+            connection_type: "USB_ADB".into(),
+            latency_ms: 2.0,
+            last_seen_epoch_ms: 0,
+        });
+        state
+            .telemetry_cache
+            .record_worker(crate::telemetry::WorkerHealth {
+                id: "w1".into(),
+                temp_celsius: Some(38.5),
+                battery_pct: Some(92.0),
+                free_ram_bytes: 1024,
+                observed_at_epoch_ms: 1,
+            });
+        state.telemetry_cache.record_master_ram(Some(42.0));
+
+        let mut events = state.telemetry.subscribe();
+        publish_metrics(
+            &state.telemetry,
+            &state.registry,
+            &state.telemetry_cache,
+            10,
+            1.0,
+        );
+
+        let event = events.try_recv().expect("metrics event");
+        match event {
+            TelemetryEvent::GenerationMetrics { data, .. } => {
+                assert_eq!(data.worker_nodes.len(), 1);
+                assert_eq!(data.worker_nodes[0].temp_celsius, Some(38.5));
+                assert_eq!(data.worker_nodes[0].battery_pct, Some(92.0));
+                assert_eq!(data.master_ram_utilization_pct, Some(42.0));
+            }
+            other => panic!("expected generation metrics, got {other:?}"),
+        }
+    }
+
+    /// A worker that has never answered is **unknown**, not zero (D-E3).
+    #[test]
+    fn generation_metrics_report_unknown_rather_than_zero() {
+        let state = seeded_state();
+        state.registry.register_or_update(DiscoveredNode {
+            node_id: "w1".into(),
+            device_name: "Pixel 8".into(),
+            ip_address: "127.0.0.1".into(),
+            port: 50052,
+            total_ram_bytes: 8 * 1024 * 1024 * 1024,
+            free_ram_bytes: 4 * 1024 * 1024 * 1024,
+            connection_type: "USB_ADB".into(),
+            latency_ms: 2.0,
+            last_seen_epoch_ms: 0,
+        });
+
+        let mut events = state.telemetry.subscribe();
+        publish_metrics(
+            &state.telemetry,
+            &state.registry,
+            &state.telemetry_cache,
+            10,
+            1.0,
+        );
+
+        let event = events.try_recv().expect("metrics event");
+        match event {
+            TelemetryEvent::GenerationMetrics { data, .. } => {
+                assert_eq!(data.worker_nodes[0].temp_celsius, None);
+                assert_eq!(data.worker_nodes[0].battery_pct, None);
+                assert_eq!(data.master_ram_utilization_pct, None);
+            }
+            other => panic!("expected generation metrics, got {other:?}"),
+        }
     }
 
     #[test]

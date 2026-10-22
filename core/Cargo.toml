@@ -27,6 +27,7 @@ memmap2 = "0.9"
 bytes = "1"
 rcgen = "0.14.10"
 sha2 = "0.10"
+sysinfo = "0.39"
 
 [build-dependencies]
 tonic-build = "0.13"

@@ -74,7 +74,7 @@ fn base_state(registry: Arc<NodeRegistry>, store: Arc<Store>) -> AppState {
 }
 
 fn state(registry: Arc<NodeRegistry>, store: Arc<Store>) -> AppState {
-    base_state(registry, store).with_benchmark_transports(Arc::new(PlaintextTransports))
+    base_state(registry, store).with_worker_transports(Arc::new(PlaintextTransports))
 }
 
 async fn post_benchmark(app: Router) -> (StatusCode, serde_json::Value) {

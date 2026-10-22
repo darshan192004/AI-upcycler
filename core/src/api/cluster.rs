@@ -11,9 +11,8 @@ use serde::Serialize;
 use crate::api::{ApiResult, AppState, HostInfo};
 use crate::discovery::mdns::DiscoveredNode;
 use crate::rpc::client::WorkerRpcClient;
-use crate::rpc::engine::{WorkerTransport, WorkerTransportSource};
+use crate::rpc::engine::WorkerTransportSource;
 use crate::scheduler::planner::{LayerScheduler, ModelSpec};
-use crate::security::SecurityState;
 use crate::store::{NewBenchmark, NewNode};
 
 /// How the master sees a node in the topology graph.
@@ -158,8 +157,9 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn benchmark(State(state): State<AppState>) -> ApiResult<Json<BenchmarkResponse>> {
     let started = Instant::now();
-    let benchmarker =
-        ProbeBenchmarker::new(state.security.clone(), state.benchmark_transports.clone());
+    // One resolution path for every dial: the enrollment-aware rule, or the
+    // test override (spec 2026-10-22, D-E4).
+    let benchmarker = ProbeBenchmarker::with_transports(state.transports());
     let mut nodes_tested = 0u32;
     let mut nodes_failed = 0u32;
 
@@ -237,79 +237,22 @@ pub trait HardwareBenchmarker: Send + Sync {
     async fn benchmark(&self, node: &DiscoveredNode) -> Result<NodeBenchmark, String>;
 }
 
-/// Resolves a node's *benchmark* dial the way that node actually serves
-/// (D-C3): mTLS once it has completed pairing against this master's CA,
-/// plaintext until then.
-///
-/// This is deliberately **not** [`crate::security::EnrolledWorkerSource`], which
-/// refuses any unenrolled node. That refusal is right for the serving path —
-/// serving must never downgrade an unknown worker to plaintext — but wrong
-/// here: an unpaired mDNS worker, and the local Rust worker behind an ADB
-/// forward, genuinely serve plaintext, so a probe that refused them could never
-/// measure the very nodes the endpoint exists to compare. The exposure class is
-/// unchanged: discovery handshakes and ADB tunnel probes already speak
-/// plaintext to unpaired workers (spec D-C3).
-struct BenchmarkTransports {
-    security: Arc<SecurityState>,
-}
-
-impl BenchmarkTransports {
-    fn new(security: Arc<SecurityState>) -> Self {
-        Self { security }
-    }
-}
-
-impl WorkerTransportSource for BenchmarkTransports {
-    fn transport_for(&self, node_id: &str) -> Result<WorkerTransport, String> {
-        if !self.security.enrollments.is_enrolled(node_id) {
-            return Ok(WorkerTransport::Plaintext);
-        }
-        Ok(WorkerTransport::MutualTls(
-            crate::rpc::engine::WorkerTlsConfig {
-                ca_pem: self.security.ca.ca_pem(),
-                client_cert_pem: self.security.ca.client_cert_pem().to_string(),
-                client_key_pem: self.security.ca.client_key_pem().to_string(),
-            },
-        ))
-    }
-}
-
 /// Probes each node over the transport it actually serves on (D-C3).
 pub struct ProbeBenchmarker {
     transports: Arc<dyn WorkerTransportSource>,
 }
 
 impl ProbeBenchmarker {
-    /// Production wiring: derives transports from the live pairing enrollment
-    /// registry. `override_transports` exists only for tests, which dial
-    /// loopback mock workers and cannot complete a pairing.
-    pub fn new(
-        security: Arc<SecurityState>,
-        override_transports: Option<Arc<dyn WorkerTransportSource>>,
-    ) -> Self {
-        let transports =
-            override_transports.unwrap_or_else(|| Arc::new(BenchmarkTransports::new(security)));
+    /// Dials every node with the given transport source. Production resolves
+    /// it through [`crate::api::AppState::transports`] — the enrollment-aware
+    /// rule (mTLS once paired, plaintext until then, D-C3); tests inject a
+    /// plaintext loopback source.
+    pub fn with_transports(transports: Arc<dyn WorkerTransportSource>) -> Self {
         Self { transports }
     }
 
     async fn connect(&self, node: &DiscoveredNode) -> Result<WorkerRpcClient, String> {
-        match self.transports.transport_for(&node.node_id)? {
-            WorkerTransport::Plaintext => {
-                let endpoint = crate::rpc::engine::http_endpoint(&node.ip_address, node.port);
-                WorkerRpcClient::connect(&endpoint).await
-            }
-            WorkerTransport::MutualTls(config) => {
-                let endpoint = crate::rpc::engine::https_endpoint(&node.ip_address, node.port);
-                WorkerRpcClient::connect_tls(
-                    &endpoint,
-                    &config.ca_pem,
-                    &config.client_cert_pem,
-                    &config.client_key_pem,
-                    crate::rpc::engine::host(&node.ip_address),
-                )
-                .await
-            }
-        }
+        crate::rpc::engine::dial_worker(self.transports.as_ref(), node).await
     }
 }
 
@@ -543,29 +486,6 @@ mod tests {
         assert_eq!(response.status, "no_nodes");
         assert_eq!(response.nodes_tested, 0);
         assert_eq!(response.nodes_failed, 0);
-    }
-
-    #[test]
-    fn benchmark_transports_pair_enrollment_with_mtls_and_leave_the_rest_plaintext() {
-        let security = Arc::new(SecurityState::default());
-        security.enrollments.enroll("paired", "phone", vec![]);
-        let source = BenchmarkTransports::new(security.clone());
-
-        match source.transport_for("paired").expect("enrolled") {
-            WorkerTransport::MutualTls(config) => {
-                assert_eq!(config.ca_pem, security.ca.ca_pem());
-                assert_eq!(config.client_cert_pem, security.ca.client_cert_pem());
-            }
-            WorkerTransport::Plaintext => panic!("an enrolled node must be dialed over mTLS"),
-        }
-
-        // Unpaired is plaintext, not an error: that is how the node serves.
-        assert!(matches!(
-            source
-                .transport_for("unpaired")
-                .expect("unpaired never errors"),
-            WorkerTransport::Plaintext
-        ));
     }
 
     #[test]

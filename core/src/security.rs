@@ -381,6 +381,44 @@ impl WorkerTransportSource for EnrolledWorkerSource {
     }
 }
 
+/// Resolves a node's dial the way that node actually serves (spec 2026-10-21,
+/// D-C3): mTLS once it has completed pairing against this master's CA,
+/// plaintext until then.
+///
+/// This is deliberately **not** [`EnrolledWorkerSource`], which refuses any
+/// unenrolled node. That refusal is right for the serving path — serving must
+/// never downgrade an unknown worker to plaintext — but wrong for the
+/// measurement paths: an unpaired mDNS worker, and the local Rust worker
+/// behind an ADB forward, genuinely serve plaintext, so a probe that refused
+/// them could never measure the very nodes the endpoint exists to compare. The
+/// exposure class is unchanged: discovery handshakes and ADB tunnel probes
+/// already speak plaintext to unpaired workers (spec D-C3).
+///
+/// Shared by the benchmark probe and the health poller so the rule cannot
+/// drift between them (spec 2026-10-22, D-E4).
+pub struct EnrollmentAwareTransports {
+    security: Arc<SecurityState>,
+}
+
+impl EnrollmentAwareTransports {
+    pub fn new(security: Arc<SecurityState>) -> Self {
+        Self { security }
+    }
+}
+
+impl WorkerTransportSource for EnrollmentAwareTransports {
+    fn transport_for(&self, node_id: &str) -> Result<WorkerTransport, String> {
+        if !self.security.enrollments.is_enrolled(node_id) {
+            return Ok(WorkerTransport::Plaintext);
+        }
+        Ok(WorkerTransport::MutualTls(WorkerTlsConfig {
+            ca_pem: self.security.ca.ca_pem(),
+            client_cert_pem: self.security.ca.client_cert_pem().to_string(),
+            client_key_pem: self.security.ca.client_key_pem().to_string(),
+        }))
+    }
+}
+
 /// CA, pairing sessions and enrollment records shared through
 /// [`crate::api::AppState`].
 pub struct SecurityState {
@@ -416,6 +454,29 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrollment_aware_transports_pair_with_mtls_and_leave_the_rest_plaintext() {
+        let security = Arc::new(SecurityState::default());
+        security.enrollments.enroll("paired", "phone", vec![]);
+        let source = EnrollmentAwareTransports::new(security.clone());
+
+        match source.transport_for("paired").expect("enrolled") {
+            WorkerTransport::MutualTls(config) => {
+                assert_eq!(config.ca_pem, security.ca.ca_pem());
+                assert_eq!(config.client_cert_pem, security.ca.client_cert_pem());
+            }
+            WorkerTransport::Plaintext => panic!("an enrolled node must be dialed over mTLS"),
+        }
+
+        // Unpaired is plaintext, not an error: that is how the node serves.
+        assert!(matches!(
+            source
+                .transport_for("unpaired")
+                .expect("unpaired never errors"),
+            WorkerTransport::Plaintext
+        ));
+    }
 
     #[test]
     fn generates_ca_with_stable_fingerprint() {

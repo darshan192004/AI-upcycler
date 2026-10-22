@@ -230,6 +230,7 @@ data: [DONE]
   - `node_connected`: Broadcast when a new mobile device connects.
   - `node_disconnected`: Broadcast when a device loses connection.
   - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference.
+  - `worker_health`: Emits the freshest measured health of every worker (battery, CPU temperature, free RAM) plus the master's own RAM utilization. Published after each poll cycle (every 5 s).
   - `model_download_progress`: Emits GGUF download progress (`running` / `complete` / `error`) with received and total bytes.
 
 ```json
@@ -247,6 +248,38 @@ data: [DONE]
   }
 }
 ```
+
+```json
+{
+  "event": "worker_health",
+  "timestamp": 1743457100,
+  "data": {
+    "master_ram_utilization_pct": 68.2,
+    "nodes": [
+      {
+        "id": "worker-android-01",
+        "temp_celsius": 38.5,
+        "battery_pct": 92.0,
+        "free_ram_bytes": 2415919104,
+        "observed_at_epoch_ms": 1743457098000
+      },
+      {
+        "id": "worker-android-02",
+        "temp_celsius": null,
+        "battery_pct": 84.0,
+        "free_ram_bytes": 1879048192,
+        "observed_at_epoch_ms": 1743457098000
+      }
+    ]
+  }
+}
+```
+
+**Unknown is `null`, never `0`**: a metric the worker cannot measure — a desktop
+has no battery, and Android's thermal sysfs is unreadable for unprivileged apps —
+is reported as `null`. The master never substitutes a zero. A worker that has
+never answered is absent from `nodes` entirely; a worker that stopped answering
+keeps its last measured snapshot, with `observed_at_epoch_ms` saying how old it is.
 
 ```json
 {

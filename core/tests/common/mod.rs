@@ -44,6 +44,10 @@ pub struct MockWorker {
     /// When false, `benchmark` answers `UNIMPLEMENTED` — the shape every
     /// pre-benchmark-probe worker presents to the master (spec 2026-10-21).
     serve_benchmark: bool,
+    /// The battery percentage and CPU temperature this worker reports.
+    /// Negative means "I cannot measure this" — the sentinel the Android
+    /// worker uses (spec 2026-10-22, D-E3).
+    health: (f32, f32),
     events: Events,
 }
 
@@ -61,6 +65,7 @@ impl MockWorker {
             fail_load: false,
             fail_forward: false,
             serve_benchmark: true,
+            health: (80.0, 40.0),
             events,
         }
     }
@@ -79,6 +84,13 @@ impl MockWorker {
     /// worker built before the probe RPC existed.
     pub fn without_benchmark(mut self) -> Self {
         self.serve_benchmark = false;
+        self
+    }
+
+    /// Sets the battery percentage and CPU temperature this worker reports.
+    /// A negative value is the "I cannot measure this" sentinel.
+    pub fn with_health(mut self, battery_pct: f32, temp_celsius: f32) -> Self {
+        self.health = (battery_pct, temp_celsius);
         self
     }
 
@@ -172,9 +184,12 @@ impl WorkerService for MockWorker {
         &self,
         _request: tonic::Request<HealthRequest>,
     ) -> Result<tonic::Response<HealthResponse>, tonic::Status> {
+        // Logged so a test can prove the generation path never asks for
+        // health (spec 2026-10-22, D-E1).
+        self.record(format!("health:{}", self.node_id));
         Ok(tonic::Response::new(HealthResponse {
-            battery_percentage: 80.0,
-            cpu_temp_celsius: 40.0,
+            battery_percentage: self.health.0,
+            cpu_temp_celsius: self.health.1,
             free_ram_bytes: 1 << 29,
         }))
     }

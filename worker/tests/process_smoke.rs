@@ -55,6 +55,17 @@ fn worker_binary_serves_handshake_and_health() {
         .expect("health")
         .into_inner();
     assert!(health.free_ram_bytes > 0);
+    // A desktop has no battery and no thermal sensor: the worker reports the
+    // "I cannot measure this" sentinel, not a 0.0 the master would render as
+    // "0% charged, 0 °C" (spec 2026-10-22, D-E3).
+    assert_eq!(
+        health.battery_percentage, -1.0,
+        "an unmeasurable battery must be the unknown sentinel"
+    );
+    assert_eq!(
+        health.cpu_temp_celsius, -1.0,
+        "an unmeasurable temperature must be the unknown sentinel"
+    );
 
     child.kill().expect("kill worker");
     let _ = child.wait().expect("reap worker");
