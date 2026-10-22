@@ -2,7 +2,9 @@ use ai_upcycler_core::api::pairing::PairingSessionResponse;
 use ai_upcycler_core::api::{self, AppState};
 use ai_upcycler_core::discovery::mdns::NodeRegistry;
 use ai_upcycler_core::rpc::engine::{ExecutionResult, RpcPipelineEngine, TensorPayload};
-use ai_upcycler_core::scheduler::planner::{LayerAssignment, ModelSpec, PartitioningPlan};
+use ai_upcycler_core::scheduler::planner::{
+    LayerAssignment, LayerScheduler, ModelSpec, PartitioningPlan, ThermalHints,
+};
 use ai_upcycler_core::store::Store;
 use ai_upcycler_core::telemetry::TelemetryBus;
 use std::net::SocketAddr;
@@ -34,12 +36,9 @@ fn compute_layer_plan(
     let nodes = registry.list_nodes();
     // The plan is thermal-aware: a worker that is already hot gets a smaller
     // share so it can rest (spec 2026-10-22, D-F1/D-F2).
-    let thermal = ai_upcycler_core::scheduler::planner::ThermalHints::from_temperatures(
-        state.telemetry_cache.temperatures(),
-    );
-    Ok(ai_upcycler_core::scheduler::planner::LayerScheduler::compute_plan(
-        &model, &nodes, &thermal,
-    ))
+    let thermal = ThermalHints::from_temperatures(state.telemetry_cache.temperatures());
+    let plan = LayerScheduler::compute_plan(&model, &nodes, &thermal);
+    Ok(plan)
 }
 
 #[tauri::command]
