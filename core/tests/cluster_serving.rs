@@ -384,6 +384,7 @@ async fn real_router_serves_greedy_chat_through_one_worker_parity_with_llama() {
         store.clone(),
         security,
         Arc::new(StubBackend::new()),
+        Arc::new(ai_upcycler_core::worker_health::TelemetryCache::new()),
     )
     .with_transports(Arc::new(LoopbackPlaintexts));
 
@@ -534,6 +535,7 @@ async fn real_router_splits_the_model_across_two_workers_parity_with_llama() {
         store.clone(),
         security,
         Arc::new(StubBackend::new()),
+        Arc::new(ai_upcycler_core::worker_health::TelemetryCache::new()),
     )
     .with_transports(Arc::new(LoopbackPlaintexts));
 
@@ -596,7 +598,7 @@ async fn real_router_splits_the_model_across_two_workers_parity_with_llama() {
 #[test]
 fn planner_splits_between_two_ram_limited_nodes() {
     use ai_upcycler_core::discovery::mdns::DiscoveredNode;
-    use ai_upcycler_core::scheduler::planner::{LayerScheduler, ModelSpec};
+    use ai_upcycler_core::scheduler::planner::{LayerScheduler, ModelSpec, ThermalHints};
 
     let bytes_per_layer = 491_400_032u64 / 24; // the shipped model
     let spec = ModelSpec {
@@ -626,7 +628,7 @@ fn planner_splits_between_two_ram_limited_nodes() {
             .cmp(&b.free_ram_bytes)
             .then_with(|| a.node_id.cmp(&b.node_id))
     });
-    let plan = LayerScheduler::compute_plan(&spec, &nodes);
+    let plan = LayerScheduler::compute_plan(&spec, &nodes, &ThermalHints::default());
     assert_eq!(
         plan.assignments.len(),
         2,

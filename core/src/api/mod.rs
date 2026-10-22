@@ -212,11 +212,16 @@ impl AppState {
         // adaptive backend serves through LoadedPipeline when enrolled workers
         // exist; llama-server stays the fallback of last resort.
         let security = Arc::new(SecurityState::default());
+        // One cache for the worker health the poll loop writes and the
+        // planner reads (spec 2026-10-22, D-F1): a hot worker gets a smaller
+        // share of the model.
+        let telemetry_cache = Arc::new(crate::worker_health::TelemetryCache::new());
         let backend: Arc<dyn GenerationBackend> = Arc::new(distributed::AdaptiveBackend::new(
             registry.clone(),
             store.clone(),
             security.clone(),
             fallback,
+            telemetry_cache.clone(),
         ));
         Self::new(
             cluster_id,
@@ -227,6 +232,7 @@ impl AppState {
             HostInfo::default(),
         )
         .with_security(security)
+        .with_telemetry_cache(telemetry_cache)
         .with_models_dir(models_dir)
     }
 }

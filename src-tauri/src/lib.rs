@@ -29,9 +29,17 @@ fn get_discovered_nodes(
 fn compute_layer_plan(
     model: ModelSpec,
     registry: tauri::State<'_, Arc<NodeRegistry>>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<PartitioningPlan, String> {
     let nodes = registry.list_nodes();
-    Ok(ai_upcycler_core::scheduler::planner::LayerScheduler::compute_plan(&model, &nodes))
+    // The plan is thermal-aware: a worker that is already hot gets a smaller
+    // share so it can rest (spec 2026-10-22, D-F1/D-F2).
+    let thermal = ai_upcycler_core::scheduler::planner::ThermalHints::from_temperatures(
+        state.telemetry_cache.temperatures(),
+    );
+    Ok(ai_upcycler_core::scheduler::planner::LayerScheduler::compute_plan(
+        &model, &nodes, &thermal,
+    ))
 }
 
 #[tauri::command]

@@ -12,7 +12,7 @@ use crate::api::{ApiResult, AppState, HostInfo};
 use crate::discovery::mdns::DiscoveredNode;
 use crate::rpc::client::WorkerRpcClient;
 use crate::rpc::engine::WorkerTransportSource;
-use crate::scheduler::planner::{LayerScheduler, ModelSpec};
+use crate::scheduler::planner::{LayerScheduler, ModelSpec, ThermalHints};
 use crate::store::{NewBenchmark, NewNode};
 
 /// How the master sees a node in the topology graph.
@@ -26,12 +26,28 @@ pub struct Topology {
     pub nodes: Vec<TopologyNode>,
     pub storage_mmap: StorageMmap,
     pub discovery: DiscoveryStatus,
+    /// The thermal state the layer plan was computed against: one entry per
+    /// worker with a measured temperature (spec 2026-10-22, D-F4).
+    pub thermal: Vec<TopologyThermal>,
+    /// Whether the hot-worker cap had to be relaxed to place the model
+    /// (spec D-F3): the cluster was hot enough that resting was not an option.
+    pub thermal_relaxed: bool,
 }
 
 /// Whether the mDNS browser behind Wi-Fi discovery is actually running.
 #[derive(Debug, Serialize)]
 pub struct DiscoveryStatus {
     pub mdns: &'static str,
+}
+
+/// The thermal state one node was planned against (spec 2026-10-22, D-F4).
+#[derive(Debug, Serialize)]
+pub struct TopologyThermal {
+    pub node_id: String,
+    /// The last measured CPU temperature, in celsius.
+    pub temp_celsius: f64,
+    /// Whether this node's share of the model was capped because it is hot.
+    pub capped: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +83,8 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
     let mut assignments: HashMap<String, Vec<[usize; 2]>> = HashMap::new();
     let mut ram_assigned: HashMap<String, u64> = HashMap::new();
     let mut active_model = None;
+    let mut thermal: Vec<TopologyThermal> = Vec::new();
+    let mut thermal_relaxed = false;
     if let Some(model) = &model {
         if model.total_layers > 0 && model.weight_size_bytes > 0 {
             let spec = ModelSpec {
@@ -76,7 +94,21 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
                 activation_bytes: 0,
                 quantization: model.quantization_format.clone(),
             };
-            let plan = LayerScheduler::compute_plan(&spec, &plan_nodes);
+            let plan = LayerScheduler::compute_plan(
+                &spec,
+                &plan_nodes,
+                &ThermalHints::from_temperatures(state.telemetry_cache.temperatures()),
+            );
+            thermal = plan
+                .thermal
+                .iter()
+                .map(|node| TopologyThermal {
+                    node_id: node.node_id.clone(),
+                    temp_celsius: node.temp_celsius,
+                    capped: node.capped,
+                })
+                .collect();
+            thermal_relaxed = plan.thermal_relaxed;
             for assignment in &plan.assignments {
                 assignments
                     .entry(assignment.node_id.clone())
@@ -135,6 +167,8 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
                 "unavailable"
             },
         },
+        thermal,
+        thermal_relaxed,
     }))
 }
 

@@ -35,13 +35,30 @@ from the telemetry cache, which the poll loop refreshes every 5 s (spec 2026-10-
 D-E1). **No measurement means no penalty**: a node the master has never polled (or
 one whose worker cannot measure temperature) is treated as unknown, never as hot.
 
-### D-F2 — A hot worker is capped, not excluded
+### D-F2 — A hot worker rests, and the cap relaxes only as far as it must
 
-A worker at or above `HOT_CELSIUS` (40 °C) may take at most `HOT_LAYER_SHARE`
-(50%) of the layers its free RAM would otherwise allow. The cap is on the *share*,
-not a hard exclusion: excluding the node outright would leave the model
+A worker at or above `HOT_CELSIUS` (40 °C) is hot. The planner then tries the hot
+worker's share in graded steps, taking the **first** one at which the whole model
+fits:
+
+1. **0%** — the hot worker rests entirely and the cool ones carry the load.
+2. **`HOT_LAYER_SHARE` (50%)** — the hot worker takes half of what its free RAM
+   would allow.
+3. **100%** — the hot worker takes what it must, and the plan records that the cap
+   was relaxed.
+
+Each step is "the minimum the cluster needs", so a hot phone rests whenever the
+cluster can afford it, and is used only when the model would otherwise not fit. A
+hot worker is never *excluded* from the plan outright: that would leave the model
 unpartitioned and silently fall back to the host backend, which is a worse outcome
 than using a warm phone.
+
+> **Amendment (2026-10-22, implementation slice 1).** This was first written as a
+> flat 50% cap with an all-or-nothing relaxation. Two problems with that showed up
+> while implementing it: a phone resting at half share is barely resting (it keeps
+> heating), and an all-or-nothing relaxation hands a hot, large node *everything*,
+> defeating the cap. The graded steps above fix both, and keep the promise that
+> matters: the plan always places the model, and it reports what it had to give up.
 
 40 °C is a policy constant, not a measurement: it is where a phone is plainly warm
 and throttling becomes likely. It is a constant rather than configuration because
@@ -49,10 +66,11 @@ there is no real data yet to tune it against (D-F8).
 
 ### D-F3 — The plan never fails because of temperature
 
-After the capped pass, if layers remain unassigned, the plan is recomputed without
-the cap, and the result records that the relaxation was needed. Resting is
-best-effort: the cluster always works, and the operator can see that it worked by
-working *harder* than it wanted to.
+The plan always places the model. If the graded steps (D-F2) cannot place it, the
+last step — the hot worker taking what it must — is used, and the plan records that
+the relaxation was needed (`thermal_relaxed`). Resting is best-effort: the cluster
+always works, and the operator can see that it worked by working *harder* than it
+wanted to.
 
 ### D-F4 — The plan reports the thermal state it used
 

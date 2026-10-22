@@ -132,10 +132,31 @@ data: [DONE]
   },
   "discovery": {
     "mdns": "active"
-  }
+  },
+  "thermal": [
+    {
+      "node_id": "worker-android-01",
+      "temp_celsius": 38.5,
+      "capped": false
+    },
+    {
+      "node_id": "worker-android-02",
+      "temp_celsius": 46.0,
+      "capped": true
+    }
+  ],
+  "thermal_relaxed": false
 }
 ```
 `discovery.mdns` is `"active"` when the mDNS browser daemon is running and `"unavailable"` when it failed to start (Wi-Fi discovery offline; USB/ADB workers unaffected).
+
+`thermal` reports the state the layer plan was computed against: one entry per
+worker with a measured CPU temperature, and `capped: true` when that worker's
+share of the model was limited because it is hot (at or above 40 °C) — it is
+resting while the cooler workers carry the load. `thermal_relaxed` is `true`
+when the cluster was hot enough that resting was not an option and the cap had
+to be relaxed to place the model. A worker with no measurement is absent from
+`thermal`; the master is never listed (it is not a polled worker).
 
 ### 3.2 Trigger Hardware Re-Benchmarking
 - **Endpoint**: `POST /api/cluster/benchmark`
