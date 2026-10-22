@@ -50,6 +50,7 @@ pub struct WorkerRpcClient {
 pub fn build_execute_request(
     assignment: &LayerAssignment,
     payload: &TensorPayload,
+    last_logits_only: bool,
 ) -> ExecuteForwardRequest {
     ExecuteForwardRequest {
         session_id: payload.session_id.clone(),
@@ -61,7 +62,7 @@ pub fn build_execute_request(
             raw_data: payload.data_bytes.clone(),
         }),
         sequence_position: payload.sequence_index as i32,
-        last_logits_only: false,
+        last_logits_only,
     }
 }
 
@@ -150,12 +151,17 @@ impl WorkerRpcClient {
 
     /// Pushes one forward pass of the layer range owned by `assignment`
     /// through the worker and returns the resulting activation tensor.
+    ///
+    /// `last_logits_only` is the wire hint for a head stage: the worker answers
+    /// `[1, n_vocab]` instead of `[n, n_vocab]` (spec 2026-10-21-last-row-logits,
+    /// L2). Workers without the capability ignore it and return whole logits.
     pub async fn execute_forward(
         &mut self,
         assignment: &LayerAssignment,
         payload: &TensorPayload,
+        last_logits_only: bool,
     ) -> Result<ExecutionResult, String> {
-        let request = build_execute_request(assignment, payload);
+        let request = build_execute_request(assignment, payload, last_logits_only);
         info!(
             "RPC client: execute_forward session {} sequence {} layers {}..={}",
             request.session_id, payload.sequence_index, request.start_layer, request.end_layer
@@ -289,7 +295,7 @@ mod tests {
 
     #[test]
     fn maps_assignment_and_payload_to_proto_request() {
-        let req = build_execute_request(&sample_assignment(), &sample_payload());
+        let req = build_execute_request(&sample_assignment(), &sample_payload(), false);
 
         assert_eq!(req.session_id, "session-1");
         assert_eq!(req.start_layer, 8);
@@ -308,7 +314,7 @@ mod tests {
             data_type: ActivationType::Fp16,
             ..sample_payload()
         };
-        let req = build_execute_request(&sample_assignment(), &payload);
+        let req = build_execute_request(&sample_assignment(), &payload, false);
         assert_eq!(req.activation_tensor.unwrap().data_type, 1, "FP16");
     }
 
@@ -319,7 +325,7 @@ mod tests {
             end_layer: 11,
             ..sample_assignment()
         };
-        let req = build_execute_request(&a, &sample_payload());
+        let req = build_execute_request(&a, &sample_payload(), false);
         assert_eq!(req.start_layer, 0);
         assert_eq!(req.end_layer, 11);
     }

@@ -167,6 +167,11 @@ assembles `message.content` from decoded ids. `usage.prompt_tokens` = prefill le
 
 - `proto/cluster_rpc.proto`: 0 lines changed. No new RPC methods; the worker learns
   nothing about chat.
+  *Superseded in one narrow point* by
+  `2026-10-21-last-row-logits-design.md` (L1): two additive fields,
+  `ExecuteForwardRequest.last_logits_only` and
+  `HandshakeResponse.supports_last_row_logits`, still no new RPC method and
+  still nothing chat-specific on the worker. Every other D6 invariant stands.
 - `LoadedPipeline` and the worker engine stay text-free (D4 puts all text on the
   master, where the tokenizer lives).
 - llm weights/tensors are a stage-local concern; the master handles only ids,

@@ -42,10 +42,14 @@
   recovery windows, SSE error events and metric truthing (true
   `usage.prompt_tokens` = prefill length). Design +
   slice record: `docs/superpowers/specs/2026-10-18-live-chat-path-design.md`,
-  `docs/superpowers/plans/2026-10-18-live-chat-path.md`. Known shipped limits:
-  whole-logits prefill bounds prompts at ~430 tokens on the shipped model
-  (last-row-only wire contract is a proto change, deliberately deferred), and
-  `proto/cluster_rpc.proto` stayed byte-identical through the epic (D6).
+  `docs/superpowers/plans/2026-10-18-live-chat-path.md`. The epic shipped with
+  whole-logits prefill, which bounded prompts at ~430 tokens on the shipped
+  model, and left `proto/cluster_rpc.proto` byte-identical (D6). The bound is
+  now lifted for capable heads by the additive last-row-logits contract
+  (`docs/superpowers/specs/2026-10-21-last-row-logits-design.md`, #83 + this
+  change): a head that advertises the capability prefills the whole prompt and
+  answers with `[1, n_vocab]`; an old head keeps the honest refusal. Prompt
+  length is still limited by worker RAM and per-layer cost, not by the wire.
 - [x] Port the engine to the Android worker (mTLS server + compute RPCs so
   phones join the split) — **device-free complete**: pure-Kotlin GGUF parser +
   dequant (#66), forward-parity vectors at the D-A2 bar (#68), the refusal
