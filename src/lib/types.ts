@@ -60,15 +60,39 @@ export interface NodeEventData {
 
 export interface WorkerTelemetry {
   id: string;
-  temp_celsius: number;
-  battery_pct: number;
+  /** `null` when the worker cannot measure it — never a placeholder zero. */
+  temp_celsius: number | null;
+  /** `null` when the worker cannot measure it — never a placeholder zero. */
+  battery_pct: number | null;
 }
 
 export interface GenerationMetrics {
   tokens_per_second: number;
   current_token: number;
-  master_ram_utilization_pct: number;
+  /** The master's own RAM utilization; `null` when it could not be read. */
+  master_ram_utilization_pct: number | null;
   worker_nodes: WorkerTelemetry[];
+}
+
+/**
+ * One worker's latest **measured** health, published every poll cycle.
+ *
+ * A worker that cannot measure a metric reports `null`; a worker that has
+ * never answered is absent from the map entirely.
+ */
+export interface WorkerHealth {
+  id: string;
+  temp_celsius: number | null;
+  battery_pct: number | null;
+  free_ram_bytes: number;
+  /** When the snapshot was taken (Unix epoch milliseconds). */
+  observed_at_epoch_ms: number;
+}
+
+export interface WorkerHealthEventData {
+  /** The master's own RAM utilization; `null` when it could not be read. */
+  master_ram_utilization_pct: number | null;
+  nodes: WorkerHealth[];
 }
 
 export type DownloadStatus = 'running' | 'complete' | 'error';
@@ -85,6 +109,7 @@ export type TelemetryEvent =
   | { event: 'node_connected'; timestamp: number; data: NodeEventData }
   | { event: 'node_disconnected'; timestamp: number; data: NodeEventData }
   | { event: 'generation_metrics'; timestamp: number; data: GenerationMetrics }
+  | { event: 'worker_health'; timestamp: number; data: WorkerHealthEventData }
   | { event: 'model_download_progress'; timestamp: number; data: DownloadProgressData };
 
 export interface ChatMessage {

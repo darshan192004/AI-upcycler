@@ -6,6 +6,7 @@ import type {
   ModelEntry,
   TelemetryEvent,
   Topology,
+  WorkerHealth,
 } from '../lib/types';
 
 const HISTORY_CAP = 120;
@@ -16,6 +17,10 @@ interface ClusterState {
   models: ModelEntry[];
   generationHistory: number[];
   latestMetrics: GenerationMetrics | null;
+  /** The freshest measured health per worker id. */
+  workerHealth: Record<string, WorkerHealth>;
+  /** The master's own RAM utilization; `null` when it could not be read. */
+  masterRamUtilizationPct: number | null;
   downloads: Record<string, DownloadProgressData>;
   refreshTopology: () => Promise<void>;
   refreshModels: () => Promise<void>;
@@ -28,6 +33,8 @@ export const useClusterStore = create<ClusterState>((set, get) => ({
   models: [],
   generationHistory: [],
   latestMetrics: null,
+  workerHealth: {},
+  masterRamUtilizationPct: null,
   downloads: {},
 
   refreshTopology: async () => {
@@ -63,6 +70,19 @@ export const useClusterStore = create<ClusterState>((set, get) => ({
             ...history,
             event.data.tokens_per_second,
           ].slice(-HISTORY_CAP),
+        });
+        break;
+      }
+      case 'worker_health': {
+        // Replaced wholesale, not merged: a worker that left the registry
+        // drops out of the map instead of showing a value forever.
+        const workerHealth: Record<string, WorkerHealth> = {};
+        for (const node of event.data.nodes) {
+          workerHealth[node.id] = node;
+        }
+        set({
+          workerHealth,
+          masterRamUtilizationPct: event.data.master_ram_utilization_pct,
         });
         break;
       }

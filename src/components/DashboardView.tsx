@@ -27,12 +27,16 @@ export function DashboardView() {
   const latestMetrics = useClusterStore((s) => s.latestMetrics);
   const history = useClusterStore((s) => s.generationHistory);
   const apiOnline = useClusterStore((s) => s.apiOnline);
+  const workerHealth = useClusterStore((s) => s.workerHealth);
+  const masterRamPct = useClusterStore((s) => s.masterRamUtilizationPct);
 
   const workerNodes = topology?.nodes.filter((n) => n.role !== 'master') ?? [];
   const totalGb = topology ? topology.total_pooled_ram_mb / 1024 : 0;
   const usedGb = topology ? topology.used_pooled_ram_mb / 1024 : 0;
   const tokS = latestMetrics?.tokens_per_second ?? 0;
-  const ramPct = latestMetrics?.master_ram_utilization_pct ?? 0;
+  // The poll publishes the master's own RAM every cycle; the generation
+  // metrics carry the same reading. Unknown stays unknown — never "0.0%".
+  const ramPct = masterRamPct ?? latestMetrics?.master_ram_utilization_pct ?? null;
   const mdnsOffline = topology?.discovery?.mdns === 'unavailable';
 
   if (!apiOnline && !topology) {
@@ -144,7 +148,9 @@ export function DashboardView() {
             </div>
             <div className="font-mono text-xs text-slate-400">
               master RAM util{' '}
-              <span className="text-emerald-300">{ramPct.toFixed(1)}%</span>
+              <span className="text-emerald-300">
+                {ramPct != null ? `${ramPct.toFixed(1)}%` : '—'}
+              </span>
             </div>
           </div>
           <Sparkline
@@ -181,7 +187,12 @@ export function DashboardView() {
         {topology && topology.nodes.length > 0 ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {topology.nodes.map((node, index) => (
-              <NodeCard key={node.node_id} node={node} index={index} />
+              <NodeCard
+                key={node.node_id}
+                node={node}
+                index={index}
+                health={workerHealth[node.node_id]}
+              />
             ))}
           </div>
         ) : (

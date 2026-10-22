@@ -1,7 +1,16 @@
 import { motion } from 'motion/react';
+import { Battery, Thermometer } from 'lucide-react';
 import { ProgressBar } from './ui/ProgressBar';
 import { StatusDot } from './ui/StatusDot';
-import type { TopologyNode } from '../lib/types';
+import type { TopologyNode, WorkerHealth } from '../lib/types';
+
+/**
+ * A snapshot older than this is shown dimmed: the value was really measured,
+ * but the worker has stopped answering and it is no longer current.
+ *
+ * Three poll intervals (the master polls every 5 s).
+ */
+const STALE_AFTER_MS = 15_000;
 
 function formatMb(mb: number): string {
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
@@ -18,11 +27,16 @@ function connectionTone(connection: string): 'ok' | 'warn' | 'idle' {
 interface NodeCardProps {
   node: TopologyNode;
   index: number;
+  /** The worker's latest measured health, when the master has one. */
+  health?: WorkerHealth;
 }
 
-export function NodeCard({ node, index }: NodeCardProps) {
+export function NodeCard({ node, index, health }: NodeCardProps) {
   const ramRatio = node.ram_total_mb > 0 ? node.ram_assigned_mb / node.ram_total_mb : 0;
   const isMaster = node.role === 'master';
+  const stale =
+    health !== undefined && Date.now() - health.observed_at_epoch_ms > STALE_AFTER_MS;
+  const measured = health !== undefined && !stale;
 
   return (
     <motion.div
@@ -81,6 +95,44 @@ export function NodeCard({ node, index }: NodeCardProps) {
         ariaLabel={`RAM usage for ${node.device_name}`}
         shimmer={ramRatio > 0}
       />
+
+      {!isMaster && (
+        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+          <span
+            className={`flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px] ${
+              measured && health?.temp_celsius != null
+                ? 'border-cyan-400/25 bg-cyan-500/10 text-cyan-300'
+                : 'border-white/10 bg-white/5 text-slate-500'
+            }`}
+            title={
+              health
+                ? `Measured at ${new Date(health.observed_at_epoch_ms).toLocaleTimeString()}`
+                : 'Not measured yet'
+            }
+          >
+            <Thermometer className="h-3 w-3" aria-hidden="true" />
+            {health?.temp_celsius != null ? `${health.temp_celsius.toFixed(1)} °C` : '—'}
+          </span>
+          <span
+            className={`flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px] ${
+              measured && health?.battery_pct != null
+                ? 'border-emerald-400/25 bg-emerald-500/10 text-emerald-300'
+                : 'border-white/10 bg-white/5 text-slate-500'
+            }`}
+            title={
+              health
+                ? `Measured at ${new Date(health.observed_at_epoch_ms).toLocaleTimeString()}`
+                : 'Not measured yet'
+            }
+          >
+            <Battery className="h-3 w-3" aria-hidden="true" />
+            {health?.battery_pct != null ? `${Math.round(health.battery_pct)}%` : '—'}
+          </span>
+          {stale && (
+            <span className="text-[10px] uppercase tracking-wider text-slate-600">stale</span>
+          )}
+        </div>
+      )}
 
       <div className="mt-3 flex flex-wrap gap-1.5">
         {node.assigned_layers.length === 0 ? (
