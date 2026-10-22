@@ -48,6 +48,10 @@ pub struct MockWorker {
     /// Negative means "I cannot measure this" — the sentinel the Android
     /// worker uses (spec 2026-10-22, D-E3).
     health: (f32, f32),
+    /// Whether the handshake advertises the last-row-logits contract
+    /// (spec 2026-10-21-last-row-logits, L3). Defaults to false, i.e. the
+    /// behaviour of every worker built before the contract existed.
+    supports_last_row_logits: bool,
     events: Events,
 }
 
@@ -66,6 +70,7 @@ impl MockWorker {
             fail_forward: false,
             serve_benchmark: true,
             health: (80.0, 40.0),
+            supports_last_row_logits: false,
             events,
         }
     }
@@ -94,6 +99,13 @@ impl MockWorker {
         self
     }
 
+    /// Makes the handshake advertise the last-row-logits contract, like the
+    /// Rust and Kotlin workers after spec 2026-10-21-last-row-logits.
+    pub fn with_last_row_logits(mut self) -> Self {
+        self.supports_last_row_logits = true;
+        self
+    }
+
     fn record(&self, event: impl Into<String>) {
         self.events.lock().expect("events lock").push(event.into());
     }
@@ -113,7 +125,7 @@ impl WorkerService for MockWorker {
             free_ram_bytes: 1 << 29,
             cpu_cores: 4,
             has_npu_acceleration: false,
-            supports_last_row_logits: false,
+            supports_last_row_logits: self.supports_last_row_logits,
         }))
     }
 
@@ -145,7 +157,14 @@ impl WorkerService for MockWorker {
         request: tonic::Request<ExecuteForwardRequest>,
     ) -> Result<tonic::Response<ExecuteForwardResponse>, tonic::Status> {
         let request = request.into_inner();
-        self.record(format!("forward:{}", self.node_id));
+        // The suffix keeps existing exact-event assertions valid while letting
+        // a test see where the last-row hint actually went.
+        let suffix = if request.last_logits_only {
+            ":last-row"
+        } else {
+            ""
+        };
+        self.record(format!("forward:{}{suffix}", self.node_id));
         if self.fail_forward {
             return Ok(tonic::Response::new(ExecuteForwardResponse {
                 success: false,

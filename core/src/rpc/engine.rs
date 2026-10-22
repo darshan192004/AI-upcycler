@@ -102,6 +102,10 @@ impl WorkerTransportSource for PlaintextTransports {
 struct PipelineStage {
     assignment: LayerAssignment,
     client: WorkerRpcClient,
+    /// What this worker advertised in its handshake: it can answer a head
+    /// forward with `[1, n_vocab]` instead of `[n, n_vocab]` (spec
+    /// 2026-10-21-last-row-logits, L3). Old workers report `false`.
+    supports_last_row_logits: bool,
 }
 
 /// A loaded, connected pipeline: every worker holds its layer range and one
@@ -211,18 +215,51 @@ impl LoadedPipeline {
 
     /// Threads one activation through every stage and returns the final
     /// tensor plus the summed worker execution time.
+    ///
+    /// This is the whole-logits contract: every stage is asked for its full
+    /// output. The generation path uses
+    /// [`LoadedPipeline::forward_with_last_row_only`] instead.
     pub async fn forward(&mut self, payload: TensorPayload) -> Result<ExecutionResult, String> {
+        self.forward_inner(payload, false).await
+    }
+
+    /// Threads one activation through every stage, asking the **final** stage
+    /// for only the last logits row.
+    ///
+    /// Intermediate stages carry hidden activations and never produce logits,
+    /// so the flag is deliberately not set on them. Whether the worker honours
+    /// it is its own choice (see [`LoadedPipeline::supports_last_row_logits`]);
+    /// an old worker ignores the field and returns whole logits, which the
+    /// caller still decodes by taking the tail (spec 2026-10-21-last-row-logits,
+    /// L2/L4).
+    pub async fn forward_with_last_row_only(
+        &mut self,
+        payload: TensorPayload,
+    ) -> Result<ExecutionResult, String> {
+        self.forward_inner(payload, true).await
+    }
+
+    async fn forward_inner(
+        &mut self,
+        payload: TensorPayload,
+        last_row_only: bool,
+    ) -> Result<ExecutionResult, String> {
         if self.stages.is_empty() {
             return Err("pipeline has no loaded stages".into());
         }
 
         let mut current = payload;
         let mut total_execution_us = 0u64;
+        let last_index = self.stages.len() - 1;
 
-        for stage in &mut self.stages {
+        for (index, stage) in self.stages.iter_mut().enumerate() {
             let result = stage
                 .client
-                .execute_forward(&stage.assignment, &current)
+                .execute_forward(
+                    &stage.assignment,
+                    &current,
+                    last_row_only && index == last_index,
+                )
                 .await?;
             total_execution_us += result.execution_time_us;
             current = TensorPayload {
@@ -242,6 +279,15 @@ impl LoadedPipeline {
             output_shape: current.shape,
             output_data_type: current.data_type,
         })
+    }
+
+    /// Whether the final stage advertised `supports_last_row_logits` in its
+    /// handshake. Only the last stage can answer with logits, so only its
+    /// capability matters.
+    pub fn supports_last_row_logits(&self) -> bool {
+        self.stages
+            .last()
+            .is_some_and(|stage| stage.supports_last_row_logits)
     }
 
     /// Releases every worker's layer range. Consumes the pipeline so it cannot
@@ -340,7 +386,7 @@ async fn load_stage(
             WorkerRpcClient::connect(&endpoint).await?
         }
     };
-    client.handshake(MASTER_ID, PROTOCOL_VERSION).await?;
+    let handshake = client.handshake(MASTER_ID, PROTOCOL_VERSION).await?;
     let response = client.load_layers(model_id, assignment).await?;
     if !response.success {
         return Err(format!(
@@ -354,6 +400,7 @@ async fn load_stage(
     Ok(PipelineStage {
         assignment: assignment.clone(),
         client,
+        supports_last_row_logits: handshake.supports_last_row_logits,
     })
 }
 
@@ -413,7 +460,7 @@ impl RpcPipelineEngine {
 
         let mut client = WorkerRpcClient::connect(&endpoint).await?;
         client.handshake(MASTER_ID, PROTOCOL_VERSION).await?;
-        client.execute_forward(assignment, &payload).await
+        client.execute_forward(assignment, &payload, false).await
     }
 }
 

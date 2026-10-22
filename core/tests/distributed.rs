@@ -68,6 +68,100 @@ async fn loads_runs_and_unloads_in_layer_order_across_workers() {
 }
 
 #[tokio::test]
+async fn asks_only_the_final_stage_for_the_last_logits_row() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) =
+        serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone()).with_last_row_logits()).await;
+    let (port_b, server_b) =
+        serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone()).with_last_row_logits()).await;
+    let plan = [
+        assignment("phone-a", port_a, 0, 3),
+        assignment("phone-b", port_b, 4, 7),
+    ];
+
+    let mut pipeline = LoadedPipeline::load("llama-3-8b", &plan)
+        .await
+        .expect("load pipeline");
+    assert!(
+        pipeline.supports_last_row_logits(),
+        "the head advertised the capability in its handshake"
+    );
+    pipeline
+        .forward_with_last_row_only(sample_payload())
+        .await
+        .expect("forward");
+    pipeline.unload().await.expect("unload");
+
+    let log = events(&log);
+    assert!(
+        log.contains(&"forward:phone-a".to_string()),
+        "an intermediate stage carries hidden activations, so it must not be asked for a logits row: {log:?}"
+    );
+    assert!(
+        log.contains(&"forward:phone-b:last-row".to_string()),
+        "the final stage must be asked for one row: {log:?}"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
+async fn a_whole_logits_forward_still_asks_every_stage_for_every_row() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) =
+        serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone()).with_last_row_logits()).await;
+    let (port_b, server_b) =
+        serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone()).with_last_row_logits()).await;
+    let plan = [
+        assignment("phone-a", port_a, 0, 3),
+        assignment("phone-b", port_b, 4, 7),
+    ];
+
+    let mut pipeline = LoadedPipeline::load("llama-3-8b", &plan)
+        .await
+        .expect("load pipeline");
+    // `forward` is the whole-logits path (debug/one-shot callers); the
+    // generation path opts in explicitly, so the hint must not leak into it.
+    pipeline.forward(sample_payload()).await.expect("forward");
+    pipeline.unload().await.expect("unload");
+
+    let log = events(&log);
+    assert!(log.contains(&"forward:phone-a".to_string()), "{log:?}");
+    assert!(
+        log.contains(&"forward:phone-b".to_string()),
+        "whole-logits forward must not ask for one row: {log:?}"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
+async fn an_old_head_is_not_reported_as_capable() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (port_a, server_a) =
+        serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone()).with_last_row_logits()).await;
+    // phone-b predates the contract: no capability bit.
+    let (port_b, server_b) = serve_mock(MockWorker::new("phone-b", 0xB2, 250, log.clone())).await;
+    let plan = [
+        assignment("phone-a", port_a, 0, 3),
+        assignment("phone-b", port_b, 4, 7),
+    ];
+
+    let pipeline = LoadedPipeline::load("llama-3-8b", &plan)
+        .await
+        .expect("load pipeline");
+    assert!(
+        !pipeline.supports_last_row_logits(),
+        "only the final stage produces logits, so an old head keeps the whole-logits wire guard even when earlier stages are new"
+    );
+
+    server_a.abort();
+    server_b.abort();
+}
+
+#[tokio::test]
 async fn establishes_layer_order_from_an_out_of_order_plan() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (port_a, server_a) = serve_mock(MockWorker::new("phone-a", 0xA1, 100, log.clone())).await;
