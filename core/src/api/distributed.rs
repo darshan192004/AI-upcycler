@@ -35,7 +35,7 @@ use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use crate::rpc::engine::{
     ActivationType, ExecutionResult, LoadedPipeline, TensorPayload, WorkerTransportSource,
 };
-use crate::scheduler::planner::{LayerAssignment, LayerScheduler, ModelSpec};
+use crate::scheduler::planner::{order_plan_nodes, LayerAssignment, LayerScheduler, ModelSpec};
 use crate::store::Store;
 
 use super::backend::{GenerationBackend, GenerationChunk, GenerationRequest};
@@ -674,17 +674,12 @@ impl AdaptiveBackend {
             activation_bytes: 0,
             quantization: row.quantization_format.clone(),
         };
-        // The scheduler fills nodes in the ORDER IT IS HAND them, and the
-        // registry's map order is arbitrary: sort deterministically (small
-        // free RAM first) so multi-stage plans are stable - a node with room
-        // for everything must not starve the smaller ones just because the
-        // HashMap listed it first.
+        // The planner fills nodes in the order it is handed them, and the
+        // registry's map order is arbitrary: use the shared plan order
+        // (smallest free RAM first) so multi-stage plans are stable and the
+        // topology display can show the same plan (tasks.md, item 5).
         let mut nodes = nodes;
-        nodes.sort_by(|a, b| {
-            a.free_ram_bytes
-                .cmp(&b.free_ram_bytes)
-                .then_with(|| a.node_id.cmp(&b.node_id))
-        });
+        order_plan_nodes(&mut nodes);
         let plan = LayerScheduler::compute_plan(&spec, &nodes, &self.thermal_hints());
         if plan.assignments.is_empty() {
             return None;

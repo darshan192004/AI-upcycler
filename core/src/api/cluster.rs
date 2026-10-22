@@ -12,7 +12,7 @@ use crate::api::{ApiResult, AppState, HostInfo};
 use crate::discovery::mdns::DiscoveredNode;
 use crate::rpc::client::WorkerRpcClient;
 use crate::rpc::engine::WorkerTransportSource;
-use crate::scheduler::planner::{LayerScheduler, ModelSpec, ThermalHints};
+use crate::scheduler::planner::{order_plan_nodes, LayerScheduler, ModelSpec, ThermalHints};
 use crate::store::{NewBenchmark, NewNode};
 
 /// How the master sees a node in the topology graph.
@@ -74,9 +74,7 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
     workers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
     let master = master_node(&state.host);
-    let mut plan_nodes = Vec::with_capacity(workers.len() + 1);
-    plan_nodes.push(master.clone());
-    plan_nodes.extend(workers.iter().cloned());
+    let plan_nodes = display_plan_nodes(master.clone(), &workers);
 
     let model = state.store.list_models()?.into_iter().next();
 
@@ -340,6 +338,18 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The node list the topology display plans against: the master first (the host
+/// fallback holder), then the workers in the **same order the serving path
+/// uses** (`order_plan_nodes`), so a mixed cluster cannot show ranges nobody
+/// serves. The JSON node list keeps its own node-id order for a stable UI.
+fn display_plan_nodes(master: DiscoveredNode, workers: &[DiscoveredNode]) -> Vec<DiscoveredNode> {
+    let mut plan_nodes = Vec::with_capacity(workers.len() + 1);
+    plan_nodes.push(master);
+    plan_nodes.extend(workers.iter().cloned());
+    order_plan_nodes(&mut plan_nodes[1..]);
+    plan_nodes
+}
+
 fn master_node(host: &HostInfo) -> DiscoveredNode {
     let ram_bytes = host.total_ram_mb * 1024 * 1024;
     DiscoveredNode {
@@ -539,5 +549,22 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a.memory_bandwidth_mbs, c.memory_bandwidth_mbs);
         assert_eq!(a.network_ping_ms, 1.5);
+    }
+
+    /// The display and the serving path must hand layers out in the same node
+    /// order; otherwise a mixed cluster shows ranges nobody serves (tasks.md,
+    /// item 5). The master keeps the fallback slot, the workers follow RAM.
+    #[test]
+    fn the_displayed_plan_orders_workers_by_ram_like_serving() {
+        let plan_nodes = display_plan_nodes(
+            node("master", 32 << 30),
+            &[node("big", 8 << 30), node("small", 1 << 30)],
+        );
+        let ids: Vec<&str> = plan_nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["master", "small", "big"],
+            "smallest free RAM first, then node id: the order fill_layers uses"
+        );
     }
 }
