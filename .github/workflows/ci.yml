@@ -14,10 +14,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      # The toolchain is pinned in rust-toolchain.toml, not in this workflow:
+      # CI formats, lints and tests with exactly the compiler a checkout uses.
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: |
+          # Install the exact toolchain pinned in rust-toolchain.toml; rustup
+          # activates it from that file in this repository. Then fail loudly if
+          # some other toolchain is active, so this pin cannot silently rot.
+          pin=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup show active-toolchain | grep -q "$pin" || { echo "::error::active toolchain is not the pinned $pin"; exit 1; }
 
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
@@ -40,10 +46,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      # The toolchain is pinned in rust-toolchain.toml, not in this workflow:
+      # CI formats, lints and tests with exactly the compiler a checkout uses.
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: |
+          # Install the exact toolchain pinned in rust-toolchain.toml; rustup
+          # activates it from that file in this repository. Then fail loudly if
+          # some other toolchain is active, so this pin cannot silently rot.
+          pin=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup show active-toolchain | grep -q "$pin" || { echo "::error::active toolchain is not the pinned $pin"; exit 1; }
 
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
@@ -66,10 +78,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      # The toolchain is pinned in rust-toolchain.toml, not in this workflow:
+      # CI formats, lints and tests with exactly the compiler a checkout uses.
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: |
+          # Install the exact toolchain pinned in rust-toolchain.toml; rustup
+          # activates it from that file in this repository. Then fail loudly if
+          # some other toolchain is active, so this pin cannot silently rot.
+          pin=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup show active-toolchain | grep -q "$pin" || { echo "::error::active toolchain is not the pinned $pin"; exit 1; }
 
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
@@ -92,10 +110,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      # The toolchain is pinned in rust-toolchain.toml, not in this workflow:
+      # CI formats, lints and tests with exactly the compiler a checkout uses.
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        run: |
+          # Install the exact toolchain pinned in rust-toolchain.toml; rustup
+          # activates it from that file in this repository. Then fail loudly if
+          # some other toolchain is active, so this pin cannot silently rot.
+          pin=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup show active-toolchain | grep -q "$pin" || { echo "::error::active toolchain is not the pinned $pin"; exit 1; }
 
       # Tauri v2 links against webkit2gtk-4.1 (libsoup3) on Linux.
       - name: Install Linux system dependencies

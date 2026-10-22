@@ -1,0 +1,14 @@
+# The Rust toolchain this repository builds, formats and lints with.
+#
+# CI installs exactly this file (see the "Setup Rust Toolchain" steps in
+# .github/workflows/), and rustup honours it for any local checkout, so a
+# change in rustfmt's opinion lands once, here, instead of breaking a PR that
+# formatted cleanly on the machine that wrote it (see #89).
+#
+# Bumping: update `channel` here, run `cargo fmt --all` and
+# `cargo clippy --workspace --all-targets -- -D warnings`, and commit any
+# resulting churn in the same change.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
