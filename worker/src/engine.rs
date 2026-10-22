@@ -523,8 +523,12 @@ impl WorkerService for WorkerEngine {
     ) -> Result<Response<HealthResponse>, Status> {
         let (_, free) = Self::host_memory();
         Ok(Response::new(HealthResponse {
-            battery_percentage: 0.0,
-            cpu_temp_celsius: 0.0,
+            // A desktop has no battery and no thermal sensor to read. Report
+            // the "I cannot measure this" sentinel (-1), the same one the
+            // Android worker uses, instead of a 0.0 the master would render
+            // as "0% charged, 0 °C" (spec 2026-10-22, D-E3).
+            battery_percentage: -1.0,
+            cpu_temp_celsius: -1.0,
             free_ram_bytes: free as i64,
         }))
     }

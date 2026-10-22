@@ -1,3 +1,4 @@
+use crate::discovery::mdns::DiscoveredNode;
 use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
 use crate::scheduler::planner::LayerAssignment;
 use serde::{Deserialize, Serialize};
@@ -420,6 +421,34 @@ impl RpcPipelineEngine {
 /// they parse as a valid URI authority (e.g. `http://[fe80::1]:50052`).
 pub fn http_endpoint(ip_address: &str, port: u16) -> String {
     endpoint(ip_address, port, "http")
+}
+
+/// Dials one worker over the transport it actually serves on (spec
+/// 2026-10-21, D-C3): mutual TLS for an enrolled worker, plaintext otherwise.
+///
+/// The rule lives here so the benchmark probe and the health poller cannot
+/// drift apart (spec 2026-10-22, D-E4).
+pub async fn dial_worker(
+    transports: &dyn WorkerTransportSource,
+    node: &DiscoveredNode,
+) -> Result<WorkerRpcClient, String> {
+    match transports.transport_for(&node.node_id)? {
+        WorkerTransport::Plaintext => {
+            let endpoint = http_endpoint(&node.ip_address, node.port);
+            WorkerRpcClient::connect(&endpoint).await
+        }
+        WorkerTransport::MutualTls(config) => {
+            let endpoint = https_endpoint(&node.ip_address, node.port);
+            WorkerRpcClient::connect_tls(
+                &endpoint,
+                &config.ca_pem,
+                &config.client_cert_pem,
+                &config.client_key_pem,
+                host(&node.ip_address),
+            )
+            .await
+        }
+    }
 }
 
 /// Builds the `https://host:port` endpoint used by the mTLS transport.

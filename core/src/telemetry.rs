@@ -23,13 +23,35 @@ pub struct NodeEventData {
 
 /// Per-worker telemetry carried inside a [`GenerationMetrics`] event.
 ///
-/// Thermal/battery values are placeholders (`0.0`) until the worker telemetry
-/// channel lands; see `docs/tasks.md`.
-#[derive(Debug, Clone, Serialize)]
+/// Thermal/battery values are `None` when the worker cannot measure them —
+/// the master never fills in a placeholder zero (spec 2026-10-22, D-E3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkerTelemetry {
     pub id: String,
-    pub temp_celsius: f64,
-    pub battery_pct: f64,
+    pub temp_celsius: Option<f64>,
+    pub battery_pct: Option<f64>,
+}
+
+/// One worker's latest health snapshot, as published to the dashboard.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkerHealth {
+    pub id: String,
+    /// CPU temperature in celsius; `None` when the worker cannot measure it.
+    pub temp_celsius: Option<f64>,
+    /// Battery charge in percent; `None` when the worker cannot measure it.
+    pub battery_pct: Option<f64>,
+    pub free_ram_bytes: u64,
+    /// When the snapshot was taken (Unix epoch milliseconds).
+    pub observed_at_epoch_ms: u64,
+}
+
+/// The freshest cluster telemetry, published after every poll cycle.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkerHealthEventData {
+    /// The master's own RAM utilization; `None` when it could not be read.
+    pub master_ram_utilization_pct: Option<f64>,
+    /// One entry per worker that has ever answered.
+    pub nodes: Vec<WorkerHealth>,
 }
 
 /// Inference throughput/utilisation event emitted while tokens stream.
@@ -37,7 +59,8 @@ pub struct WorkerTelemetry {
 pub struct GenerationMetrics {
     pub tokens_per_second: f64,
     pub current_token: u64,
-    pub master_ram_utilization_pct: f64,
+    /// The master's own RAM utilization; `None` when it could not be read.
+    pub master_ram_utilization_pct: Option<f64>,
     pub worker_nodes: Vec<WorkerTelemetry>,
 }
 
@@ -77,6 +100,10 @@ pub enum TelemetryEvent {
         timestamp: u64,
         data: GenerationMetrics,
     },
+    WorkerHealth {
+        timestamp: u64,
+        data: WorkerHealthEventData,
+    },
     ModelDownloadProgress {
         timestamp: u64,
         data: DownloadProgressData,
@@ -100,6 +127,14 @@ impl TelemetryEvent {
 
     pub fn generation_metrics(data: GenerationMetrics) -> Self {
         Self::GenerationMetrics {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    /// The freshest worker health, published after every poll cycle.
+    pub fn worker_health(data: WorkerHealthEventData) -> Self {
+        Self::WorkerHealth {
             timestamp: now_epoch_secs(),
             data,
         }
