@@ -11,9 +11,10 @@
 //! streaming token, so it reads the cache instead of dialing anyone.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::api::AppState;
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use crate::rpc::engine::{dial_worker, WorkerTransportSource};
 use crate::telemetry::{TelemetryBus, TelemetryEvent, WorkerHealth, WorkerHealthEventData};
@@ -124,20 +125,20 @@ impl HostMemorySource for SysinfoHostMemory {
 ///
 /// Spawned by the API server so every embedder of the core API gets live
 /// telemetry without extra wiring.
-pub async fn worker_health_poll(
-    registry: Arc<NodeRegistry>,
-    transports: Arc<dyn WorkerTransportSource>,
-    telemetry: TelemetryBus,
-    cache: Arc<TelemetryCache>,
-    host_memory: Arc<dyn HostMemorySource>,
-) {
+///
+/// The transport source is resolved **per cycle**, not once at spawn, so a
+/// pairing that completes while the app is running is picked up on the next
+/// poll — and the same resolution path the benchmark probe uses applies
+/// (D-E4).
+pub async fn worker_health_poll(state: AppState) {
     loop {
+        let transports = state.transports();
         poll_once(
-            &registry,
+            &state.registry,
             transports.as_ref(),
-            &telemetry,
-            &cache,
-            host_memory.as_ref(),
+            &state.telemetry,
+            &state.telemetry_cache,
+            state.host_memory.as_ref(),
         )
         .await;
         tokio::time::sleep(HEALTH_POLL_INTERVAL).await;

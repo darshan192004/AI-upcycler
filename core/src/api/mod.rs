@@ -284,13 +284,7 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
     // measured battery/temperature instead of placeholders. It lives here
     // rather than in the desktop shell so every embedder of the core API gets
     // live telemetry.
-    tokio::spawn(crate::worker_health::worker_health_poll(
-        state.registry.clone(),
-        state.transports(),
-        state.telemetry.clone(),
-        state.telemetry_cache.clone(),
-        state.host_memory.clone(),
-    ));
+    tokio::spawn(crate::worker_health::worker_health_poll(state.clone()));
 
     axum::serve(listener, router(state)).await
 }

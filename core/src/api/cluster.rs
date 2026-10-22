@@ -13,7 +13,6 @@ use crate::discovery::mdns::DiscoveredNode;
 use crate::rpc::client::WorkerRpcClient;
 use crate::rpc::engine::WorkerTransportSource;
 use crate::scheduler::planner::{LayerScheduler, ModelSpec};
-use crate::security::SecurityState;
 use crate::store::{NewBenchmark, NewNode};
 
 /// How the master sees a node in the topology graph.
@@ -158,8 +157,9 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn benchmark(State(state): State<AppState>) -> ApiResult<Json<BenchmarkResponse>> {
     let started = Instant::now();
-    let benchmarker =
-        ProbeBenchmarker::new(state.security.clone(), state.worker_transports.clone());
+    // One resolution path for every dial: the enrollment-aware rule, or the
+    // test override (spec 2026-10-22, D-E4).
+    let benchmarker = ProbeBenchmarker::with_transports(state.transports());
     let mut nodes_tested = 0u32;
     let mut nodes_failed = 0u32;
 
@@ -237,29 +237,17 @@ pub trait HardwareBenchmarker: Send + Sync {
     async fn benchmark(&self, node: &DiscoveredNode) -> Result<NodeBenchmark, String>;
 }
 
-/// Resolves a node's *benchmark* dial the way that node actually serves
-/// (D-C3): mTLS once it has completed pairing against this master's CA,
-/// plaintext until then.
-///
-/// The rule itself lives in [`crate::security::EnrollmentAwareTransports`],
-/// shared with the health poller so the two cannot drift (D-E4).
-type BenchmarkTransports = crate::security::EnrollmentAwareTransports;
-
 /// Probes each node over the transport it actually serves on (D-C3).
 pub struct ProbeBenchmarker {
     transports: Arc<dyn WorkerTransportSource>,
 }
 
 impl ProbeBenchmarker {
-    /// Production wiring: derives transports from the live pairing enrollment
-    /// registry. `override_transports` exists only for tests, which dial
-    /// loopback mock workers and cannot complete a pairing.
-    pub fn new(
-        security: Arc<SecurityState>,
-        override_transports: Option<Arc<dyn WorkerTransportSource>>,
-    ) -> Self {
-        let transports =
-            override_transports.unwrap_or_else(|| Arc::new(BenchmarkTransports::new(security)));
+    /// Dials every node with the given transport source. Production resolves
+    /// it through [`crate::api::AppState::transports`] — the enrollment-aware
+    /// rule (mTLS once paired, plaintext until then, D-C3); tests inject a
+    /// plaintext loopback source.
+    pub fn with_transports(transports: Arc<dyn WorkerTransportSource>) -> Self {
         Self { transports }
     }
 
