@@ -104,6 +104,18 @@ pub struct PartitioningPlan {
 
 pub struct LayerScheduler;
 
+/// The one node order both plan callers use: smallest free RAM first, then
+/// node id. [`fill_layers`] hands layers out in the order it is given, so a
+/// shared order is what stops the topology display and the serving path from
+/// disagreeing about which worker holds which range on a mixed cluster.
+pub fn order_plan_nodes(nodes: &mut [DiscoveredNode]) {
+    nodes.sort_by(|a, b| {
+        a.free_ram_bytes
+            .cmp(&b.free_ram_bytes)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+}
+
 impl LayerScheduler {
     /// Solves layer allocation using hardware-aware dynamic programming algorithm
     ///
@@ -599,5 +611,28 @@ mod tests {
             assert_eq!(plan.total_layers_assigned, next_expected);
             assert!(plan.total_layers_assigned <= model.total_layers);
         }
+    }
+
+    /// One order, both plan callers (topology display and serving): smallest
+    /// free RAM first, then node id, independent of the input order.
+    #[test]
+    fn plan_nodes_are_ordered_smallest_ram_first_then_by_id() {
+        let mut nodes = vec![
+            node("big", 8 << 30),
+            node("small", 1 << 30),
+            node("mid", 4 << 30),
+        ];
+        order_plan_nodes(&mut nodes);
+        let ids: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["small", "mid", "big"]);
+
+        let mut same_ram = vec![node("b", 2 << 30), node("a", 2 << 30)];
+        order_plan_nodes(&mut same_ram);
+        let ids: Vec<&str> = same_ram.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "ties break on node id, never on map order"
+        );
     }
 }
