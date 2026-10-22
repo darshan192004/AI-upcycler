@@ -64,13 +64,18 @@ export const useClusterStore = create<ClusterState>((set, get) => ({
       }
       case 'generation_metrics': {
         const history = get().generationHistory;
-        set({
+        set((state) => ({
           latestMetrics: event.data,
           generationHistory: [
             ...history,
             event.data.tokens_per_second,
           ].slice(-HISTORY_CAP),
-        });
+          // Both events carry the same cached master reading, so whichever
+          // arrives last is the fresher one. A null reading never overwrites
+          // a known one: "unknown" must not erase a measurement.
+          masterRamUtilizationPct:
+            event.data.master_ram_utilization_pct ?? state.masterRamUtilizationPct,
+        }));
         break;
       }
       case 'worker_health': {

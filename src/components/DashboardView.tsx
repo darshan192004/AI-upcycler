@@ -34,9 +34,11 @@ export function DashboardView() {
   const totalGb = topology ? topology.total_pooled_ram_mb / 1024 : 0;
   const usedGb = topology ? topology.used_pooled_ram_mb / 1024 : 0;
   const tokS = latestMetrics?.tokens_per_second ?? 0;
-  // The poll publishes the master's own RAM every cycle; the generation
-  // metrics carry the same reading. Unknown stays unknown — never "0.0%".
-  const ramPct = masterRamPct ?? latestMetrics?.master_ram_utilization_pct ?? null;
+  // One source of truth: the store keeps the freshest master RAM reading
+  // from whichever event arrived last (the poll publishes it every cycle,
+  // the generation metrics carry the same cached reading). Unknown stays
+  // unknown — never "0.0%".
+  const ramPct = masterRamPct;
   const mdnsOffline = topology?.discovery?.mdns === 'unavailable';
 
   if (!apiOnline && !topology) {
