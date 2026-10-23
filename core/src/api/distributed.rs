@@ -609,6 +609,29 @@ pub struct AdaptiveBackend {
     cluster: Arc<AsyncMutex<HashMap<String, Arc<DistributedBackend>>>>,
 }
 
+/// The worker nodes a cluster request would plan over, in the order the
+/// scheduler fills them: **paired workers only**, smallest free RAM first.
+///
+/// The topology view asks the same question (spec 2026-10-22, D-F4), so the
+/// dashboard shows the plan a request would actually use — not a hypothetical
+/// one that hands layers to the master or to a phone that was never paired and
+/// therefore cannot be dialed.
+pub(crate) fn serving_plan_nodes(
+    registry: &NodeRegistry,
+    enrollments: &crate::security::EnrollmentRegistry,
+) -> Vec<DiscoveredNode> {
+    let mut nodes: Vec<DiscoveredNode> = registry
+        .list_nodes()
+        .into_iter()
+        .filter(|node| enrollments.is_enrolled(&node.node_id))
+        .collect();
+    // One comparator owns the order (see `order_plan_nodes`): the scheduler
+    // fills nodes in the order it is handed them, and the registry's map order
+    // is arbitrary.
+    order_plan_nodes(&mut nodes);
+    nodes
+}
+
 impl AdaptiveBackend {
     /// Production transport source = the pairing enrollment registry.
     pub fn new(
@@ -649,12 +672,7 @@ impl AdaptiveBackend {
             return Some(cached.clone());
         }
 
-        let nodes: Vec<DiscoveredNode> = self
-            .registry
-            .list_nodes()
-            .into_iter()
-            .filter(|node| self.security.enrollments.is_enrolled(&node.node_id))
-            .collect();
+        let nodes = serving_plan_nodes(&self.registry, &self.security.enrollments);
         if nodes.is_empty() {
             return None;
         }
@@ -674,12 +692,6 @@ impl AdaptiveBackend {
             activation_bytes: 0,
             quantization: row.quantization_format.clone(),
         };
-        // The planner fills nodes in the order it is handed them, and the
-        // registry's map order is arbitrary: use the shared plan order
-        // (smallest free RAM first) so multi-stage plans are stable and the
-        // topology display can show the same plan (tasks.md, item 5).
-        let mut nodes = nodes;
-        order_plan_nodes(&mut nodes);
         let plan = LayerScheduler::compute_plan(&spec, &nodes, &self.thermal_hints());
         if plan.assignments.is_empty() {
             return None;
@@ -783,6 +795,47 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    // ---- serving plan node set -------------------------------------------
+
+    fn discovered(node_id: &str, free_ram_bytes: u64) -> DiscoveredNode {
+        DiscoveredNode {
+            node_id: node_id.into(),
+            device_name: node_id.into(),
+            ip_address: "127.0.0.1".into(),
+            port: 1,
+            total_ram_bytes: free_ram_bytes,
+            free_ram_bytes,
+            connection_type: "WIFI_MDNS".into(),
+            latency_ms: 1.0,
+            last_seen_epoch_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_serving_plan_is_paired_workers_in_scheduler_order() {
+        let registry = NodeRegistry::new();
+        registry.register_or_update(discovered("roomy", 4_000));
+        registry.register_or_update(discovered("unpaired", 100));
+        registry.register_or_update(discovered("tight", 1_000));
+        let enrollments = crate::security::EnrollmentRegistry::new();
+        enrollments.enroll("roomy", "roomy", vec![]);
+        enrollments.enroll("tight", "tight", vec![]);
+
+        let planned = serving_plan_nodes(&registry, &enrollments);
+        let ids: Vec<&str> = planned.iter().map(|n| n.node_id.as_str()).collect();
+        // The unpaired phone is dropped even though it has the least RAM; the
+        // rest are ordered the way the scheduler fills layers (smallest first).
+        assert_eq!(ids, ["tight", "roomy"]);
+    }
+
+    #[test]
+    fn nothing_paired_means_no_plan() {
+        let registry = NodeRegistry::new();
+        registry.register_or_update(discovered("phone", 1_000));
+        let enrollments = crate::security::EnrollmentRegistry::new();
+        assert!(serving_plan_nodes(&registry, &enrollments).is_empty());
+    }
 
     // ---- sampler ---------------------------------------------------------
 

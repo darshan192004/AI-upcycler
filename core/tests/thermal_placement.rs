@@ -69,6 +69,9 @@ async fn a_hot_worker_rests_and_the_topology_says_why() {
     let registry = Arc::new(NodeRegistry::new());
     registry.register_or_update(node("hot", hot_port, ram));
     registry.register_or_update(node("cool", cool_port, ram));
+    // Sorts before the paired workers, so if the plan ever includes it the
+    // layer assertions below fail instead of passing by accident.
+    registry.register_or_update(node("a-unpaired", 1, ram));
 
     let store = Arc::new(Store::open_in_memory().expect("store"));
     store
@@ -100,6 +103,12 @@ async fn a_hot_worker_rests_and_the_topology_says_why() {
     )
     .with_worker_transports(Arc::new(PlaintextTransports))
     .with_telemetry_cache(cache.clone());
+
+    // A real request only plans over paired workers; these two are paired, the
+    // third discovered node is not, and the master is never in the plan.
+    for id in ["hot", "cool"] {
+        state.security.enrollments.enroll(id, id, vec![]);
+    }
 
     // One poll cycle: the workers report their real temperature.
     poll_once(
@@ -169,6 +178,33 @@ async fn a_hot_worker_rests_and_the_topology_says_why() {
         "the cool worker carries the load"
     );
 
+    // The displayed plan is the serving plan: masters and unpaired phones are
+    // listed with their capacity but receive no layers (spec D-F4).
+    let master_node = nodes
+        .iter()
+        .find(|n| n["node_id"] == "master")
+        .expect("the master is in the topology");
+    assert!(
+        master_node["assigned_layers"]
+            .as_array()
+            .expect("assigned layers")
+            .is_empty(),
+        "the master coordinates, it holds no layers, got {:?}",
+        master_node["assigned_layers"]
+    );
+    let unpaired_node = nodes
+        .iter()
+        .find(|n| n["node_id"] == "a-unpaired")
+        .expect("the unpaired node is still listed");
+    assert!(
+        unpaired_node["assigned_layers"]
+            .as_array()
+            .expect("assigned layers")
+            .is_empty(),
+        "an unpaired phone cannot be dialed, so it holds no layers, got {:?}",
+        unpaired_node["assigned_layers"]
+    );
+
     // The master has no measurement, so it is never capped and never listed.
     assert!(
         !thermal.iter().any(|t| t["node_id"] == "master"),
@@ -227,6 +263,10 @@ async fn a_cluster_that_needs_the_hot_worker_reports_the_relaxation() {
     )
     .with_worker_transports(Arc::new(PlaintextTransports))
     .with_telemetry_cache(cache.clone());
+
+    for id in ["hot", "small"] {
+        state.security.enrollments.enroll(id, id, vec![]);
+    }
 
     poll_once(
         &state.registry,
