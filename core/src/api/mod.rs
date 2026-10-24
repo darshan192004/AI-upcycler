@@ -24,13 +24,14 @@ use crate::discovery::mdns::NodeRegistry;
 use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
+use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 /// Shared, cheaply-cloneable server state handed to every handler.
@@ -245,6 +246,65 @@ fn default_models_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("models"))
 }
 
+/// Whether a browser may use the loopback API (spec 2026-10-24, D-G1).
+///
+/// The bundled desktop shell is served from a Tauri custom protocol, and
+/// `tauri dev` from a localhost port; every other origin is a web page the user
+/// happens to have open and gets no CORS grant. Matching is on the parsed host,
+/// never a prefix or suffix, so `http://localhost.evil.com` is not localhost and
+/// `http://tauri.localhost.evil.com` is not the shell.
+pub(crate) fn browser_origin_is_allowed(origin: &str) -> bool {
+    let origin = origin.trim();
+    if origin.eq_ignore_ascii_case("tauri://localhost") {
+        return true;
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+
+    // An IPv6 literal is bracketed; keep it whole so the port split below does
+    // not trip over the colons inside the address.
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        match after_bracket.split_once(']') {
+            Some((address, _)) => format!("[{address}]"),
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or_default().to_string()
+    };
+
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost"
+    )
+}
+
+/// The CORS policy shared by the main and pairing listeners (spec 2026-10-24,
+/// D-G2). Refused origins get no `Access-Control-Allow-Origin` at all, which is
+/// what makes the browser drop the response.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            origin
+                .to_str()
+                .map(browser_origin_is_allowed)
+                .unwrap_or(false)
+        }))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+        // Some Chromium builds send a Private Network Access preflight when a
+        // page asks for a loopback address; grant it only to allowed origins.
+        .allow_private_network(true)
+}
+
 /// Builds the application router (used by the server and by integration tests).
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -257,7 +317,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/pairing/enroll", post(pairing::enroll))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(state)
 }
 
@@ -276,7 +336,7 @@ pub fn pairing_router(state: AppState) -> Router {
     Router::new()
         .route("/api/pairing/enroll", post(pairing::enroll))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(state)
 }
 
@@ -365,5 +425,44 @@ mod tests {
     fn rejects_malformed_timestamps() {
         assert_eq!(sqlite_timestamp_to_epoch("nonsense"), None);
         assert_eq!(sqlite_timestamp_to_epoch("2025-13-01 00:00:00"), None);
+    }
+
+    #[test]
+    fn accepts_the_shell_and_localhost_origins() {
+        for origin in [
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://localhost:1420",
+            "https://localhost",
+            "http://127.0.0.1:8080",
+            "http://[::1]:1420",
+        ] {
+            assert!(
+                browser_origin_is_allowed(origin),
+                "{origin} is a shell or localhost origin and must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_web_pages_and_lookalike_hosts() {
+        for origin in [
+            "https://evil.example",
+            "https://localtest.me",
+            "http://localhost.evil.com",
+            "http://tauri.localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://localhost@evil.example",
+            "tauri://evil",
+            "chrome-extension://abcdefghijklmnop",
+            "null",
+            "file://",
+        ] {
+            assert!(
+                !browser_origin_is_allowed(origin),
+                "{origin} must not receive a CORS grant"
+            );
+        }
     }
 }

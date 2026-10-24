@@ -327,3 +327,26 @@ keeps its last measured snapshot, with `observed_at_epoch_ms` saying how old it 
   }
 }
 ```
+
+## 5. Browser Origins
+
+The listeners bind loopback, but a browser on the same machine is not "local"
+in the sense the threat model needs: without a CORS policy, any page the user
+visits could read the topology or start a download. The API therefore grants
+CORS only to:
+
+- `tauri://localhost` - the bundled desktop shell on Linux and macOS;
+- `http(s)://tauri.localhost` - the bundled shell on Windows and Android;
+- `http(s)://localhost[:port]`, `http(s)://127.0.0.1[:port]`, `[::1]` - the
+  `tauri dev` server and local tooling.
+
+Every other origin receives no `Access-Control-Allow-Origin` header, so the
+browser drops the response. Requests without an `Origin` header (curl, the
+Android worker, SDKs) are unaffected: CORS is enforced by browsers, not by the
+server. The telemetry WebSocket applies the same rule to its handshake and
+answers `403` to a foreign origin, because browsers do not apply CORS to
+WebSocket upgrades (spec 2026-10-24).
+
+This is not authentication. A program running as the same user can still call
+the API; that boundary is the OS account, and it stays documented as a known
+limit in `docs/tasks.md`.
