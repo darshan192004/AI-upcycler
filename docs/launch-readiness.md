@@ -88,6 +88,21 @@ exact device/build used. Until then, "works on a real cluster" stays unclaimed.
    the answer is "write to the issue tracker with the log path"), and a known
    limitations page that repeats the honest gaps from `docs/tasks.md`.
 
+### Host configuration (environment)
+
+The desktop shell reads these before it starts the API:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AI_UPCYCLER_LLAMA_SERVER` | `engine/llama-server[.exe]` beside the models dir | `llama-server` binary |
+| `AI_UPCYCLER_MODEL` | `models/qwen2.5-0.5b-instruct-q4_k_m.gguf` in the app data dir | GGUF the host serves |
+| `AI_UPCYCLER_MODELS_DIR` | app data dir `models/` | Where `/api/models/download` writes |
+| `AI_UPCYCLER_API_PORT` | `8080` | Loopback API port; invalid or `0` keeps the default |
+
+`AI_UPCYCLER_MODELS_DIR` exists because models are large and the system drive is
+often the smallest one; pointing it at another volume is supported. The pairing
+listener stays on `8081`.
+
 ### D. Known correctness limits already documented (not blockers, must be stated)
 
 - The REST API binds `127.0.0.1:8080` and has **no auth**. Fine for local-only; a
