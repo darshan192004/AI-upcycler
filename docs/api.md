@@ -77,6 +77,17 @@ data: {"id":"chatcmpl-102","object":"chat.completion.chunk","created":1743457001
 data: [DONE]
 ```
 
+### 2.3 Agents (tool calling)
+
+Coding agents (opencode, Kilo Code) use the same endpoint but send `tools` and
+expect `tool_calls` in the reply. Tool requests are served by the host
+`llama-server` only; when no host engine is configured the API returns `400`
+instead of a text answer, so the agent fails loudly rather than looping.
+
+The supported request/response subset and the exact streaming shape are
+specified in
+`docs/superpowers/specs/2026-10-24-agent-api-compatibility-design.md`.
+
 ---
 
 ## 3. Host Cluster Management REST API
