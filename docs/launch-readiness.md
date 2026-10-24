@@ -23,7 +23,7 @@ maintainer can make.
 | Android worker | debug APK, engine + mTLS + pairing, 133 JVM tests | `android-worker.yml` lane |
 | iOS worker | **does not exist** | `mobile-worker/ios/` absent |
 | Real-device proof | **never run** | tasks.md §6 checklist |
-| License | **README claims MIT, no `LICENSE` file exists** | root listing |
+| License | MIT, file present | `LICENSE`, README badge, `core/Cargo.toml` |
 | Auto-update | **none** | no updater plugin/config |
 | Installer signing | **none** | no signing config or CI secrets |
 
@@ -55,9 +55,10 @@ exact device/build used. Until then, "works on a real cluster" stays unclaimed.
 
 ### B. Distribution and trust (device-free, decision-gated)
 
-1. **`LICENSE`** - README badges and the license section point at MIT; the file
-   is missing. Add it, and add a short note that downloaded GGUF models carry
-   their own licenses.
+1. **`LICENSE`** - done: the file now exists and matches what the README badge,
+   the license section and `core/Cargo.toml` already declared (MIT). The desktop
+   bundle includes it via `bundle.licenseFile`. Downloaded GGUF models carry
+   their own licenses, which are the user's to observe.
 2. **Installer signing** - Windows code signing and macOS Developer ID +
    notarization. Needs certificates and CI secrets; without them users meet
    SmartScreen and Gatekeeper.
@@ -107,7 +108,7 @@ exact device/build used. Until then, "works on a real cluster" stays unclaimed.
 
 | Decision | Why it gates work | Recommended default |
 |---|---|---|
-| **License** | `LICENSE` must match what the README claims; affects every redistribution channel | MIT, as the README already states |
+| **License** | `LICENSE` must match what the README claims; affects every redistribution channel | **Decided 2026-10-24: MIT**, matching the README badge, the license section and `core/Cargo.toml` |
 | **Launch surface** | signing, store listings, updater hosting | Signed GitHub Releases for Windows/Linux/macOS + sideload APK first; stores later |
 | **iOS timing** | 3-6 weeks of Swift work; changes the "global" claim | After the Android+desktop beta is real-device verified |
 | **Telemetry posture** | privacy text, error reporting | No remote telemetry in v1; local logs only, user-initiated sharing |
@@ -133,7 +134,7 @@ external security audit, support rotation.
 
 ## 5. Go/no-go checklist
 
-- [ ] `LICENSE` present and consistent with README
+- [x] `LICENSE` present and consistent with README
 - [ ] Windows + macOS artifacts signed and notarized; Linux artifacts published
 - [ ] Updater feed signed, one successful upgrade from the previous tag
 - [ ] Android APK signed with a release key (or sideload-only stated publicly)
