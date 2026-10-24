@@ -15,6 +15,7 @@ use futures::stream::BoxStream;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 mod common;
@@ -855,4 +856,155 @@ async fn a_certificate_that_does_not_cover_the_dialed_address_is_refused() {
     );
 
     handle.abort();
+}
+
+// ---- Loopback browser boundary (spec 2026-10-24, D-G1 - D-G3) ----
+
+fn origin_get(origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header(header::ORIGIN, origin)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn preflight(origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("OPTIONS")
+        .uri("/api/models/download")
+        .header(header::ORIGIN, origin)
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Speaks a raw WebSocket handshake to a real loopback listener and returns
+/// the status line. The in-process `oneshot` path cannot upgrade (there is no
+/// hyper connection behind it), so the 101 case needs a socket.
+async fn websocket_status(origin: Option<&str>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral loopback port");
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state())).await.unwrap();
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = format!(
+        "GET /api/telemetry HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    if let Some(origin) = origin {
+        request.push_str(&format!("Origin: {origin}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buffer = [0u8; 128];
+    let read = stream.read(&mut buffer).await.unwrap();
+    server.abort();
+    String::from_utf8_lossy(&buffer[..read]).to_string()
+}
+
+#[tokio::test]
+async fn grants_cors_to_the_desktop_shell_and_localhost_only() {
+    for allowed in [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "http://localhost:1420",
+    ] {
+        let response = router(state()).oneshot(origin_get(allowed)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some(allowed),
+            "{allowed} is the shell or a dev server and must be granted"
+        );
+    }
+
+    let response = router(state())
+        .oneshot(origin_get("https://evil.example"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "CORS is not access control: the handler still runs"
+    );
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "a web page must not receive a grant"
+    );
+}
+
+#[tokio::test]
+async fn a_web_page_preflight_gets_no_grant() {
+    let refused = router(state())
+        .oneshot(preflight("https://evil.example"))
+        .await
+        .unwrap();
+    assert!(refused
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
+
+    let allowed = router(state())
+        .oneshot(preflight("tauri://localhost"))
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("tauri://localhost")
+    );
+    assert!(allowed
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .contains("POST"));
+}
+
+#[tokio::test]
+async fn requests_without_an_origin_are_not_touched() {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .body(Body::empty())
+        .unwrap();
+    let response = router(state()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn refuses_a_foreign_telemetry_origin_and_lets_the_shell_in() {
+    let refused = websocket_status(Some("https://evil.example")).await;
+    assert!(
+        refused.starts_with("HTTP/1.1 403"),
+        "a web page must not read telemetry; got: {refused}"
+    );
+
+    let shell = websocket_status(Some("tauri://localhost")).await;
+    assert!(
+        shell.starts_with("HTTP/1.1 101"),
+        "the bundled shell must still subscribe; got: {shell}"
+    );
+
+    let native = websocket_status(None).await;
+    assert!(
+        native.starts_with("HTTP/1.1 101"),
+        "a native client sends no origin and must still subscribe; got: {native}"
+    );
 }

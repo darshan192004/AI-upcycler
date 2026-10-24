@@ -5,13 +5,28 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::Response;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use tokio::sync::broadcast;
 
-use crate::api::AppState;
+use crate::api::{browser_origin_is_allowed, AppState};
 use crate::telemetry::{NodeEventData, TelemetryEvent};
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    // Browsers do not apply CORS to WebSocket handshakes, so the upgrade checks
+    // the origin itself (spec 2026-10-24, D-G3): only the bundled shell, a
+    // localhost dev page, or a client that sends no origin may subscribe.
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or_default();
+        if !browser_origin_is_allowed(origin) {
+            tracing::warn!(origin, "refused telemetry WebSocket from a non-app origin");
+            return (StatusCode::FORBIDDEN, "forbidden origin").into_response();
+        }
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 

@@ -89,8 +89,13 @@ exact device/build used. Until then, "works on a real cluster" stays unclaimed.
 
 ### D. Known correctness limits already documented (not blockers, must be stated)
 
-- The REST API binds `127.0.0.1:8080` with permissive CORS and **no auth**. Fine
-  for local-only; a blocker the moment the bind widens.
+- The REST API binds `127.0.0.1:8080` and has **no auth**. Fine for local-only; a
+  blocker the moment the bind widens. The browser side is bounded as of
+  2026-10-24: CORS grants only the bundled shell and localhost origins, and the
+  telemetry WebSocket refuses a foreign `Origin`.
+- The webview still has **no Content-Security-Policy** (`tauri.conf.json` says
+  `"csp": null`). Tightening it needs runtime verification of the shell's inline
+  styles; until then a compromised frontend is not sandboxed.
 - `storage_mmap` reports `enabled: false`: the host path delegates mapping to
   `llama-server`.
 - The displayed topology is the serving plan for paired workers; the master
