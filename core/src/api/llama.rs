@@ -25,7 +25,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use super::backend::{GenerationBackend, GenerationChunk, GenerationRequest};
+use super::backend::{GenerationBackend, GenerationChunk, GenerationRequest, ToolCallDelta};
 
 /// Default GGUF used when no `AI_UPCYCLER_MODEL` override is set. Matches the
 /// Hugging Face file name so models saved by the download endpoint line up.
@@ -150,6 +150,13 @@ impl LlamaCppBackend {
         let mut cmd = Command::new(server_path);
         cmd.arg("-m")
             .arg(model_path)
+            // Tool calls are rendered by the model's chat template, which
+            // llama.cpp only evaluates when the Jinja path is on. Pass it
+            // explicitly so a future default change cannot silently disable
+            // the agent path (spec D-A6).
+            .arg("--jinja")
+            .arg("-c")
+            .arg(context_size().to_string())
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
@@ -190,13 +197,31 @@ impl LlamaCppBackend {
     ) -> Result<impl futures::Stream<Item = Result<GenerationChunk, String>> + 'static, String>
     {
         let base_url = self.ensure_base_url().await?;
-        let body = json!({
+        let mut body = json!({
             "model": request.model,
             "messages": request.messages,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
             "stream": true,
         });
+        // Pass the agent fields through unchanged: the model's chat template,
+        // not this proxy, decides how a tool definition is rendered.
+        let fields = body.as_object_mut().expect("chat body is an object");
+        if let Some(tools) = &request.tools {
+            fields.insert("tools".into(), json!(tools));
+        }
+        if let Some(tool_choice) = &request.tool_choice {
+            fields.insert("tool_choice".into(), tool_choice.clone());
+        }
+        if let Some(stop) = &request.stop {
+            fields.insert("stop".into(), json!(stop));
+        }
+        if let Some(top_p) = request.top_p {
+            fields.insert("top_p".into(), json!(top_p));
+        }
+        if let Some(seed) = request.seed {
+            fields.insert("seed".into(), json!(seed));
+        }
         let resp = self
             .client
             .post(format!("{base_url}/v1/chat/completions"))
@@ -233,6 +258,12 @@ impl GenerationBackend for LlamaCppBackend {
             }
         })
     }
+
+    /// The host engine is the only backend that renders tools; its model
+    /// template decides whether a given model actually calls them.
+    fn tool_calling_available(&self) -> bool {
+        true
+    }
 }
 
 /// One decoded server-sent-event line.
@@ -240,12 +271,20 @@ impl GenerationBackend for LlamaCppBackend {
 enum SseLine {
     /// `data: [DONE]` — the stream is finished.
     Done,
-    /// A content delta from `choices[0].delta.content`.
-    Chunk(String),
+    /// A content or tool-call delta, and/or the finish reason.
+    Delta(SseDelta),
     /// A keep-alive, empty delta, or other ignorable line.
     Skip,
     /// The server signalled an error inside the stream.
     Error(String),
+}
+
+/// The parts of `choices[0]` this proxy cares about.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SseDelta {
+    content: String,
+    tool_calls: Option<Vec<ToolCallDelta>>,
+    finish_reason: Option<String>,
 }
 
 /// Incremental `data:`-line decoder that tolerates arbitrary chunk boundaries.
@@ -288,12 +327,39 @@ fn parse_sse_line(line: &str) -> SseLine {
             {
                 return SseLine::Error(message.to_string());
             }
-            match value
-                .pointer("/choices/0/delta/content")
+            let choice = value.pointer("/choices/0");
+            let delta = choice.and_then(|c| c.get("delta"));
+            let content = delta
+                .and_then(|d| d.get("content"))
                 .and_then(Value::as_str)
-            {
-                Some(content) if !content.is_empty() => SseLine::Chunk(content.to_string()),
-                _ => SseLine::Skip,
+                .unwrap_or("")
+                .to_string();
+            let tool_calls = match delta.and_then(|d| d.get("tool_calls")) {
+                Some(Value::Array(items)) => {
+                    match serde_json::from_value::<Vec<ToolCallDelta>>(Value::Array(items.clone()))
+                    {
+                        Ok(calls) if !calls.is_empty() => Some(calls),
+                        Ok(_) => None,
+                        Err(e) => {
+                            return SseLine::Error(format!("unparseable tool_calls: {e}"));
+                        }
+                    }
+                }
+                Some(_) => return SseLine::Error("tool_calls must be an array".into()),
+                None => None,
+            };
+            let finish_reason = choice
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if content.is_empty() && tool_calls.is_none() && finish_reason.is_none() {
+                SseLine::Skip
+            } else {
+                SseLine::Delta(SseDelta {
+                    content,
+                    tool_calls,
+                    finish_reason,
+                })
             }
         }
         Err(e) => SseLine::Error(format!("unparseable SSE payload: {e}")),
@@ -318,11 +384,18 @@ where
             for line in decoder.push(&text) {
                 match line {
                     SseLine::Done => return,
-                    SseLine::Chunk(content) => {
+                    SseLine::Delta(delta) => {
+                        let tokens = if !delta.content.is_empty() || delta.tool_calls.is_some() {
+                            1
+                        } else {
+                            0
+                        };
                         yield Ok(GenerationChunk {
-                            content,
-                            tokens_emitted: 1,
-                            prompt_tokens: None,
+                            content: delta.content,
+                            tokens_emitted: tokens,
+                            tool_calls: delta.tool_calls,
+                            finish_reason: delta.finish_reason,
+                            ..Default::default()
                         });
                     }
                     SseLine::Skip => {}
@@ -334,6 +407,15 @@ where
             }
         }
     }
+}
+
+/// Context window for the host engine: 8192 fits the 8 GB host with a 3B Q4
+/// model and its KV cache. `AI_UPCYCLER_CONTEXT` overrides it for larger hosts.
+fn context_size() -> u32 {
+    std::env::var("AI_UPCYCLER_CONTEXT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8192)
 }
 
 fn free_loopback_port() -> Result<u16, String> {
@@ -348,7 +430,7 @@ fn free_loopback_port() -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::backend::ChatMessage;
+    use crate::api::backend::{ChatMessage, FunctionCallDelta, FunctionDef, Stop, ToolDef};
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::StreamExt;
 
@@ -358,10 +440,12 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                ..Default::default()
             }],
             temperature: 0.7,
             max_tokens: 32,
             session_id: "s-test".into(),
+            ..Default::default()
         }
     }
 
@@ -373,7 +457,13 @@ mod tests {
         let lines = decoder.push("ta\":{\"content\":\"Hi\"}}]}\n\n");
         assert_eq!(
             lines,
-            vec![SseLine::Chunk("Hi".into()), SseLine::Skip],
+            vec![
+                SseLine::Delta(SseDelta {
+                    content: "Hi".into(),
+                    ..Default::default()
+                }),
+                SseLine::Skip
+            ],
             "split payload reassembles into one chunk plus a blank keep-alive line"
         );
         assert_eq!(decoder.push("data: [DONE]\n"), vec![SseLine::Done]);
@@ -384,7 +474,10 @@ mod tests {
         assert_eq!(parse_sse_line("data: [DONE]"), SseLine::Done);
         assert_eq!(
             parse_sse_line("data: {\"choices\":[{\"delta\":{\"content\":\"Hey\"}}]}"),
-            SseLine::Chunk("Hey".into())
+            SseLine::Delta(SseDelta {
+                content: "Hey".into(),
+                ..Default::default()
+            })
         );
         assert_eq!(
             parse_sse_line("data: {\"choices\":[{\"delta\":{}}]}"),
@@ -392,6 +485,42 @@ mod tests {
         );
         assert_eq!(parse_sse_line(": keep-alive"), SseLine::Skip);
         assert_eq!(parse_sse_line("event: foo"), SseLine::Skip);
+
+        let tool_payload = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{\"path\":" }
+                    }]
+                }
+            }]
+        });
+        assert_eq!(
+            parse_sse_line(&format!("data: {tool_payload}")),
+            SseLine::Delta(SseDelta {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    kind: Some("function".into()),
+                    function: Some(FunctionCallDelta {
+                        name: Some("read".into()),
+                        arguments: Some("{\"path\":".into()),
+                    }),
+                }]),
+                finish_reason: None,
+            })
+        );
+        assert_eq!(
+            parse_sse_line("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}"),
+            SseLine::Delta(SseDelta {
+                finish_reason: Some("tool_calls".into()),
+                ..Default::default()
+            })
+        );
         assert_eq!(
             parse_sse_line("data: {\"error\":{\"message\":\"boom\"}}"),
             SseLine::Error("boom".into())
@@ -447,6 +576,79 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         let text: String = chunks.iter().map(|c| c.content.as_str()).collect();
         assert_eq!(text, "Hello world");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_backend_forwards_tool_calls_and_the_finish_reason() {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::Json<Value>| async move {
+                assert_eq!(body["tools"][0]["function"]["name"], "read");
+                assert_eq!(body["tool_choice"], "auto");
+                assert_eq!(body["stop"], serde_json::json!(["\n\n"]));
+                assert_eq!(body["top_p"], 0.5);
+                assert_eq!(body["seed"], 42);
+                let events = vec![
+                    "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}",
+                    "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\
+                     \"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}",
+                    "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":\
+                     {\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}",
+                    "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+                    "[DONE]",
+                ];
+                let stream = futures::stream::iter(
+                    events
+                        .into_iter()
+                        .map(|e| Ok::<_, std::convert::Infallible>(Event::default().data(e))),
+                );
+                Sse::new(stream).keep_alive(KeepAlive::default())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = LlamaCppBackend::remote(format!("http://{addr}"));
+
+        let mut req = request();
+        req.tools = Some(vec![ToolDef {
+            kind: "function".into(),
+            function: FunctionDef {
+                name: "read".into(),
+                description: Some("Read a file".into()),
+                parameters: Some(serde_json::json!({ "type": "object" })),
+            },
+        }]);
+        req.tool_choice = Some(serde_json::json!("auto"));
+        req.stop = Some(Stop::Many(vec!["\n\n".into()]));
+        req.top_p = Some(0.5);
+        req.seed = Some(42);
+
+        let chunks: Vec<_> = backend
+            .generate(req)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk ok"))
+            .collect();
+
+        assert_eq!(chunks.len(), 3, "two tool deltas plus the finish reason");
+        let first = chunks[0].tool_calls.as_ref().expect("first tool delta");
+        assert_eq!(
+            first[0].function.as_ref().unwrap().name.as_deref(),
+            Some("read")
+        );
+        let second = chunks[1].tool_calls.as_ref().expect("second tool delta");
+        assert_eq!(
+            second[0].function.as_ref().unwrap().arguments.as_deref(),
+            Some("\"a.txt\"}")
+        );
+        assert_eq!(chunks[2].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(chunks[2].tokens_emitted, 0);
         server.abort();
     }
 

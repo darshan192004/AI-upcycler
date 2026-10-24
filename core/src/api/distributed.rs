@@ -382,6 +382,17 @@ impl GenerationBackend for DistributedBackend {
     ) -> BoxStream<'static, Result<GenerationChunk, String>> {
         let backend = self.clone();
         Box::pin(async_stream::stream! {
+            // The cluster samples ChatML with system/user/assistant turns and
+            // has no tool renderer. A request that needs one must never be
+            // served here, even if a caller bypassed the API guard.
+            if request.wants_tools() {
+                yield Err(
+                    "the distributed backend does not support tool calls; \
+                     use the host engine"
+                        .into(),
+                );
+                return;
+            }
             let full_ids = match backend.prompt_ids(&request.messages) {
                 Ok(ids) => ids,
                 Err(error) => {
@@ -504,6 +515,7 @@ impl GenerationBackend for DistributedBackend {
                                     content: tail,
                                     tokens_emitted: 1,
                                     prompt_tokens: Some(prefill_len),
+                                    ..Default::default()
                                 });
                             }
                             stop = true;
@@ -523,6 +535,7 @@ impl GenerationBackend for DistributedBackend {
                                     content: suffix,
                                     tokens_emitted: 1,
                                     prompt_tokens: Some(prefill_len),
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -759,13 +772,32 @@ impl GenerationBackend for AdaptiveBackend {
             cluster: self.cluster.clone(),
         };
         Box::pin(async_stream::stream! {
-            let chosen: Option<Arc<DistributedBackend>> = this.try_cluster(&request).await;
+            let wants_tools = request.wants_tools();
+            if wants_tools && !this.fallback.tool_calling_available() {
+                yield Err(
+                    "tool calls require a local host engine (llama-server); \
+                     none is available"
+                        .into(),
+                );
+                return;
+            }
+            // Agent requests are host-only in phase 1: the cluster path has no
+            // tool renderer, so it is skipped entirely rather than tried and
+            // failed (spec D-A2).
+            let chosen: Option<Arc<DistributedBackend>> = if wants_tools {
+                None
+            } else {
+                this.try_cluster(&request).await
+            };
             let serving: Arc<dyn GenerationBackend> = match chosen.clone() {
                 Some(cluster) => cluster,
                 None => this.fallback.clone(),
             };
             match chosen {
                 Some(cluster) => info!("chat generation serving from: {}", cluster.describe()),
+                None if wants_tools => {
+                    info!("chat generation serving from the host backend (tool request)")
+                }
                 None => info!("chat generation serving from the fallback backend"),
             }
             let mut inner = serving.generate(request);
@@ -773,6 +805,12 @@ impl GenerationBackend for AdaptiveBackend {
                 yield item;
             }
         })
+    }
+
+    /// Tool calls are exactly as available as the host fallback: the cluster
+    /// path never serves them.
+    fn tool_calling_available(&self) -> bool {
+        self.fallback.tool_calling_available()
     }
 }
 
@@ -798,7 +836,7 @@ fn withheld_tail(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::backend::ChatMessage;
+    use crate::api::backend::{ChatMessage, FunctionDef, ToolDef};
     use ai_upcycler_model_io::fixture::{
         default_merges, write_tiny_model, TinyModelConfig, TokenizerFixture,
     };
@@ -889,6 +927,56 @@ mod tests {
         let enrollments = crate::security::EnrollmentRegistry::new();
         let cache = crate::worker_health::TelemetryCache::new();
         assert!(serving_plan_nodes(&registry, &enrollments, &cache).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_requests_use_the_host_fallback_and_report_its_capability() {
+        struct HostBackend;
+
+        impl GenerationBackend for HostBackend {
+            fn generate(
+                &self,
+                request: GenerationRequest,
+            ) -> BoxStream<'static, Result<GenerationChunk, String>> {
+                assert!(request.wants_tools(), "the tool request reaches the host");
+                Box::pin(async_stream::stream! {
+                    yield Ok(GenerationChunk {
+                        content: "host".into(),
+                        tokens_emitted: 1,
+                        ..Default::default()
+                    });
+                })
+            }
+
+            fn tool_calling_available(&self) -> bool {
+                true
+            }
+        }
+
+        let adaptive = AdaptiveBackend::new(
+            Arc::new(NodeRegistry::new()),
+            Arc::new(Store::open_in_memory().expect("store")),
+            Arc::new(crate::security::SecurityState::default()),
+            Arc::new(HostBackend),
+            Arc::new(crate::worker_health::TelemetryCache::new()),
+        );
+        assert!(adaptive.tool_calling_available());
+
+        let mut req = request("tools", 8);
+        req.tools = Some(vec![ToolDef {
+            kind: "function".into(),
+            function: FunctionDef {
+                name: "read".into(),
+                description: None,
+                parameters: None,
+            },
+        }]);
+        let chunks: Vec<_> = adaptive.generate(req).collect().await;
+        let text: String = chunks
+            .into_iter()
+            .map(|chunk| chunk.expect("host chunk").content)
+            .collect();
+        assert_eq!(text, "host");
     }
 
     // ---- sampler ---------------------------------------------------------
@@ -1096,10 +1184,12 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "ping".into(),
+                ..Default::default()
             }],
             temperature: 0.0,
             max_tokens,
             session_id: session.into(),
+            ..Default::default()
         }
     }
 
@@ -1369,10 +1459,12 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content,
+                ..Default::default()
             }],
             temperature: 0.0,
             max_tokens,
             session_id: session.into(),
+            ..Default::default()
         }
     }
 }

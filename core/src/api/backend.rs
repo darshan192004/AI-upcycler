@@ -6,15 +6,111 @@
 //! [`StubBackend`] provides a deterministic, clearly-labelled placeholder.
 
 use futures::stream::BoxStream;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One OpenAI chat message.
+///
+/// `content` is a `String` at the boundary: agents send `null` on assistant
+/// turns that only call tools, and rejecting that would break every loop, so
+/// `null` and a missing field both become `""` (spec D-A3). The tool fields
+/// are optional and omitted from serialization when absent, so a plain chat
+/// message still goes on the wire exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+fn null_as_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// A complete tool call, as an assistant turn carries it and as the buffered
+/// response returns it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FunctionCall {
+    pub name: String,
+    /// The arguments are a JSON-encoded **string**, not an object: that is
+    /// what the OpenAI schema specifies and what agents parse.
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// One streamed tool-call fragment. llama-server sends the id/type/name once
+/// and the argument JSON in pieces; the API forwards the pieces and the
+/// buffered path merges them by `index`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolCallDelta {
+    #[serde(default)]
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FunctionCallDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+/// A tool definition supplied by the client, passed through to the engine
+/// unchanged: the model's chat template, not this server, interprets it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolDef {
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+}
+
+fn function_kind() -> String {
+    "function".into()
+}
+
+/// OpenAI's `stop` accepts one string or an array of them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Stop {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GenerationRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -23,9 +119,24 @@ pub struct GenerationRequest {
     /// The chat session id (the API's session namespace). The backend keys
     /// worker KV session ids off it; llama-server ignores it.
     pub session_id: String,
+    /// Function tools from the client. Only a host engine can render them;
+    /// the API refuses a tool request when no such engine exists (spec D-A2).
+    pub tools: Option<Vec<ToolDef>>,
+    pub tool_choice: Option<Value>,
+    pub stop: Option<Stop>,
+    pub top_p: Option<f32>,
+    pub seed: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl GenerationRequest {
+    /// True when the client asked for at least one tool. This is the routing
+    /// fact: such a request must never reach the cluster (spec D-A2).
+    pub fn wants_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GenerationChunk {
     pub content: String,
     pub tokens_emitted: u32,
@@ -34,6 +145,11 @@ pub struct GenerationChunk {
     /// (`approx_tokens`) in `usage` - the llama fallback has no token-level
     /// view of its JSON streaming.
     pub prompt_tokens: Option<u32>,
+    /// Tool-call fragments from the engine, in the order they arrived.
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// The engine's finish reason, when it sent one. The API defaults to
+    /// `"stop"`, or `"tool_calls"` when the turn produced calls.
+    pub finish_reason: Option<String>,
 }
 
 /// Produces a stream of token chunks for a chat request.
@@ -42,6 +158,15 @@ pub trait GenerationBackend: Send + Sync + 'static {
         &self,
         request: GenerationRequest,
     ) -> BoxStream<'static, Result<GenerationChunk, String>>;
+
+    /// Whether this backend can render tool definitions and return calls.
+    ///
+    /// Only a real host engine can. The cluster path samples ChatML with
+    /// system/user/assistant turns and has no tool renderer, so pretending
+    /// otherwise would return text that looks like a call but is not one.
+    fn tool_calling_available(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic offline stand-in for a real inference engine.
@@ -90,7 +215,7 @@ impl GenerationBackend for StubBackend {
                 yield Ok(GenerationChunk {
                     content: word.to_string(),
                     tokens_emitted: 1,
-                    prompt_tokens: None,
+                    ..Default::default()
                 });
             }
         })
@@ -118,10 +243,12 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "What is AI Upcycler?".into(),
+                ..Default::default()
             }],
             temperature: 0.7,
             max_tokens: 512,
             session_id: "s-test".into(),
+            ..Default::default()
         }
     }
 
@@ -166,5 +293,95 @@ mod tests {
         req.max_tokens = 3;
         let count = StubBackend::new().generate(req).count().await;
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn null_or_missing_content_becomes_empty() {
+        let null: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null
+        }))
+        .expect("null content is legal");
+        assert_eq!(null.content, "");
+        assert!(null.tool_calls.is_none());
+
+        let missing: ChatMessage =
+            serde_json::from_value(serde_json::json!({ "role": "assistant" }))
+                .expect("missing content is legal");
+        assert_eq!(missing.content, "");
+    }
+
+    #[test]
+    fn an_assistant_tool_call_turn_round_trips() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "read", "arguments": "{\"path\":\"a.txt\"}" }
+            }]
+        }))
+        .expect("tool-call turn");
+        let calls = message.tool_calls.as_ref().expect("calls");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"a.txt\"}");
+
+        let wire = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(wire["tool_calls"][0]["function"]["name"], "read");
+        assert!(wire.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn a_tool_result_turn_keeps_its_call_id() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "content": "file contents",
+            "tool_call_id": "call_1"
+        }))
+        .expect("tool turn");
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn tool_definitions_are_passed_through() {
+        let def: ToolDef = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        }))
+        .expect("tool definition");
+        assert_eq!(def.kind, "function");
+        assert_eq!(def.function.name, "read");
+        assert_eq!(
+            def.function.parameters.as_ref().unwrap()["required"][0],
+            "path"
+        );
+    }
+
+    #[test]
+    fn wants_tools_only_when_the_array_is_not_empty() {
+        let mut req = request();
+        assert!(!req.wants_tools());
+        req.tools = Some(vec![]);
+        assert!(!req.wants_tools());
+        req.tools = Some(vec![ToolDef {
+            kind: "function".into(),
+            function: FunctionDef {
+                name: "read".into(),
+                description: None,
+                parameters: None,
+            },
+        }]);
+        assert!(req.wants_tools());
     }
 }

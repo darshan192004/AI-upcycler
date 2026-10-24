@@ -3,6 +3,7 @@
 //! Both modes persist the user turn and the assistant reply to the SQLite store
 //! and publish `generation_metrics` telemetry while tokens flow.
 
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::time::Instant;
 
@@ -15,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::api::backend::{ChatMessage, GenerationRequest};
+use crate::api::backend::{
+    ChatMessage, FunctionCall, GenerationRequest, Stop, ToolCall, ToolCallDelta, ToolDef,
+};
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::discovery::mdns::NodeRegistry;
 use crate::store::{NewChatMessage, Store};
@@ -38,6 +41,16 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub tools: Option<Vec<ToolDef>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub stop: Option<Stop>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 fn default_temperature() -> f32 {
@@ -62,7 +75,7 @@ struct ChatCompletionResponse {
 struct Choice {
     index: u32,
     message: ChatMessage,
-    finish_reason: &'static str,
+    finish_reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +97,22 @@ pub async fn chat_completions(
         .get_model(&request.model)?
         .ok_or_else(|| ApiError::NotFound(format!("model '{}'", request.model)))?;
 
+    // Agent requests are host-only in phase 1 (spec D-A2). Refuse before the
+    // session or user turn is persisted, so a rejected request leaves no
+    // half-written conversation behind.
+    if request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+        && !state.backend.tool_calling_available()
+    {
+        return Err(ApiError::BadRequest(
+            "tool calls require a local host engine (llama-server); \
+             the distributed route cannot call tools"
+                .into(),
+        ));
+    }
+
     let session_id = resolve_session(&state, &request)?;
     if let Some(user) = request.messages.iter().rev().find(|m| m.role == "user") {
         state.store.append_message(&NewChatMessage {
@@ -101,6 +130,11 @@ pub async fn chat_completions(
         temperature: request.temperature,
         max_tokens: request.max_tokens,
         session_id: session_id.clone(),
+        tools: request.tools.clone(),
+        tool_choice: request.tool_choice.clone(),
+        stop: request.stop.clone(),
+        top_p: request.top_p,
+        seed: request.seed,
     };
 
     if request.stream {
@@ -125,6 +159,8 @@ async fn buffered_response(
     // The backend that encodes the prompt itself reports the TRUE prefill
     // token count on its chunks (D5); the approximation stays the fallback.
     let mut prompt_tokens: Option<u64> = None;
+    let mut tool_deltas: Vec<ToolCallDelta> = Vec::new();
+    let mut finish_reason: Option<String> = None;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(ApiError::Internal)?;
         if chunk.prompt_tokens.is_some() {
@@ -132,8 +168,22 @@ async fn buffered_response(
         }
         content.push_str(&chunk.content);
         completion_tokens += u64::from(chunk.tokens_emitted);
+        if let Some(reason) = chunk.finish_reason {
+            finish_reason = Some(reason);
+        }
+        if let Some(calls) = chunk.tool_calls {
+            tool_deltas.extend(calls);
+        }
     }
     let elapsed = started.elapsed().as_secs_f64();
+    let tool_calls = merge_tool_calls(tool_deltas);
+    // A turn that produced calls is a tool-call turn even if the engine's
+    // own reason said "stop": the agent keys its next step off this field.
+    let finish_reason = if tool_calls.is_empty() {
+        finish_reason.unwrap_or_else(|| "stop".into())
+    } else {
+        "tool_calls".into()
+    };
 
     persist_assistant(
         &state.store,
@@ -168,8 +218,14 @@ async fn buffered_response(
             message: ChatMessage {
                 role: ROLE_ASSISTANT.into(),
                 content,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                ..Default::default()
             },
-            finish_reason: "stop",
+            finish_reason,
         }],
         usage: Usage {
             prompt_tokens,
@@ -197,6 +253,9 @@ fn stream_response(
 
         let mut content = String::new();
         let mut completion_tokens: u64 = 0;
+        let mut finish_reason: Option<String> = None;
+        let mut saw_tool_calls = false;
+        let mut tool_indices: HashSet<u32> = HashSet::new();
         let mut backend = state.backend.generate(generation.clone());
         while let Some(item) = backend.next().await {
             match item {
@@ -204,7 +263,31 @@ fn stream_response(
                     completion_tokens += u64::from(chunk.tokens_emitted);
                     content.push_str(&chunk.content);
                     publish_metrics(&telemetry, &registry, &cache, completion_tokens, started.elapsed().as_secs_f64());
-                    yield Ok(sse_event(chunk_value(&id, &model, json!({ "content": chunk.content }), None)));
+                    if !chunk.content.is_empty() {
+                        yield Ok(sse_event(chunk_value(&id, &model, json!({ "content": chunk.content }), None)));
+                    }
+                    if let Some(mut calls) = chunk.tool_calls {
+                        if !calls.is_empty() {
+                            saw_tool_calls = true;
+                            for call in &mut calls {
+                                // Fill the id/type the engine may omit on the
+                                // first fragment: OpenAI clients match the tool
+                                // result to the call by id.
+                                if tool_indices.insert(call.index) {
+                                    if call.id.as_deref().unwrap_or("").is_empty() {
+                                        call.id = Some(format!("call_{}", Uuid::new_v4()));
+                                    }
+                                    if call.kind.is_none() {
+                                        call.kind = Some("function".into());
+                                    }
+                                }
+                            }
+                            yield Ok(sse_event(chunk_value(&id, &model, json!({ "tool_calls": calls }), None)));
+                        }
+                    }
+                    if let Some(reason) = chunk.finish_reason {
+                        finish_reason = Some(reason);
+                    }
                 }
                 Err(error) => {
                     yield Ok(Event::default().data(json!({ "error": { "message": error } }).to_string()));
@@ -213,7 +296,14 @@ fn stream_response(
             }
         }
 
-        yield Ok(sse_event(chunk_value(&id, &model, json!({}), Some("stop"))));
+        let reason = finish_reason.unwrap_or_else(|| {
+            if saw_tool_calls {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }
+        });
+        yield Ok(sse_event(chunk_value(&id, &model, json!({}), Some(&reason))));
         yield Ok(Event::default().data("[DONE]"));
 
         persist_assistant(&store, &session_id, &content, completion_tokens, started.elapsed().as_secs_f64());
@@ -243,6 +333,50 @@ fn resolve_session(state: &AppState, request: &ChatCompletionRequest) -> ApiResu
             Ok(id)
         }
     }
+}
+
+/// Assembles streamed fragments into complete calls, ordered by `index`.
+fn merge_tool_calls(deltas: Vec<ToolCallDelta>) -> Vec<ToolCall> {
+    let mut builders: BTreeMap<u32, ToolCall> = BTreeMap::new();
+    for delta in deltas {
+        let call = builders.entry(delta.index).or_insert_with(|| ToolCall {
+            id: String::new(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
+        });
+        if let Some(id) = delta.id {
+            if !id.is_empty() {
+                call.id = id;
+            }
+        }
+        if let Some(kind) = delta.kind {
+            if !kind.is_empty() {
+                call.kind = kind;
+            }
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                if !name.is_empty() {
+                    call.function.name = name;
+                }
+            }
+            if let Some(arguments) = function.arguments {
+                call.function.arguments.push_str(&arguments);
+            }
+        }
+    }
+    builders
+        .into_values()
+        .map(|mut call| {
+            if call.id.is_empty() {
+                call.id = format!("call_{}", Uuid::new_v4());
+            }
+            call
+        })
+        .collect()
 }
 
 fn persist_assistant(
@@ -333,6 +467,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::backend::FunctionCallDelta;
     use crate::discovery::mdns::DiscoveredNode;
     use crate::store::{NewModel, Store};
     use std::sync::Arc;
@@ -364,11 +499,17 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "hello there".into(),
+                ..Default::default()
             }],
             temperature: 0.7,
             max_tokens: 64,
             stream,
             session_id: Some("s1".into()),
+            tools: None,
+            tool_choice: None,
+            stop: None,
+            top_p: None,
+            seed: None,
         }
     }
 
@@ -378,6 +519,46 @@ mod tests {
         assert_eq!(value["object"], "chat.completion.chunk");
         assert_eq!(value["choices"][0]["delta"]["content"], "hi");
         assert!(value["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn merge_tool_calls_assembles_fragments_by_index() {
+        let calls = merge_tool_calls(vec![
+            ToolCallDelta {
+                index: 1,
+                id: Some("call_2".into()),
+                kind: Some("function".into()),
+                function: Some(FunctionCallDelta {
+                    name: Some("write".into()),
+                    arguments: Some("{\"path\":".into()),
+                }),
+            },
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                kind: Some("function".into()),
+                function: Some(FunctionCallDelta {
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":".into()),
+                }),
+            },
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                kind: None,
+                function: Some(FunctionCallDelta {
+                    name: None,
+                    arguments: Some("\"a.txt\"}".into()),
+                }),
+            },
+        ]);
+
+        assert_eq!(calls.len(), 2, "ordered by index");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"a.txt\"}");
+        assert_eq!(calls[1].id, "call_2");
+        assert_eq!(calls[1].function.name, "write");
     }
 
     /// The generation metrics carry the worker's **measured** health, and the
@@ -508,6 +689,7 @@ mod tests {
             temperature: 0.7,
             max_tokens: 64,
             session_id: session_id.clone(),
+            ..Default::default()
         };
         let Json(response) = buffered_response(state.clone(), session_id.clone(), generation)
             .await
