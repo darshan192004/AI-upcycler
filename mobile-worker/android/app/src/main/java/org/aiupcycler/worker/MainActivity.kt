@@ -2,17 +2,23 @@ package org.aiupcycler.worker
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import java.util.concurrent.Executors
 import org.aiupcycler.worker.identity.WorkerIdentity
+import org.aiupcycler.worker.model.ModelFile
 import org.aiupcycler.worker.pairing.PairingInput
 import org.aiupcycler.worker.pairing.PairingState
 
@@ -35,6 +41,9 @@ class MainActivity : Activity() {
 
     private lateinit var runtime: WorkerRuntime
     private lateinit var content: LinearLayout
+    private lateinit var modelStatus: TextView
+    private lateinit var modelPicker: Spinner
+    private var models: List<ModelFile> = emptyList()
     private val uiThread = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
 
@@ -64,6 +73,7 @@ class MainActivity : Activity() {
     private fun render(state: PairingState) {
         content.removeAllViews()
         content.addView(identityView())
+        content.addView(modelSection())
         content.addView(sectionLabel(getString(R.string.pairing_title)))
         when (state) {
             is PairingState.Paired -> renderPaired(state)
@@ -166,6 +176,163 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---- model library ----------------------------------------------------
+
+    /**
+     * The Models section. The spinner lists complete GGUFs; importing copies
+     * the picked document into app-private storage, and loading opens it for
+     * the compute RPCs. Until then the worker is metadata-only and the master
+     * leaves it out of the layer plan.
+     */
+    private fun modelSection(): LinearLayout {
+        models = runtime.listModels()
+        val section = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        section.addView(sectionLabel(getString(R.string.model_title)))
+        modelStatus = body("")
+        section.addView(modelStatus)
+
+        val names = if (models.isEmpty()) {
+            listOf(getString(R.string.model_no_models))
+        } else {
+            models.map { it.displayName }
+        }
+        modelPicker = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_item,
+                names,
+            ).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            isEnabled = models.isNotEmpty()
+            val selected = runtime.selectedModel()
+            val index = models.indexOfFirst { it.file == selected?.file }
+            if (index >= 0) setSelection(index)
+        }
+        section.addView(modelPicker)
+        section.addView(
+            Button(this).apply {
+                text = getString(R.string.model_import)
+                setOnClickListener { pickModel() }
+            },
+        )
+        section.addView(
+            Button(this).apply {
+                text = getString(R.string.model_load)
+                isEnabled = models.isNotEmpty()
+                setOnClickListener { loadSelectedModel() }
+            },
+        )
+        section.addView(
+            Button(this).apply {
+                text = getString(R.string.model_unload)
+                isEnabled = runtime.loadedModelName() != null
+                setOnClickListener { unloadModel() }
+            },
+        )
+        renderModelStatus()
+        return section
+    }
+
+    private fun renderModelStatus() {
+        val loaded = runtime.loadedModelName()
+        val selected = runtime.selectedModel()
+        modelStatus.text = when {
+            loaded != null -> getString(R.string.model_status_loaded, loaded)
+            selected != null -> getString(R.string.model_status_selected, selected.displayName)
+            else -> getString(R.string.model_status_none)
+        }
+    }
+
+    private fun setModelStatus(text: String) {
+        if (::modelStatus.isInitialized) modelStatus.text = text
+    }
+
+    private fun pickModel() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        startActivityForResult(intent, REQUEST_IMPORT_MODEL)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_IMPORT_MODEL || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val (name, size) = documentNameAndSize(uri)
+        setModelStatus(getString(R.string.model_importing, name))
+        worker.execute {
+            val result = runCatching {
+                val input = contentResolver.openInputStream(uri)
+                    ?: error("the selected document cannot be opened")
+                input.use { runtime.importModel(name, size, it) }
+            }
+            uiThread.post {
+                if (isFinishing || isDestroyed) return@post
+                result.onSuccess { imported ->
+                    render(runtime.pairingState())
+                    setModelStatus(getString(R.string.model_imported, imported.displayName))
+                }.onFailure { e ->
+                    setModelStatus(
+                        getString(R.string.model_import_failed, e.message ?: "unknown error"),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun documentNameAndSize(uri: Uri): Pair<String, Long?> {
+        contentResolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val name = cursor.getString(0) ?: "model.gguf"
+                val size = if (cursor.isNull(1)) null else cursor.getLong(1)
+                return name to size
+            }
+        }
+        return (uri.lastPathSegment ?: "model.gguf") to null
+    }
+
+    private fun loadSelectedModel() {
+        val model = models.getOrNull(modelPicker.selectedItemPosition) ?: return
+        setModelStatus(getString(R.string.model_loading, model.displayName))
+        worker.execute {
+            val result = runCatching { runtime.loadModel(model.file) }
+            uiThread.post {
+                if (isFinishing || isDestroyed) return@post
+                result.onSuccess {
+                    render(runtime.pairingState())
+                }.onFailure { e ->
+                    setModelStatus(
+                        getString(R.string.model_load_failed, e.message ?: "unknown error"),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun unloadModel() {
+        worker.execute {
+            val result = runCatching { runtime.unloadModel() }
+            uiThread.post {
+                if (isFinishing || isDestroyed) return@post
+                result.onSuccess {
+                    render(runtime.pairingState())
+                }.onFailure { e ->
+                    setModelStatus(
+                        getString(R.string.model_unload_failed, e.message ?: "unknown error"),
+                    )
+                }
+            }
+        }
+    }
+
     // ---- small view helpers ----------------------------------------------
 
     /** A labelled text field; the label is what makes it a form and not two boxes. */
@@ -235,6 +402,7 @@ class MainActivity : Activity() {
 
     private companion object {
         const val NOTIFICATION_REQUEST = 1
+        const val REQUEST_IMPORT_MODEL = 2
         const val ERROR_COLOR = 0xFFB3261E.toInt()
         const val OK_COLOR = 0xFF1B5E20.toInt()
     }
