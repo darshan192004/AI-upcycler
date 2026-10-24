@@ -130,6 +130,14 @@ export function NodeCard({ node, index, health, thermal }: NodeCardProps) {
             <Battery className="h-3 w-3" aria-hidden="true" />
             {health?.battery_pct != null ? `${Math.round(health.battery_pct)}%` : '—'}
           </span>
+          {health && !health.supports_compute && (
+            <span
+              className="flex items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/10 px-2 py-0.5 font-mono text-[11px] text-amber-300"
+              title="This worker answers health but has no model engine open, so it cannot receive layers."
+            >
+              metadata only
+            </span>
+          )}
           {stale && (
             <span className="text-[10px] uppercase tracking-wider text-slate-600">stale</span>
           )}

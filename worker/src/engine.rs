@@ -548,6 +548,8 @@ impl WorkerService for WorkerEngine {
             battery_percentage: -1.0,
             cpu_temp_celsius: -1.0,
             free_ram_bytes: free as i64,
+            // This service exists only around an open engine.
+            supports_compute: true,
         }))
     }
 

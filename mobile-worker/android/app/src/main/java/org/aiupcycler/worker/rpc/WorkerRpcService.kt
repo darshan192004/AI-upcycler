@@ -123,6 +123,9 @@ class WorkerRpcService(
             .setBatteryPercentage(snapshot.batteryPercentage)
             .setCpuTempCelsius(snapshot.cpuTempCelsius)
             .setFreeRamBytes(snapshot.freeRamBytes)
+            // Metadata-only until a model is loaded; the master must not plan
+            // layers onto a worker that would answer UNIMPLEMENTED.
+            .setSupportsCompute(engine != null)
             .build()
         responseObserver.onNext(response)
         responseObserver.onCompleted()

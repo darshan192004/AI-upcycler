@@ -103,6 +103,11 @@ export interface WorkerHealth {
   free_ram_bytes: number;
   /** When the snapshot was taken (Unix epoch milliseconds). */
   observed_at_epoch_ms: number;
+  /**
+   * Whether the worker can execute layer RPCs (a model engine is open).
+   * A metadata-only worker is never planned over.
+   */
+  supports_compute: boolean;
 }
 
 export interface WorkerHealthEventData {

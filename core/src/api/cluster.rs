@@ -77,12 +77,16 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
 
     let master = master_node(&state.host);
     // The layer assignments must be the plan a real request would use, so they
-    // come from the same helper as the serving path: paired workers only, in
-    // scheduler order (spec 2026-10-22, D-F4). The master tokenizes and samples
-    // but holds no layers, and an unpaired phone cannot be dialed, so neither
-    // is planned over — they are still listed, with their real capacity.
-    let plan_nodes =
-        crate::api::distributed::serving_plan_nodes(&state.registry, &state.security.enrollments);
+    // come from the same helper as the serving path: paired, compute-capable
+    // workers only, in scheduler order (spec 2026-10-22, D-F4). The master
+    // tokenizes and samples but holds no layers, an unpaired phone cannot be
+    // dialed, and a paired phone without an open engine cannot execute a layer,
+    // so none is planned over - they are still listed, with their real capacity.
+    let plan_nodes = crate::api::distributed::serving_plan_nodes(
+        &state.registry,
+        &state.security.enrollments,
+        &state.telemetry_cache,
+    );
 
     let model = state.store.list_models()?.into_iter().next();
 
@@ -479,6 +483,18 @@ mod tests {
             .unwrap();
         let state = state(registry, store);
         state.security.enrollments.enroll("w1", "w1", vec![]);
+        // Pairing alone does not prove the worker can hold layers; a fresh
+        // health snapshot is what puts it in the plan.
+        state
+            .telemetry_cache
+            .record_worker(crate::telemetry::WorkerHealth {
+                id: "w1".into(),
+                temp_celsius: None,
+                battery_pct: None,
+                free_ram_bytes: 1024,
+                observed_at_epoch_ms: 1,
+                supports_compute: true,
+            });
 
         let topology = topology_of(state).await;
 

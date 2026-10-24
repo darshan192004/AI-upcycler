@@ -65,6 +65,7 @@ impl WorkerService for TestWorker {
             battery_percentage: 99.0,
             cpu_temp_celsius: 35.0,
             free_ram_bytes: 1 << 29,
+            supports_compute: true,
         }))
     }
 

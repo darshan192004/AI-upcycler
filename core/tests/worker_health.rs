@@ -96,6 +96,7 @@ async fn the_poll_records_the_values_the_worker_reported() {
     assert_eq!(health.temp_celsius, Some(38.5));
     assert!(health.free_ram_bytes > 0);
     assert!(health.observed_at_epoch_ms > 0);
+    assert!(health.supports_compute, "mock worker advertises compute");
 
     let event = events.try_recv().expect("worker_health event");
     match event {
