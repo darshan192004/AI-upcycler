@@ -28,6 +28,7 @@ use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -321,6 +322,46 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Overrides the GGUF download directory (`AI_UPCYCLER_MODELS_DIR`).
+///
+/// An unset or empty variable keeps the shell's default (the app-data
+/// `models/` directory). Models are large and the system drive is often the
+/// smallest one, so hosts can point this at another volume.
+pub fn resolve_models_dir(default: PathBuf) -> PathBuf {
+    resolve_models_dir_with(default, std::env::var_os("AI_UPCYCLER_MODELS_DIR"))
+}
+
+fn resolve_models_dir_with(default: PathBuf, override_: Option<OsString>) -> PathBuf {
+    match override_ {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => default,
+    }
+}
+
+/// Overrides the loopback API port (`AI_UPCYCLER_API_PORT`).
+///
+/// The desktop shell's default is 8080. A host that already has a process on
+/// that port (another local model server, for example) can move this one.
+pub fn resolve_api_port(default: u16) -> u16 {
+    let value = std::env::var("AI_UPCYCLER_API_PORT").ok();
+    parse_api_port(value.as_deref(), default)
+}
+
+fn parse_api_port(value: Option<&str>, default: u16) -> u16 {
+    match value.map(str::trim) {
+        Some(text) if !text.is_empty() => match text.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                tracing::warn!(
+                    "ignoring invalid AI_UPCYCLER_API_PORT={text:?}; using {default}"
+                );
+                default
+            }
+        },
+        _ => default,
+    }
+}
+
 /// Loopback port for the pairing-only listener (spec 2026-10-20, D-B2): one
 /// route, reachable from a phone through `adb reverse` only.
 pub const PAIRING_PORT: u16 = 8081;
@@ -406,6 +447,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn parses_sqlite_timestamps() {
@@ -463,6 +505,48 @@ mod tests {
                 !browser_origin_is_allowed(origin),
                 "{origin} must not receive a CORS grant"
             );
+        }
+    }
+
+    #[test]
+    fn models_dir_override_wins_when_non_empty() {
+        let default = PathBuf::from("C:/app/models");
+        let override_ = PathBuf::from("D:/ai-upcycler-models");
+
+        assert_eq!(
+            resolve_models_dir_with(default, Some(override_.into_os_string())),
+            PathBuf::from("D:/ai-upcycler-models")
+        );
+    }
+
+    #[test]
+    fn models_dir_empty_override_keeps_default() {
+        let default = PathBuf::from("C:/app/models");
+
+        assert_eq!(
+            resolve_models_dir_with(default.clone(), Some(OsString::from(""))),
+            default
+        );
+        assert_eq!(resolve_models_dir_with(default.clone(), None), default);
+    }
+
+    #[test]
+    fn api_port_override_parses_a_valid_port() {
+        assert_eq!(parse_api_port(Some("8090"), 8080), 8090);
+        assert_eq!(parse_api_port(Some(" 8090 "), 8080), 8090);
+    }
+
+    #[test]
+    fn api_port_invalid_zero_or_out_of_range_keeps_default() {
+        for value in [
+            Some("0"),
+            Some("65536"),
+            Some("-1"),
+            Some("abc"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(parse_api_port(value, 8080), 8080, "{value:?}");
         }
     }
 }

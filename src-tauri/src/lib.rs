@@ -119,21 +119,23 @@ pub fn run() {
                     .map_err(|e| format!("cannot open database: {e}"))?,
             );
 
+            let models_dir = api::resolve_models_dir(data_dir.join("models"));
             let state = AppState::bootstrap(
                 "cluster-local".into(),
                 server_registry.clone(),
                 store,
                 telemetry.clone(),
-                data_dir.join("models"),
+                models_dir,
             );
 
             // `prepare_pairing` resolves this shared state; its Arcs are the
             // same instances the API listeners below serve from.
             app.manage(state.clone());
 
+            let api_port = api::resolve_api_port(API_PORT);
             let state_for_api = state.clone();
             tauri::async_runtime::spawn(async move {
-                let addr = SocketAddr::from(([127, 0, 0, 1], API_PORT));
+                let addr = SocketAddr::from(([127, 0, 0, 1], api_port));
                 if let Err(e) = api::serve(addr, state_for_api).await {
                     error!("local API server stopped: {e}");
                 }
