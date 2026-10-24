@@ -1,15 +1,16 @@
 # Launch readiness
 
-**Status:** 2026-10-23, `main` @ `b141120`.
-**Scope assumed:** local-first desktop app (Tauri/React) that pools Android
-worker phones on the user's own LAN/USB; no hosted service, no accounts.
+**Status:** 2026-10-24, `main` @ `0169eb5`.
+**Scope assumed:** local-first desktop app (Tauri/React) that exposes an
+OpenAI-compatible endpoint for coding agents and can pool Android worker
+phones on the user's own LAN/USB; no hosted service, no accounts.
 If the launch is meant to be a hosted or multi-tenant service, this document
 understates the work by a wide margin - start with a new threat model.
 
 This page exists because `docs/tasks.md` tracks **features**, and the project is
 feature-complete device-free while still not being launch-ready. It lists what
 is actually left, what evidence closes each item, and the decisions only the
-maintainer can make.
+maintainer can make. The user-facing agent setup is in `docs/agents.md`.
 
 ## 1. Where the product stands
 
@@ -17,10 +18,11 @@ maintainer can make.
 |---|---|---|
 | Master core (Rust) | complete, tested | `cargo test` across core + worker; CI lane "Core" |
 | Desktop shell | builds on 3 OSes, unsigned | `release.yml` matrix: macOS universal, Linux `.deb/.rpm/.AppImage`, Windows `.msi/.exe` |
-| Dashboard + chat UI | complete, typechecked | CI lane "Frontend" |
+| Dashboard + chat UI | complete, typechecked; hardcodes port 8080 | CI lane "Frontend" |
 | Host inference | real `llama-server` subprocess, stub fallback | `docs/api.md`, tasks.md §7 |
-| Distributed split | real RPC across Rust/Kotlin workers, mTLS, scheduler, telemetry, thermal cap | PRs #41-#95, specs under `docs/superpowers/specs/` |
-| Android worker | debug APK, engine + mTLS + pairing, 133 JVM tests | `android-worker.yml` lane |
+| Agent endpoint | OpenAI-compatible `tools` / `tool_calls`, buffered and streaming, host-only; no real-model run yet | `docs/agents.md`, PR #103 |
+| Distributed split | real RPC across Rust/Kotlin workers, mTLS, scheduler, telemetry, thermal cap; plain chat only | PRs #41-#95, specs under `docs/superpowers/specs/` |
+| Android worker | debug APK, model import/load/serve, engine + mTLS + pairing; JVM suite green | `android-worker.yml` lane, PR #102 |
 | iOS worker | **does not exist** | `mobile-worker/ios/` absent |
 | Real-device proof | **never run** | tasks.md §6 checklist |
 | License | MIT, file present | `LICENSE`, README badge, `core/Cargo.toml` |
@@ -29,10 +31,16 @@ maintainer can make.
 
 ## 2. Blocking work
 
-### A. Hardware verification (the honest bar)
+### A. Hardware and real-model verification (the honest bar)
 
-Everything here needs a physical Android phone (ideally two) and an 8 GB host.
-None of it can be replaced by more code.
+Everything here needs a physical Android phone (ideally two) and an 8 GB host,
+or a real GGUF plus an agent client. None of it can be replaced by more code.
+
+0. **Host agent smoke test** (new): download the 3B Q4 model, start the app
+   with `AI_UPCYCLER_MODEL`, confirm `GET /v1/models` and a `tools` request
+   return `tool_calls`, then run one opencode session. Record the exact model,
+   context, and whether the loop completes. The unit/API tests are green, but
+   this is the first real-model proof.
 
 1. **Pair -> serve -> drive on one phone** (tasks.md §6, D-B10): QR/PIN enroll,
    tunnel retired, plaintext refused, master `load_secure` dial, distributed
@@ -77,14 +85,23 @@ exact device/build used. Until then, "works on a real cluster" stays unclaimed.
 1. **First-run onboarding** - today model setup depends on
    `AI_UPCYCLER_LLAMA_SERVER` / `AI_UPCYCLER_MODEL` or assets under the data
    dir. A launcher that finds-or-downloads llama.cpp and a model, then proves it
-   with a local chat, is the difference between a demo and a product.
-2. **iOS agent** - absent. This is the single largest remaining engineering
+   with a local chat, is the difference between a demo and a product. The agent
+   path needs the same treatment: download the coder model, set it as the host
+   model, and show the endpoint without environment variables.
+2. **Port-following frontend** - the API listener honours
+   `AI_UPCYCLER_API_PORT`, but `src/lib/api.ts` still hardcodes 8080. Until the
+   webview receives the resolved port, moving the API breaks the dashboard and
+   built-in chat. Fix before advertising the override as a general feature.
+3. **Host model selection** - one `AI_UPCYCLER_MODEL` is loaded at startup.
+   The catalog can list several GGUFs, but there is no in-app switch between
+   them or between the host model and the cluster's active model.
+4. **iOS agent** - absent. This is the single largest remaining engineering
    item if iOS is in the launch scope; a Swift engine port, RPC client/server,
    mTLS identities and pairing UI, gated on macOS + Xcode.
-3. **Privacy and telemetry statement** - the app keeps chat history locally and
+5. **Privacy and telemetry statement** - the app keeps chat history locally and
    polls worker health; state what is stored, where, and how to delete it, and
    that nothing leaves the LAN.
-4. **Support surface** - issue template, crash/error reporting story (even if
+6. **Support surface** - issue template, crash/error reporting story (even if
    the answer is "write to the issue tracker with the log path"), and a known
    limitations page that repeats the honest gaps from `docs/tasks.md`.
 
@@ -94,10 +111,11 @@ The desktop shell reads these before it starts the API:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AI_UPCYCLER_LLAMA_SERVER` | `engine/llama-server[.exe]` beside the models dir | `llama-server` binary |
+| `AI_UPCYCLER_LLAMA_SERVER` | `<parent of models dir>/engine/llama-server[.exe]` | `llama-server` binary |
 | `AI_UPCYCLER_MODEL` | `models/qwen2.5-0.5b-instruct-q4_k_m.gguf` in the app data dir | GGUF the host serves |
 | `AI_UPCYCLER_MODELS_DIR` | app data dir `models/` | Where `/api/models/download` writes |
 | `AI_UPCYCLER_API_PORT` | `8080` | Loopback API port; invalid or `0` keeps the default |
+| `AI_UPCYCLER_CONTEXT` | `8192` | Context window passed to `llama-server` (PR #103) |
 
 `AI_UPCYCLER_MODELS_DIR` exists because models are large and the system drive is
 often the smallest one; pointing it at another volume is supported. The pairing
@@ -105,10 +123,22 @@ listener stays on `8081`.
 
 ### D. Known correctness limits already documented (not blockers, must be stated)
 
-- The REST API binds `127.0.0.1:8080` and has **no auth**. Fine for local-only; a
-  blocker the moment the bind widens. The browser side is bounded as of
-  2026-10-24: CORS grants only the bundled shell and localhost origins, and the
-  telemetry WebSocket refuses a foreign `Origin`.
+- The REST API defaults to `127.0.0.1:8080` and has **no auth**. Fine for
+  local-only; a blocker the moment the bind widens. The browser side is bounded
+  as of 2026-10-24: CORS grants only the bundled shell and localhost origins,
+  and the telemetry WebSocket refuses a foreign `Origin`.
+- `AI_UPCYCLER_API_PORT` moves the listener, but the dashboard and built-in
+  chat still call 8080 (see C.2). The agent endpoint can move independently;
+  the UI cannot yet follow.
+- One host GGUF is served per process. Tool requests always go to that host
+  engine; a tool request with no host engine returns `400` before anything is
+  persisted.
+- Tool calling depends on the model's chat template and `--jinja`. The app
+  passes the flag; a model whose template cannot render tools will answer with
+  text instead of a call, which is a model limitation, not a server error.
+- The cluster's ChatML renderer knows only system/user/assistant messages, so
+  distributed tool calling is not implemented. Cluster workers keep serving
+  plain chat.
 - The webview still has **no Content-Security-Policy** (`tauri.conf.json` says
   `"csp": null`). Tightening it needs runtime verification of the shell's inline
   styles; until then a compromised frontend is not sandboxed.
@@ -135,11 +165,12 @@ listener stays on `8081`.
 **Phase 1 - device-free launch hardening (~1 week).**
 `LICENSE`; signing + updater scaffolding with documented secrets; release APK
 signing config; onboarding flow; privacy/limitations docs; clean-install test on
-one OS. Each lands as its own PR with the normal gates.
+one OS; the host agent smoke test with the 3B model and opencode. Each lands as
+its own PR with the normal gates.
 
 **Phase 2 - real-device proof (~2-4 days once a phone + 8 GB host are in hand).**
-Section 2A, in the listed order. Any failure here becomes a fix PR, so budget
-for one iteration.
+Section 2A items 1-7, in the listed order. Any failure here becomes a fix PR, so
+budget for one iteration.
 
 **Phase 3 - public beta.** Signed artifacts, updater feed, onboarding, honest
 limitations. Windows/Linux/macOS desktop + sideload Android.
@@ -150,6 +181,9 @@ external security audit, support rotation.
 ## 5. Go/no-go checklist
 
 - [x] `LICENSE` present and consistent with README
+- [ ] Host agent smoke test: 3B model + one opencode tool loop recorded
+- [ ] `docs/agents.md` published and linked from the README
+- [ ] Port override followed by the dashboard/chat, or documented as listener-only
 - [ ] Windows + macOS artifacts signed and notarized; Linux artifacts published
 - [ ] Updater feed signed, one successful upgrade from the previous tag
 - [ ] Android APK signed with a release key (or sideload-only stated publicly)
