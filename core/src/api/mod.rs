@@ -352,9 +352,7 @@ fn parse_api_port(value: Option<&str>, default: u16) -> u16 {
         Some(text) if !text.is_empty() => match text.parse::<u16>() {
             Ok(port) if port > 0 => port,
             _ => {
-                tracing::warn!(
-                    "ignoring invalid AI_UPCYCLER_API_PORT={text:?}; using {default}"
-                );
+                tracing::warn!("ignoring invalid AI_UPCYCLER_API_PORT={text:?}; using {default}");
                 default
             }
         },
