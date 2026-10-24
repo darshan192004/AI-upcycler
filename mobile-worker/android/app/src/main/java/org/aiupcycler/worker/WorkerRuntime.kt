@@ -4,9 +4,14 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
+import java.io.File
+import java.io.InputStream
+import org.aiupcycler.worker.engine.WorkerEngine
 import org.aiupcycler.worker.identity.WorkerIdentity
 import org.aiupcycler.worker.mdns.MdnsAdvertiser
 import org.aiupcycler.worker.metrics.DeviceMetrics
+import org.aiupcycler.worker.model.ModelFile
+import org.aiupcycler.worker.model.ModelStore
 import org.aiupcycler.worker.pairing.CredentialStore
 import org.aiupcycler.worker.pairing.EnrollmentClient
 import org.aiupcycler.worker.pairing.EnrollmentRequest
@@ -26,7 +31,9 @@ import org.aiupcycler.worker.rpc.WorkerRpcServer
 class WorkerRuntime(private val context: Context) {
     private val identity = WorkerIdentity.from(context)
     private val metrics = DeviceMetrics(context)
-    private val rpcServer = WorkerRpcServer(identity, metrics)
+    private val library = ModelStore(context.filesDir.resolve(MODELS_DIR))
+    @Volatile private var engine: WorkerEngine? = null
+    @Volatile private var rpcServer: WorkerRpcServer? = null
     private val advertiser =
         MdnsAdvertiser(context, metrics, "AI Upcycler Worker ${identity.deviceName}")
     private val credentials = CredentialStore(context.filesDir.resolve(PAIRING_DIR))
@@ -62,19 +69,33 @@ class WorkerRuntime(private val context: Context) {
         is EnrollmentResult.Failed -> PairingState.Failed(result.reason)
     }
 
+    @Synchronized
     fun start() {
-        rpcServer.start(credentials.load())
+        if (rpcServer != null) return
+        if (engine == null) {
+            val selected = library.selected()
+            if (selected != null) {
+                engine = runCatching { WorkerEngine.open(selected.file) }
+                    .onFailure { Log.e(TAG, "could not open ${selected.displayName}", it) }
+                    .getOrNull()
+            }
+        }
+        val server = WorkerRpcServer(identity, metrics, engine)
+        server.start(credentials.load())
+        rpcServer = server
         advertiser.start()
-        Log.i(
-            TAG,
-            "worker $workerId serving gRPC on 0.0.0.0:$port" +
-                if (rpcServer.isTls) " (mTLS)" else " (plaintext ADB path)",
-        )
+        val transport = if (server.isTls) " (mTLS)" else " (plaintext ADB path)"
+        val compute = if (engine != null) " with ${engine?.modelName}" else " metadata-only"
+        Log.i(TAG, "worker $workerId serving gRPC on 0.0.0.0:$port$transport$compute")
     }
 
+    @Synchronized
     fun stop() {
         advertiser.stop()
-        rpcServer.stop()
+        rpcServer?.stop()
+        rpcServer = null
+        runCatching { engine?.close() }
+        engine = null
     }
 
     /**
@@ -141,10 +162,19 @@ class WorkerRuntime(private val context: Context) {
         return result
     }
 
-    /** Re-reads the pairing and re-starts the server in the mode it implies. */
+    /**
+     * Re-reads the pairing and the current engine, then restarts the server in
+     * the mode they imply. A stopped runtime stays stopped; the next start()
+     * picks both up from disk.
+     */
+    @Synchronized
     private fun restartServing() {
-        rpcServer.stop()
-        rpcServer.start(credentials.load())
+        val running = rpcServer ?: return
+        running.stop()
+        rpcServer = null
+        val server = WorkerRpcServer(identity, metrics, engine)
+        server.start(credentials.load())
+        rpcServer = server
     }
 
     /** Forgets the pairing (spec D-B4); the worker returns to plaintext ADB. */
@@ -154,6 +184,64 @@ class WorkerRuntime(private val context: Context) {
         // restarting is how the mode changes without a reconnect (D-B5).
         restartServing()
         Log.i(TAG, "pairing forgotten; serving plaintext on the ADB path again")
+    }
+
+    /** The GGUFs in the worker's library, for the model picker. */
+    fun listModels(): List<ModelFile> = library.list()
+
+    /** The model the next start() will open, if one is selected. */
+    fun selectedModel(): ModelFile? = library.selected()
+
+    /** The internal name of the open model, or `null` while metadata-only. */
+    @Synchronized
+    fun loadedModelName(): String? = engine?.modelName
+
+    /**
+     * Copies a picked document into the library and selects it. The caller
+     * supplies the bytes, so the Android document picker stays at the edge.
+     */
+    @Synchronized
+    fun importModel(displayName: String, sizeHint: Long?, source: InputStream): ModelFile {
+        val imported = library.import(displayName, sizeHint, source)
+        library.select(imported.file)
+        return imported
+    }
+
+    /**
+     * Opens [file] and serves it. The RPC server is rebuilt because its engine
+     * is fixed at construction. A file that fails to open leaves the previous
+     * engine serving; a failed server restart surfaces to the caller, and the
+     * next start() recovers with the restored engine.
+     */
+    @Synchronized
+    fun loadModel(file: File) {
+        val opened = WorkerEngine.open(file)
+        val previous = engine
+        engine = opened
+        try {
+            restartServing()
+        } catch (e: Exception) {
+            engine = previous
+            runCatching { opened.close() }
+            throw e
+        }
+        runCatching { previous?.close() }
+        library.select(file)
+    }
+
+    /** Drops the model and returns to metadata-only; the selection is cleared. */
+    @Synchronized
+    fun unloadModel() {
+        val previous = engine
+        engine = null
+        try {
+            restartServing()
+        } catch (e: Exception) {
+            engine = previous
+            throw e
+        }
+        runCatching { previous?.close() }
+        library.clearSelection()
     }
 
     private fun nodeId(): String = advertiser.nodeId()
@@ -192,6 +280,9 @@ class WorkerRuntime(private val context: Context) {
 
         /** The credential directory under the app's private files dir. */
         const val PAIRING_DIR = "pairing"
+
+        /** The side-loaded model library under the app's private files dir. */
+        const val MODELS_DIR = "models"
 
         /**
          * The master's pairing-only listener, reached as the worker's own

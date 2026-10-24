@@ -22,4 +22,20 @@
     <string name="pairing_failed_headline">Pairing failed</string>
     <string name="pairing_rejected_headline">Pairing code not accepted</string>
     <string name="pairing_requires_modern_android">Mutual TLS needs Android 10 or newer. This device stays on the USB-only plaintext path.</string>
+
+    <!-- Model library (spec 2026-10-19 android-compute-rpcs, D-A4). -->
+    <string name="model_title">Model</string>
+    <string name="model_no_models">No GGUF files yet.</string>
+    <string name="model_import">Import GGUF</string>
+    <string name="model_load">Load selected</string>
+    <string name="model_unload">Unload</string>
+    <string name="model_status_none">Metadata only - no model loaded.</string>
+    <string name="model_status_loaded">Serving compute with %1$s.</string>
+    <string name="model_status_selected">Selected %1$s (not loaded).</string>
+    <string name="model_importing">Importing %1$s...</string>
+    <string name="model_imported">Imported %1$s.</string>
+    <string name="model_import_failed">Import failed: %1$s</string>
+    <string name="model_loading">Loading %1$s...</string>
+    <string name="model_load_failed">Load failed: %1$s</string>
+    <string name="model_unload_failed">Unload failed: %1$s</string>
 </resources>
