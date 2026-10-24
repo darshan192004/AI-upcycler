@@ -1,7 +1,8 @@
 //! End-to-end tests exercising the HTTP router in-process (no sockets).
 
 use ai_upcycler_core::api::backend::{
-    GenerationBackend, GenerationChunk, GenerationRequest, StubBackend,
+    FunctionCallDelta, GenerationBackend, GenerationChunk, GenerationRequest, StubBackend,
+    ToolCallDelta,
 };
 use ai_upcycler_core::api::downloads::StubFetcher;
 use ai_upcycler_core::api::{router, AppState, HostInfo};
@@ -161,6 +162,155 @@ async fn streams_chat_as_sse() {
     assert!(text.contains("data: [DONE]"));
 }
 
+/// A backend that speaks the host tool-call shape, so the API's merge and
+/// streaming forwarding can be tested without a model.
+struct ToolBackend;
+
+impl GenerationBackend for ToolBackend {
+    fn generate(
+        &self,
+        request: GenerationRequest,
+    ) -> BoxStream<'static, Result<GenerationChunk, String>> {
+        assert!(request.wants_tools(), "tools must reach the backend");
+        Box::pin(async_stream::stream! {
+            yield Ok(GenerationChunk {
+                tokens_emitted: 1,
+                tool_calls: Some(vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    kind: Some("function".into()),
+                    function: Some(FunctionCallDelta {
+                        name: Some("read".into()),
+                        arguments: Some("{\"path\":".into()),
+                    }),
+                }]),
+                ..Default::default()
+            });
+            yield Ok(GenerationChunk {
+                tokens_emitted: 1,
+                tool_calls: Some(vec![ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    kind: None,
+                    function: Some(FunctionCallDelta {
+                        name: None,
+                        arguments: Some("\"a.txt\"}".into()),
+                    }),
+                }]),
+                ..Default::default()
+            });
+            yield Ok(GenerationChunk {
+                finish_reason: Some("tool_calls".into()),
+                ..Default::default()
+            });
+        })
+    }
+
+    fn tool_calling_available(&self) -> bool {
+        true
+    }
+}
+
+fn tool_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "llama-8b",
+        "stream": stream,
+        "messages": [{ "role": "user", "content": "read a.txt" }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file",
+                "parameters": { "type": "object" }
+            }
+        }],
+        "tool_choice": "auto"
+    })
+}
+
+#[tokio::test]
+async fn buffered_tool_calls_are_merged_and_labelled() {
+    let mut state = state();
+    state.backend = Arc::new(ToolBackend);
+
+    let (status, body) = send(
+        router(state),
+        "POST",
+        "/v1/chat/completions",
+        Some(tool_request(false)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    let calls = &body["choices"][0]["message"]["tool_calls"];
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "read");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.txt\"}");
+}
+
+#[tokio::test]
+async fn streaming_tool_calls_are_forwarded_and_labelled() {
+    let mut state = state();
+    state.backend = Arc::new(ToolBackend);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&tool_request(true)).unwrap()))
+        .unwrap();
+    let response = router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("\"tool_calls\""),
+        "tool deltas must be forwarded: {text}"
+    );
+    assert!(text.contains("\"name\":\"read\""), "{text}");
+    assert!(
+        text.contains("\"arguments\":\"{\\\"path\\\":\""),
+        "argument fragments must pass through: {text}"
+    );
+    assert!(
+        text.contains("\"finish_reason\":\"tool_calls\""),
+        "the final chunk must say tool_calls: {text}"
+    );
+    assert!(text.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn tool_requests_are_refused_without_a_host_engine() {
+    let state = state();
+    let store = state.store.clone();
+
+    let (status, body) = send(
+        router(state),
+        "POST",
+        "/v1/chat/completions",
+        Some(tool_request(false)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("host engine"),
+        "the refusal must explain the missing host engine: {body}"
+    );
+    assert!(
+        store.list_sessions().unwrap().is_empty(),
+        "a refused tool request must not create a session"
+    );
+}
+
 /// A backend whose stream refuses mid-generation: the documented failure
 /// (post-emission evictions/refusals fail honestly, plan PR-2) must surface
 /// as an SSE `error` event, not as a silently-truncated answer.
@@ -176,6 +326,7 @@ impl GenerationBackend for RefusingBackend {
                 content: "partial".into(),
                 tokens_emitted: 1,
                 prompt_tokens: Some(3),
+                ..Default::default()
             });
             yield Err("session evicted mid-decode".into());
         })
