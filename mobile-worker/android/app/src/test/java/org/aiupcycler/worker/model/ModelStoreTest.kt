@@ -118,6 +118,16 @@ class ModelStoreTest {
     }
 
     @Test
+    fun importAllowsAZeroSizeHintBelowTheReserve() = withDir { dir ->
+        val store = ModelStore(dir) { 1L }
+
+        val model = store.import("empty.gguf", 0L, ByteArrayInputStream(ByteArray(0)))
+
+        assertEquals("empty.gguf", model.displayName)
+        assertEquals(0L, model.sizeBytes)
+    }
+
+    @Test
     fun importCleansUpAPartialCopy() = withDir { dir ->
         val broken = object : InputStream() {
             override fun read(): Int = throw IOException("boom")

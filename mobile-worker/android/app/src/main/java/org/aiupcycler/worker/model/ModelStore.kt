@@ -3,6 +3,7 @@ package org.aiupcycler.worker.model
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.nio.file.Files
 
 /** One GGUF the worker can serve. */
 data class ModelFile(
@@ -35,7 +36,7 @@ class ModelStore(
 
     /** The model the worker should open on its next start, if any. */
     fun selected(): ModelFile? {
-        val name = runCatching { selectionFile().readText().trim() }.getOrNull()
+        val name = runCatching { selectionFile().readText(Charsets.UTF_8).trim() }.getOrNull()
         // A selection is a file name, never a path: rejecting separators keeps
         // a tampered selection file from pointing outside the library.
         if (name.isNullOrEmpty() || File(name).name != name) return null
@@ -49,7 +50,7 @@ class ModelStore(
             "model must live in the worker's model directory"
         }
         dir.mkdirs()
-        selectionFile().writeText(file.name)
+        selectionFile().writeText(file.name, Charsets.UTF_8)
     }
 
     fun clearSelection() {
@@ -67,11 +68,14 @@ class ModelStore(
         val safeName = safeName(displayName)
             ?: throw IllegalArgumentException("not a .gguf file name: $displayName")
         dir.mkdirs()
-        if (sizeHint != null && sizeHint > freeSpace() - RESERVE_BYTES) {
-            throw IOException(
-                "not enough free space for $sizeHint bytes " +
-                    "($RESERVE_BYTES bytes headroom required)",
-            )
+        if (sizeHint != null) {
+            val available = (freeSpace() - RESERVE_BYTES).coerceAtLeast(0)
+            if (sizeHint > available) {
+                throw IOException(
+                    "not enough free space for $sizeHint bytes " +
+                        "($RESERVE_BYTES bytes headroom required)",
+                )
+            }
         }
         val target = uniqueTarget(safeName)
         val partial = File(dir, "${target.name}.part")
@@ -79,8 +83,10 @@ class ModelStore(
             source.use { input ->
                 partial.outputStream().use { output -> input.copyTo(output, BUFFER_BYTES) }
             }
-            if (!partial.renameTo(target)) {
-                throw IOException("could not move the imported model into place")
+            try {
+                Files.move(partial.toPath(), target.toPath())
+            } catch (e: IOException) {
+                throw IOException("could not move the imported model into place", e)
             }
         } catch (e: Exception) {
             partial.delete()
