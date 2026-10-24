@@ -404,6 +404,7 @@ mod tests {
                 battery_pct: Some(92.0),
                 free_ram_bytes: 1024,
                 observed_at_epoch_ms: 1,
+                supports_compute: true,
             });
         state.telemetry_cache.record_master_ram(Some(42.0));
 

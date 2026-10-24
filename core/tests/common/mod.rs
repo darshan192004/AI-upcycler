@@ -211,6 +211,7 @@ impl WorkerService for MockWorker {
             battery_percentage: self.health.0,
             cpu_temp_celsius: self.health.1,
             free_ram_bytes: 1 << 29,
+            supports_compute: true,
         }))
     }
 

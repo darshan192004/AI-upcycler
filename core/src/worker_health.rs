@@ -207,6 +207,7 @@ async fn fetch_health(
         battery_pct: known(response.battery_percentage),
         free_ram_bytes: response.free_ram_bytes.max(0) as u64,
         observed_at_epoch_ms: now_epoch_ms(),
+        supports_compute: response.supports_compute,
     })
 }
 
@@ -252,6 +253,7 @@ mod tests {
             battery_pct: Some(92.0),
             free_ram_bytes: 1024,
             observed_at_epoch_ms: 1,
+            supports_compute: true,
         });
         assert_eq!(cache.worker("w1").unwrap().temp_celsius, Some(38.5));
 

@@ -87,6 +87,9 @@ message HealthResponse {
   float battery_percentage = 1;
   float cpu_temp_celsius = 2;
   int64 free_ram_bytes = 3;
+  // Whether this worker can execute layer RPCs, i.e. a model engine is open.
+  // A metadata-only worker still answers health but must never be planned over.
+  bool supports_compute = 4;
 }
 
 // Measures this worker's own hardware: bounded, sub-second probes run on

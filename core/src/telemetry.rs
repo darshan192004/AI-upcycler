@@ -43,6 +43,10 @@ pub struct WorkerHealth {
     pub free_ram_bytes: u64,
     /// When the snapshot was taken (Unix epoch milliseconds).
     pub observed_at_epoch_ms: u64,
+    /// Whether the worker can execute layer RPCs, i.e. a model engine is open.
+    /// A metadata-only worker still answers health but must never be planned
+    /// over (its `LoadLayers` would fail with `UNIMPLEMENTED`).
+    pub supports_compute: bool,
 }
 
 /// The freshest cluster telemetry, published after every poll cycle.

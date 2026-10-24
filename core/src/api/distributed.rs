@@ -619,11 +619,20 @@ pub struct AdaptiveBackend {
 pub(crate) fn serving_plan_nodes(
     registry: &NodeRegistry,
     enrollments: &crate::security::EnrollmentRegistry,
+    cache: &crate::worker_health::TelemetryCache,
 ) -> Vec<DiscoveredNode> {
     let mut nodes: Vec<DiscoveredNode> = registry
         .list_nodes()
         .into_iter()
         .filter(|node| enrollments.is_enrolled(&node.node_id))
+        // A worker that has never answered health is unknown, not capable.
+        // Pairing proves identity; it does not prove a model engine is open.
+        .filter(|node| {
+            cache
+                .worker(&node.node_id)
+                .map(|health| health.supports_compute)
+                .unwrap_or(false)
+        })
         .collect();
     // One comparator owns the order (see `order_plan_nodes`): the scheduler
     // fills nodes in the order it is handed them, and the registry's map order
@@ -672,7 +681,7 @@ impl AdaptiveBackend {
             return Some(cached.clone());
         }
 
-        let nodes = serving_plan_nodes(&self.registry, &self.security.enrollments);
+        let nodes = serving_plan_nodes(&self.registry, &self.security.enrollments, &self.thermal);
         if nodes.is_empty() {
             return None;
         }
@@ -812,6 +821,17 @@ mod tests {
         }
     }
 
+    fn health(node_id: &str, supports_compute: bool) -> crate::telemetry::WorkerHealth {
+        crate::telemetry::WorkerHealth {
+            id: node_id.into(),
+            temp_celsius: None,
+            battery_pct: None,
+            free_ram_bytes: 0,
+            observed_at_epoch_ms: 0,
+            supports_compute,
+        }
+    }
+
     #[test]
     fn the_serving_plan_is_paired_workers_in_scheduler_order() {
         let registry = NodeRegistry::new();
@@ -821,8 +841,11 @@ mod tests {
         let enrollments = crate::security::EnrollmentRegistry::new();
         enrollments.enroll("roomy", "roomy", vec![]);
         enrollments.enroll("tight", "tight", vec![]);
+        let cache = crate::worker_health::TelemetryCache::new();
+        cache.record_worker(health("roomy", true));
+        cache.record_worker(health("tight", true));
 
-        let planned = serving_plan_nodes(&registry, &enrollments);
+        let planned = serving_plan_nodes(&registry, &enrollments, &cache);
         let ids: Vec<&str> = planned.iter().map(|n| n.node_id.as_str()).collect();
         // The unpaired phone is dropped even though it has the least RAM; the
         // rest are ordered the way the scheduler fills layers (smallest first).
@@ -830,11 +853,42 @@ mod tests {
     }
 
     #[test]
+    fn a_paired_worker_that_cannot_compute_is_not_planned() {
+        let registry = NodeRegistry::new();
+        registry.register_or_update(discovered("roomy", 4_000));
+        registry.register_or_update(discovered("phone", 1_000));
+        let enrollments = crate::security::EnrollmentRegistry::new();
+        enrollments.enroll("roomy", "roomy", vec![]);
+        enrollments.enroll("phone", "phone", vec![]);
+        let cache = crate::worker_health::TelemetryCache::new();
+        cache.record_worker(health("roomy", true));
+        // A phone that serves metadata but has no engine loaded: it must not
+        // receive layers it cannot execute.
+        cache.record_worker(health("phone", false));
+
+        let planned = serving_plan_nodes(&registry, &enrollments, &cache);
+        let ids: Vec<&str> = planned.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, ["roomy"]);
+    }
+
+    #[test]
+    fn a_paired_worker_without_a_health_snapshot_is_not_planned() {
+        let registry = NodeRegistry::new();
+        registry.register_or_update(discovered("phone", 1_000));
+        let enrollments = crate::security::EnrollmentRegistry::new();
+        enrollments.enroll("phone", "phone", vec![]);
+        let cache = crate::worker_health::TelemetryCache::new();
+
+        assert!(serving_plan_nodes(&registry, &enrollments, &cache).is_empty());
+    }
+
+    #[test]
     fn nothing_paired_means_no_plan() {
         let registry = NodeRegistry::new();
         registry.register_or_update(discovered("phone", 1_000));
         let enrollments = crate::security::EnrollmentRegistry::new();
-        assert!(serving_plan_nodes(&registry, &enrollments).is_empty());
+        let cache = crate::worker_health::TelemetryCache::new();
+        assert!(serving_plan_nodes(&registry, &enrollments, &cache).is_empty());
     }
 
     // ---- sampler ---------------------------------------------------------
