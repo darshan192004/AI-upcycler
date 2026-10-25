@@ -84,6 +84,15 @@ expect `tool_calls` in the reply. Tool requests are served by the host
 `llama-server` only; when no host engine is configured the API returns `400`
 instead of a text answer, so the agent fails loudly rather than looping.
 
+Small models sometimes write a call as one JSON object in `content` instead of
+the native `tool_calls` field. When the request carries tools, the host backend
+promotes that object only if its `name` matches a requested tool and its
+`arguments` are a JSON object or a JSON string that parses. Prose, unknown
+names, and multiple calls stay text. Tool requests are buffered until the turn
+ends so the server can decide; requests without tools and
+`tool_choice: "none"` keep streaming unchanged. A promoted turn returns
+`finish_reason: "tool_calls"` and the usual `tool_calls` shape.
+
 The supported request/response subset and the exact streaming shape are
 specified in
 `docs/superpowers/specs/2026-10-24-agent-api-compatibility-design.md`.

@@ -111,8 +111,16 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 A working tool turn has `finish_reason: "tool_calls"` and a `tool_calls` array
 on the assistant message. A plain text answer with `finish_reason: "stop"`
-means the model or its chat template did not choose a tool; it is not a server
-error.
+means the model did not choose a tool; it is not a server error.
+
+Small models sometimes write the call as a single JSON object in `content`
+instead of the native `tool_calls` field. When the request carries tools and
+that object has a `name` matching one of the requested tools and an `arguments`
+object (or a JSON string that parses), the host backend promotes it to a
+`tool_calls` turn. It does not parse prose, unknown tool names, or multiple
+calls; those remain text. Tool requests are buffered until the turn ends so the
+server can make that decision. Requests without tools and
+`tool_choice: "none"` keep streaming unchanged.
 
 For streaming, add `"stream": true`. Tool-call fragments arrive as
 `choices[0].delta.tool_calls`, and the last chunk before `[DONE]` carries the
@@ -144,7 +152,7 @@ Add a custom provider to `opencode.json` (project) or
             "output": ["text"]
           },
           "limit": {
-            "context": 8192,
+            "context": 16384,
             "output": 2048
           }
         }
@@ -159,6 +167,12 @@ Then run `/models` and select the model, or start a run with:
 ```bash
 opencode run --model ai-upcycler/qwen2.5-coder-3b-instruct-q4_k_m "Read README.md and summarize it"
 ```
+
+Set `AI_UPCYCLER_CONTEXT=16384` when you start the app for this config. At
+8192, opencode's system prompt plus tool definitions can exceed the window and
+`llama-server` returns HTTP 400. On the 5.9 GB usable-RAM test host, the 3B at
+16k used about 2.45 GB and left little headroom; close other apps. For the
+built-in chat only, 8192 is the safer default.
 
 The endpoint needs no API key on loopback. Do not add one; the app does not
 authenticate requests. The `package` path above is the V2 runtime package. V1
@@ -196,10 +210,11 @@ chat UI is unchanged.
 |---|---|
 | `400` mentioning the host engine | Set `AI_UPCYCLER_MODEL` and `AI_UPCYCLER_LLAMA_SERVER` (or use the default `engine/` layout), then restart. Confirm both files exist. |
 | `404` for the model | The request id must match an id from `/v1/models`. The id is the file name without `.gguf`. |
-| Text instead of `tool_calls` | Use a tool-capable model (Qwen2.5-Coder), keep `--jinja` enabled, and check `finish_reason`. The 0.5B default model is not a reliable tool caller. |
+| Text instead of `tool_calls` | If the whole answer is one JSON object whose `name` matches a requested tool, the host backend promotes it. Prose, unknown names, and multiple calls stay text. Keep `--jinja` enabled, use a tool-capable model, and check `finish_reason`. The 0.5B default model is not a reliable tool caller. |
+| `400` on an agent turn | The prompt plus tools exceeded the context. Set `AI_UPCYCLER_CONTEXT` and `limit.context` to 16384, or lower `limit.output` / shorten the task. |
 | Tool arguments are cut off | The engine stopped at the output or context limit. Raise `limit.output` / `AI_UPCYCLER_CONTEXT`, or ask for a smaller edit. |
 | Port 8080 is already in use | Set `AI_UPCYCLER_API_PORT` to a free port and update the agent's base URL. |
-| Very slow or out of memory | Use the 3B Q4 model on an 8 GB host, close other apps, and keep the context at 8192. A 7B Q4 model needs about 16 GB of usable RAM. |
+| Very slow or out of memory | Use the 3B Q4 model on an 8 GB host, close other apps, and keep the context at 8192 for plain chat. opencode may need 16384 for its prompt plus tools; that leaves less headroom. A 7B Q4 model needs about 16 GB of usable RAM. |
 | Streaming stops after a tool call | Check the final chunk's `finish_reason`. A `length` reason means the model was truncated; the client should not execute a partial call. |
 
 ## 8. Limits and safety
@@ -212,9 +227,13 @@ chat UI is unchanged.
 - Distributed tool calling is not implemented. Cluster workers serve plain
   chat; tool requests stay on the host.
 - `response_format`, vision, audio, and multiple choices are out of scope.
+- The JSON-call promotion is a compatibility shim for small models. It only
+  accepts one JSON object whose name matches a requested tool; it is not a
+  general tool-calling guarantee. Tool requests are buffered, so their text is
+  not token-streamed.
 - A 3B model is useful for single-file, scoped edits. Multi-file refactors can
-  loop or hallucinate. The 7B class is the practical agent floor, but it needs
-  a 16 GB host.
+  loop or hallucinate. The JSON-call promotion covers simple single-tool turns;
+  the 7B class is the practical agent floor, but it needs a 16 GB host.
 - Performance numbers on this page are deliberately absent: they depend on the
   CPU, the quantisation, and the context. Measure on your own machine before
   relying on them.

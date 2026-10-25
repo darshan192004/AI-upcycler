@@ -25,7 +25,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use super::backend::{GenerationBackend, GenerationChunk, GenerationRequest, ToolCallDelta};
+use super::backend::{
+    FunctionCallDelta, GenerationBackend, GenerationChunk, GenerationRequest, ToolCallDelta,
+};
 
 /// Default GGUF used when no `AI_UPCYCLER_MODEL` override is set. Matches the
 /// Hugging Face file name so models saved by the download endpoint line up.
@@ -232,7 +234,8 @@ impl LlamaCppBackend {
         if !resp.status().is_success() {
             return Err(format!("llama-server returned HTTP {}", resp.status()));
         }
-        Ok(sse_chunks(resp.bytes_stream()))
+        let allowed_tools = requested_tool_names(request);
+        Ok(sse_chunks(resp.bytes_stream(), allowed_tools))
     }
 }
 
@@ -366,12 +369,179 @@ fn parse_sse_line(line: &str) -> SseLine {
     }
 }
 
-fn sse_chunks<S>(bytes: S) -> impl futures::Stream<Item = Result<GenerationChunk, String>>
+/// A tool call a model wrote as a single JSON object instead of the native
+/// `tool_calls` field. Small models do this even when the template asks for
+/// `<tool_call>` tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromotedToolCall {
+    name: String,
+    arguments: String,
+}
+
+/// The tool names a request allows the proxy to promote.
+///
+/// `tool_choice: "none"` disables promotion. A named function choice narrows
+/// it to that function; `auto`, `required`, or an absent choice allows every
+/// tool the client sent.
+fn requested_tool_names(request: &GenerationRequest) -> Vec<String> {
+    let Some(tools) = request.tools.as_ref() else {
+        return Vec::new();
+    };
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let named = request
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| match choice {
+            Value::String(choice) if choice == "none" => Some(None),
+            Value::Object(choice) => Some(
+                choice
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str),
+            ),
+            _ => None,
+        });
+    match named {
+        Some(None) => Vec::new(),
+        Some(Some(name)) => tools
+            .iter()
+            .filter(|tool| tool.function.name == name)
+            .map(|tool| tool.function.name.clone())
+            .collect(),
+        None => tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect(),
+    }
+}
+
+/// Parses a whole-turn text answer that is exactly one JSON tool call.
+///
+/// The JSON may be bare or in a JSON code fence. The name must match a tool the
+/// request allowed, and the arguments must be a JSON object or a JSON string
+/// that itself parses. Prose, multiple calls, and unknown names stay text.
+fn content_tool_call(content: &str, allowed: &[String]) -> Option<PromotedToolCall> {
+    let json = strip_json_fence(content)?;
+    let value: Value = serde_json::from_str(json).ok()?;
+    let object = value.as_object()?;
+    let name = object.get("name")?.as_str()?.trim();
+    if name.is_empty() || !allowed.iter().any(|allowed| allowed == name) {
+        return None;
+    }
+    let arguments = match object.get("arguments")? {
+        Value::String(arguments) => arguments.clone(),
+        Value::Object(_) => serde_json::to_string(object.get("arguments")?).ok()?,
+        _ => return None,
+    };
+    // OpenAI clients parse this string as JSON; a non-JSON string would make
+    // the promoted call invalid.
+    serde_json::from_str::<Value>(&arguments).ok()?;
+    Some(PromotedToolCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn strip_json_fence(content: &str) -> Option<&str> {
+    let text = content.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("```") {
+        let rest = rest.strip_suffix("```")?.trim();
+        let rest = rest
+            .strip_prefix("json")
+            .or_else(|| rest.strip_prefix("JSON"))
+            .unwrap_or(rest)
+            .trim();
+        Some(rest)
+    } else {
+        Some(text)
+    }
+}
+
+/// Turns a fully buffered tool turn into the chunks the API forwards.
+///
+/// Native calls win over text. A promoted call replaces the JSON text so the
+/// agent sees only the call. Anything else is replayed as one content chunk.
+fn finalize_buffered_turn(
+    content: String,
+    tokens: u32,
+    finish_reason: Option<String>,
+    native_calls: Vec<(ToolCallDelta, u32)>,
+    allowed: &[String],
+) -> Vec<GenerationChunk> {
+    if !native_calls.is_empty() {
+        let mut chunks = Vec::with_capacity(native_calls.len() + 1);
+        if !content.is_empty() {
+            chunks.push(GenerationChunk {
+                content,
+                ..Default::default()
+            });
+        }
+        for (call, call_tokens) in native_calls {
+            chunks.push(GenerationChunk {
+                tool_calls: Some(vec![call]),
+                tokens_emitted: call_tokens,
+                ..Default::default()
+            });
+        }
+        chunks.push(GenerationChunk {
+            finish_reason: Some("tool_calls".into()),
+            ..Default::default()
+        });
+        return chunks;
+    }
+
+    if let Some(call) = content_tool_call(&content, allowed) {
+        return vec![GenerationChunk {
+            tool_calls: Some(vec![ToolCallDelta {
+                index: 0,
+                id: Some(format!("call_{}", uuid::Uuid::new_v4())),
+                kind: Some("function".into()),
+                function: Some(FunctionCallDelta {
+                    name: Some(call.name),
+                    arguments: Some(call.arguments),
+                }),
+            }]),
+            tokens_emitted: tokens,
+            finish_reason: Some("tool_calls".into()),
+            ..Default::default()
+        }];
+    }
+
+    if content.is_empty() {
+        return vec![GenerationChunk {
+            finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".into())),
+            tokens_emitted: tokens,
+            ..Default::default()
+        }];
+    }
+
+    vec![GenerationChunk {
+        content,
+        tokens_emitted: tokens,
+        finish_reason: finish_reason.or_else(|| Some("stop".into())),
+        ..Default::default()
+    }]
+}
+
+fn sse_chunks<S>(
+    bytes: S,
+    allowed_tools: Vec<String>,
+) -> impl futures::Stream<Item = Result<GenerationChunk, String>>
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>>,
 {
     async_stream::stream! {
         let mut decoder = SseDecoder::new();
+        let buffered = !allowed_tools.is_empty();
+        let mut content = String::new();
+        let mut tokens: u32 = 0;
+        let mut finish_reason: Option<String> = None;
+        let mut native_calls: Vec<(ToolCallDelta, u32)> = Vec::new();
         futures::pin_mut!(bytes);
         while let Some(item) = bytes.next().await {
             let text = match item {
@@ -383,20 +553,51 @@ where
             };
             for line in decoder.push(&text) {
                 match line {
-                    SseLine::Done => return,
+                    SseLine::Done => {
+                        if buffered {
+                            for chunk in finalize_buffered_turn(
+                                std::mem::take(&mut content),
+                                tokens,
+                                finish_reason.take(),
+                                std::mem::take(&mut native_calls),
+                                &allowed_tools,
+                            ) {
+                                yield Ok(chunk);
+                            }
+                        }
+                        return;
+                    }
                     SseLine::Delta(delta) => {
-                        let tokens = if !delta.content.is_empty() || delta.tool_calls.is_some() {
+                        let chunk_tokens = if !delta.content.is_empty() || delta.tool_calls.is_some() {
                             1
                         } else {
                             0
                         };
-                        yield Ok(GenerationChunk {
-                            content: delta.content,
-                            tokens_emitted: tokens,
-                            tool_calls: delta.tool_calls,
-                            finish_reason: delta.finish_reason,
-                            ..Default::default()
-                        });
+                        if buffered {
+                            tokens += chunk_tokens;
+                            if !delta.content.is_empty() {
+                                content.push_str(&delta.content);
+                            }
+                            if let Some(calls) = delta.tool_calls {
+                                for (index, call) in calls.into_iter().enumerate() {
+                                    native_calls.push((
+                                        call,
+                                        if index == 0 { chunk_tokens } else { 0 },
+                                    ));
+                                }
+                            }
+                            if let Some(reason) = delta.finish_reason {
+                                finish_reason = Some(reason);
+                            }
+                        } else {
+                            yield Ok(GenerationChunk {
+                                content: delta.content,
+                                tokens_emitted: chunk_tokens,
+                                tool_calls: delta.tool_calls,
+                                finish_reason: delta.finish_reason,
+                                ..Default::default()
+                            });
+                        }
                     }
                     SseLine::Skip => {}
                     SseLine::Error(e) => {
@@ -404,6 +605,17 @@ where
                         return;
                     }
                 }
+            }
+        }
+        if buffered {
+            for chunk in finalize_buffered_turn(
+                content,
+                tokens,
+                finish_reason,
+                native_calls,
+                &allowed_tools,
+            ) {
+                yield Ok(chunk);
             }
         }
     }
@@ -447,6 +659,20 @@ mod tests {
             session_id: "s-test".into(),
             ..Default::default()
         }
+    }
+
+    fn tool_request() -> GenerationRequest {
+        let mut request = request();
+        request.tools = Some(vec![ToolDef {
+            kind: "function".into(),
+            function: FunctionDef {
+                name: "read".into(),
+                description: Some("Read a file".into()),
+                parameters: Some(serde_json::json!({ "type": "object" })),
+            },
+        }]);
+        request.tool_choice = Some(serde_json::json!("auto"));
+        request
     }
 
     #[test]
@@ -531,25 +757,96 @@ mod tests {
         ));
     }
 
-    async fn stub_llama_server() -> (String, tokio::task::JoinHandle<()>) {
+    #[test]
+    fn content_tool_call_accepts_bare_and_fenced_json() {
+        let allowed = vec!["read".to_string()];
+        assert_eq!(
+            content_tool_call(
+                r#"{"name":"read","arguments":{"path":"README.md"}}"#,
+                &allowed
+            ),
+            Some(PromotedToolCall {
+                name: "read".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            })
+        );
+        assert_eq!(
+            content_tool_call(
+                "```json\n{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n```",
+                &allowed
+            ),
+            Some(PromotedToolCall {
+                name: "read".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            })
+        );
+        assert_eq!(
+            content_tool_call("```\n{\"name\":\"read\",\"arguments\":{}}\n```", &allowed),
+            Some(PromotedToolCall {
+                name: "read".into(),
+                arguments: "{}".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn content_tool_call_rejects_unknown_names_prose_and_invalid_arguments() {
+        let allowed = vec!["read".to_string()];
+        assert!(content_tool_call(r#"{"name":"write","arguments":{}}"#, &allowed).is_none());
+        assert!(content_tool_call(
+            r#"Here is the call: {"name":"read","arguments":{}}"#,
+            &allowed
+        )
+        .is_none());
+        assert!(content_tool_call(
+            "```python\n{\"name\":\"read\",\"arguments\":{}}\n```",
+            &allowed
+        )
+        .is_none());
+        assert!(content_tool_call(r#"{"name":"read","arguments":"not json"}"#, &allowed).is_none());
+        assert!(content_tool_call(r#"{"name":"read","arguments":42}"#, &allowed).is_none());
+    }
+
+    #[test]
+    fn requested_tool_names_respects_tool_choice() {
+        let mut request = tool_request();
+        assert_eq!(requested_tool_names(&request), vec!["read".to_string()]);
+
+        request.tool_choice = Some(serde_json::json!("none"));
+        assert!(requested_tool_names(&request).is_empty());
+
+        request.tool_choice = Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": "read" }
+        }));
+        assert_eq!(requested_tool_names(&request), vec!["read".to_string()]);
+
+        request.tool_choice = Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": "write" }
+        }));
+        assert!(requested_tool_names(&request).is_empty());
+
+        request.tool_choice = None;
+        assert_eq!(requested_tool_names(&request), vec!["read".to_string()]);
+    }
+
+    async fn stub_server_with_events(events: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
         use axum::routing::post;
         let app = axum::Router::new().route(
             "/v1/chat/completions",
-            post(|body: axum::Json<Value>| async move {
-                assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
-                // `Event::data` adds the `data:` prefix itself.
-                let events = vec![
-                    "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}",
-                    "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}",
-                    "{\"choices\":[{\"delta\":{\"content\":\" world\"}}]}",
-                    "[DONE]",
-                ];
-                let stream = futures::stream::iter(
-                    events
-                        .into_iter()
-                        .map(|e| Ok::<_, std::convert::Infallible>(Event::default().data(e))),
-                );
-                Sse::new(stream).keep_alive(KeepAlive::default())
+            post(move |body: axum::Json<Value>| {
+                let events = events.clone();
+                async move {
+                    assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+                    // `Event::data` adds the `data:` prefix itself.
+                    let stream = futures::stream::iter(
+                        events
+                            .into_iter()
+                            .map(|e| Ok::<_, std::convert::Infallible>(Event::default().data(e))),
+                    );
+                    Sse::new(stream).keep_alive(KeepAlive::default())
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -558,6 +855,16 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), handle)
+    }
+
+    async fn stub_llama_server() -> (String, tokio::task::JoinHandle<()>) {
+        stub_server_with_events(vec![
+            serde_json::json!({"choices":[{"delta":{"role":"assistant"}}]}).to_string(),
+            serde_json::json!({"choices":[{"delta":{"content":"Hello"}}]}).to_string(),
+            serde_json::json!({"choices":[{"delta":{"content":" world"}}]}).to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await
     }
 
     #[tokio::test]
@@ -576,6 +883,99 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         let text: String = chunks.iter().map(|c| c.content.as_str()).collect();
         assert_eq!(text, "Hello world");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_backend_promotes_json_content_to_tool_calls() {
+        let content_start = r#"{"name": "read", "#;
+        let content_end = r#""arguments": {"path": "README.md"}}"#;
+        let (base_url, server) = stub_server_with_events(vec![
+            serde_json::json!({"choices":[{"delta":{"role":"assistant"}}]}).to_string(),
+            serde_json::json!({"choices":[{"delta":{"content": content_start}}]}).to_string(),
+            serde_json::json!({"choices":[{"delta":{"content": content_end}}]}).to_string(),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+        let backend = LlamaCppBackend::remote(&base_url);
+
+        let chunks: Vec<_> = backend
+            .generate(tool_request())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk ok"))
+            .collect();
+
+        assert_eq!(chunks.len(), 1, "the text call becomes one tool call");
+        assert!(
+            chunks[0].content.is_empty(),
+            "the JSON text is not replayed"
+        );
+        let call = &chunks[0].tool_calls.as_ref().expect("promoted call")[0];
+        assert!(call.id.as_deref().unwrap_or("").starts_with("call_"));
+        assert_eq!(call.kind.as_deref(), Some("function"));
+        assert_eq!(
+            call.function.as_ref().unwrap().name.as_deref(),
+            Some("read")
+        );
+        assert_eq!(
+            call.function.as_ref().unwrap().arguments.as_deref(),
+            Some(r#"{"path":"README.md"}"#)
+        );
+        assert_eq!(chunks[0].finish_reason.as_deref(), Some("tool_calls"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_backend_keeps_plain_content_when_tools_are_present() {
+        let (base_url, server) = stub_llama_server().await;
+        let backend = LlamaCppBackend::remote(&base_url);
+
+        let chunks: Vec<_> = backend
+            .generate(tool_request())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk ok"))
+            .collect();
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "buffered text arrives as one content chunk"
+        );
+        assert_eq!(chunks[0].content, "Hello world");
+        assert_eq!(chunks[0].finish_reason.as_deref(), Some("stop"));
+        assert!(chunks[0].tool_calls.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_backend_does_not_promote_when_tool_choice_is_none() {
+        let content = r#"{"name":"read","arguments":{}}"#;
+        let (base_url, server) = stub_server_with_events(vec![
+            serde_json::json!({"choices":[{"delta":{"content": content}}]}).to_string(),
+            serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string(),
+            "[DONE]".to_string(),
+        ])
+        .await;
+        let backend = LlamaCppBackend::remote(&base_url);
+        let mut request = tool_request();
+        request.tool_choice = Some(serde_json::json!("none"));
+
+        let chunks: Vec<_> = backend
+            .generate(request)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk ok"))
+            .collect();
+
+        let text: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert_eq!(text, content);
+        assert!(chunks.iter().all(|c| c.tool_calls.is_none()));
         server.abort();
     }
 

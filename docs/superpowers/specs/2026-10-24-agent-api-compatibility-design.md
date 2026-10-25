@@ -87,10 +87,12 @@ content (possibly empty).
 ### D-A6 - Host engine requirements
 
 `llama-server` is spawned with `--jinja` explicitly and a bounded context
-(`-c`, default 8192 on the current 8 GB host). Tool calling depends on the
-model's chat template, not on the API: the tested family is Qwen2.5-Coder
-(Q4_K_M). A model whose template cannot render tools returns plain text, which
-the agent reports as a failure to call tools.
+(`-c`, default 8192 on the current 8 GB host). opencode's system prompt plus
+tool definitions can exceed 8192; on a host with headroom, set
+`AI_UPCYCLER_CONTEXT=16384` and a matching client `limit.context`. Tool calling
+depends on the model's chat template, not on the API: the tested family is
+Qwen2.5-Coder (Q4_K_M). A model whose template cannot render tools returns plain
+text, which the agent reports as a failure to call tools.
 
 No authentication is added. The API remains loopback-only.
 
@@ -107,6 +109,31 @@ opencode uses the AI SDK's OpenAI-compatible provider:
 
 Kilo Code speaks the same surface and is expected to work without further
 server changes; it is verified after opencode.
+
+### D-A8 - Small-model text calls are promoted, narrowly (2026-10-25)
+
+The 3B Qwen2.5-Coder does not emit the template's `<tool_call>` tags even when
+the prompt asks for them. It writes a single JSON object such as
+`{"name":"read","arguments":{"path":"README.md"}}` in `content` and stops. The
+host backend now promotes that text to a `tool_calls` turn only when all of
+these hold:
+
+- the request carries tools and `tool_choice` is not `"none"`;
+- the whole content is one JSON object, bare or in a JSON code fence;
+- `name` matches a requested tool (or the one named by `tool_choice`);
+- `arguments` is a JSON object or a JSON string that itself parses.
+
+Prose, unknown names, multiple calls, and malformed arguments stay text. Native
+`tool_calls` from the engine win. Tool requests are buffered until `[DONE]` so
+the backend can make this decision; requests without tools and
+`tool_choice: "none"` keep the streaming path unchanged. This is a compatibility
+shim for small models, not a general tool-calling guarantee: the 3B still
+misreads multi-step tasks, and the 7B class remains the practical agent floor.
+
+The 16k context run on the 5.9 GB host used about 2.45 GB for the 3B and left
+little headroom. 8192 is still the engine default; opencode users need
+`AI_UPCYCLER_CONTEXT=16384` and a matching `limit.context` when the client's
+system prompt plus tools exceed 8192.
 
 ## Compatibility
 
