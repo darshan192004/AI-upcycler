@@ -26,7 +26,14 @@ export interface TopologyNode {
   device_name: string;
   connection: string;
   ram_total_mb: number;
+  /** Live used memory; `null` when the reading is unavailable. */
+  ram_used_mb: number | null;
+  /** Live available memory; `null` when the reading is unavailable. */
+  ram_available_mb: number | null;
+  /** The scheduler's plan, which is legitimately 0 for the master. */
   ram_assigned_mb: number;
+  /** `master`, `usb_detected`, `discovered`, `paired`, or `ready`. */
+  worker_state: string;
   assigned_layers: [number, number][];
   ping_ms: number;
 }
@@ -37,6 +44,7 @@ export interface Topology {
   active_model: string | null;
   total_pooled_ram_mb: number;
   used_pooled_ram_mb: number;
+  available_pooled_ram_mb: number;
   nodes: TopologyNode[];
   storage_mmap: StorageMmap;
   discovery?: DiscoveryStatus;

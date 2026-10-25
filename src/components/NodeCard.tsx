@@ -17,10 +17,61 @@ function formatMb(mb: number): string {
   return `${Math.round(mb)} MB`;
 }
 
-function connectionTone(connection: string): 'ok' | 'warn' | 'idle' {
-  const value = connection.toUpperCase();
-  if (value.includes('USB')) return 'ok';
-  if (value.includes('WIFI') || value.includes('MDNS')) return 'warn';
+function formatOptionalMb(mb: number | null): string {
+  return mb == null ? '—' : formatMb(mb);
+}
+
+function stateLabel(state: string): string {
+  switch (state) {
+    case 'usb_detected':
+      return 'USB detected';
+    case 'discovered':
+      return 'discovered';
+    case 'paired':
+      return 'paired';
+    case 'ready':
+      return 'ready';
+    case 'master':
+      return 'master';
+    default:
+      return state;
+  }
+}
+
+function stateTone(state: string): string {
+  switch (state) {
+    case 'ready':
+    case 'master':
+      return 'border-emerald-400/25 bg-emerald-500/10 text-emerald-300';
+    case 'usb_detected':
+      return 'border-amber-400/25 bg-amber-500/10 text-amber-300';
+    case 'paired':
+      return 'border-cyan-400/25 bg-cyan-500/10 text-cyan-300';
+    default:
+      return 'border-white/10 bg-white/5 text-slate-400';
+  }
+}
+
+function stateTitle(state: string): string {
+  switch (state) {
+    case 'usb_detected':
+      return 'ADB can see the phone, but the AI Upcycler worker app has not answered yet.';
+    case 'discovered':
+      return 'Discovered on Wi-Fi, but not paired with this master yet.';
+    case 'paired':
+      return 'Paired, but no model engine is open, so it cannot receive layers.';
+    case 'ready':
+      return 'Paired and serving an open model engine.';
+    case 'master':
+      return 'This machine coordinates the cluster and holds no layers.';
+    default:
+      return state;
+  }
+}
+
+function stateDotTone(state: string): 'ok' | 'warn' | 'idle' {
+  if (state === 'ready' || state === 'master') return 'ok';
+  if (state === 'paired' || state === 'usb_detected') return 'warn';
   return 'idle';
 }
 
@@ -34,8 +85,12 @@ interface NodeCardProps {
 }
 
 export function NodeCard({ node, index, health, thermal }: NodeCardProps) {
-  const ramRatio = node.ram_total_mb > 0 ? node.ram_assigned_mb / node.ram_total_mb : 0;
+  const ramRatio =
+    node.ram_used_mb != null && node.ram_total_mb > 0
+      ? Math.min(1, node.ram_used_mb / node.ram_total_mb)
+      : 0;
   const isMaster = node.role === 'master';
+  const pingKnown = isMaster || node.worker_state === 'ready' || node.ping_ms > 0;
   const stale =
     health !== undefined && Date.now() - health.observed_at_epoch_ms > STALE_AFTER_MS;
   const measured = health !== undefined && !stale;
@@ -57,12 +112,12 @@ export function NodeCard({ node, index, health, thermal }: NodeCardProps) {
       <div className="mb-3 flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <StatusDot tone={connectionTone(node.connection)} />
+            <StatusDot tone={stateDotTone(node.worker_state)} />
             <span className="truncate text-sm font-semibold text-slate-100">
               {node.device_name}
             </span>
           </div>
-          <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
             <span className="rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 font-mono uppercase tracking-wide">
               {node.connection}
             </span>
@@ -75,28 +130,48 @@ export function NodeCard({ node, index, health, thermal }: NodeCardProps) {
             >
               {node.role}
             </span>
+            {!isMaster && (
+              <span
+                className={`rounded-md border px-1.5 py-0.5 font-medium ${stateTone(
+                  node.worker_state,
+                )}`}
+                title={stateTitle(node.worker_state)}
+              >
+                {stateLabel(node.worker_state)}
+              </span>
+            )}
           </div>
         </div>
         <div className="text-right">
           <div className="font-mono text-xs text-slate-300">
-            {node.ping_ms < 1 ? '<1' : node.ping_ms.toFixed(1)} ms
+            {pingKnown ? `${node.ping_ms < 1 ? '<1' : node.ping_ms.toFixed(1)} ms` : '—'}
           </div>
           <div className="text-[10px] uppercase tracking-wider text-slate-500">ping</div>
         </div>
       </div>
 
       <div className="mb-1.5 flex items-baseline justify-between text-xs">
-        <span className="text-slate-400">RAM assigned</span>
-        <span className="font-mono text-slate-200">
-          {formatMb(node.ram_assigned_mb)}
+        <span className="text-slate-400">RAM in use</span>
+        <span className={`font-mono ${stale ? 'text-slate-500' : 'text-slate-200'}`}>
+          {formatOptionalMb(node.ram_used_mb)}
           <span className="text-slate-500"> / {formatMb(node.ram_total_mb)}</span>
         </span>
       </div>
       <ProgressBar
         value={ramRatio}
-        ariaLabel={`RAM usage for ${node.device_name}`}
+        ariaLabel={`RAM in use on ${node.device_name}`}
         shimmer={ramRatio > 0}
       />
+      <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500">
+        <span>
+          {node.ram_available_mb != null
+            ? `${formatMb(node.ram_available_mb)} available`
+            : 'available —'}
+        </span>
+        <span title="Scheduler assignment; the master holds no layers.">
+          assigned {formatMb(node.ram_assigned_mb)}
+        </span>
+      </div>
 
       {!isMaster && (
         <div className="mt-3 flex flex-wrap items-center gap-1.5">
@@ -130,14 +205,6 @@ export function NodeCard({ node, index, health, thermal }: NodeCardProps) {
             <Battery className="h-3 w-3" aria-hidden="true" />
             {health?.battery_pct != null ? `${Math.round(health.battery_pct)}%` : '—'}
           </span>
-          {health && !health.supports_compute && (
-            <span
-              className="flex items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/10 px-2 py-0.5 font-mono text-[11px] text-amber-300"
-              title="This worker answers health but has no model engine open, so it cannot receive layers."
-            >
-              metadata only
-            </span>
-          )}
           {stale && (
             <span className="text-[10px] uppercase tracking-wider text-slate-600">stale</span>
           )}
