@@ -45,6 +45,14 @@ export function DashboardView() {
   }, [topology?.thermal]);
   const totalGb = topology ? topology.total_pooled_ram_mb / 1024 : 0;
   const usedGb = topology ? topology.used_pooled_ram_mb / 1024 : 0;
+  const availableGb =
+    topology?.available_pooled_ram_mb != null
+      ? topology.available_pooled_ram_mb / 1024
+      : 0;
+  const unpairedDevices = workerNodes.filter(
+    (node) => node.worker_state === 'usb_detected' || node.worker_state === 'discovered',
+  );
+  const readyDevices = workerNodes.filter((node) => node.worker_state === 'ready');
   const tokS = latestMetrics?.tokens_per_second ?? 0;
   // One source of truth: the store keeps the freshest master RAM reading
   // from whichever event arrived last (the poll publishes it every cycle,
@@ -86,12 +94,13 @@ export function DashboardView() {
             <span className="ml-1 text-base font-normal text-slate-400">GB</span>
           </div>
           <div className="mt-1.5 flex items-center justify-between text-xs text-slate-400">
-            <span>
-              {usedGb.toFixed(1)} GB in use
-            </span>
+            <span>{usedGb.toFixed(1)} GB in use</span>
             <span className="font-mono text-emerald-400">
               {topology ? topology.nodes.length : 0} nodes
             </span>
+          </div>
+          <div className="mt-1 text-[11px] text-slate-500">
+            {availableGb.toFixed(1)} GB available
           </div>
         </GlowCard>
 
@@ -247,7 +256,8 @@ export function DashboardView() {
             )}
           </div>
           <span className="text-xs text-slate-500">
-            {workerNodes.length} worker{workerNodes.length === 1 ? '' : 's'} connected
+            {workerNodes.length} device{workerNodes.length === 1 ? '' : 's'} visible
+            {readyDevices.length > 0 ? ` · ${readyDevices.length} ready` : ''}
           </span>
         </div>
 
@@ -287,6 +297,21 @@ export function DashboardView() {
           <p className="mt-3 text-xs text-slate-500">
             Only the host is visible — connect an Android worker over USB or Wi-Fi to
             pool its memory.
+          </p>
+        )}
+
+        {workerNodes.length > 0 && readyDevices.length === 0 && unpairedDevices.length > 0 && (
+          <p className="mt-3 text-xs text-slate-500">
+            {unpairedDevices.length} device{unpairedDevices.length === 1 ? '' : 's'} detected
+            but not ready — open the AI Upcycler worker app on the phone and pair it to run
+            layers.
+          </p>
+        )}
+
+        {workerNodes.length > 0 && readyDevices.length === 0 && unpairedDevices.length === 0 && (
+          <p className="mt-3 text-xs text-slate-500">
+            Worker paired, but no model engine is open yet — load a model on the worker to
+            receive layers.
           </p>
         )}
       </motion.div>

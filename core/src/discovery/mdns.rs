@@ -115,6 +115,24 @@ impl NodeRegistry {
         self.publish_node_event(&node, true);
     }
 
+    /// Inserts or replaces a node, publishing a connect event only when the
+    /// node is new.
+    ///
+    /// The ADB poll refreshes a device's live capacity every few seconds; a
+    /// "connected" event per cycle would make the dashboard refetch for no
+    /// reason. The first sighting still announces the node.
+    pub fn upsert(&self, node: DiscoveredNode) {
+        let is_new = {
+            let mut map = self.nodes.lock().unwrap();
+            let is_new = !map.contains_key(&node.node_id);
+            map.insert(node.node_id.clone(), node.clone());
+            is_new
+        };
+        if is_new {
+            self.publish_node_event(&node, true);
+        }
+    }
+
     /// Removes a node that has left the cluster (e.g. an mDNS `ServiceRemoved`
     /// event). Returns the removed entry if it was known.
     pub fn remove(&self, node_id: &str) -> Option<DiscoveredNode> {
@@ -360,6 +378,35 @@ mod tests {
             rx.try_recv().expect("disconnect event"),
             crate::telemetry::TelemetryEvent::NodeDisconnected { .. }
         ));
+    }
+
+    #[test]
+    fn upsert_announces_only_the_first_sighting() {
+        let bus = crate::telemetry::TelemetryBus::new(8);
+        let mut rx = bus.subscribe();
+        let registry = NodeRegistry::with_events(bus);
+        let mut node =
+            DiscoveredNode::from_service_info(&sample_service_info()).expect("node built");
+
+        registry.upsert(node.clone());
+        assert!(matches!(
+            rx.try_recv().expect("first sighting event"),
+            crate::telemetry::TelemetryEvent::NodeConnected { .. }
+        ));
+
+        node.free_ram_bytes = 1;
+        registry.upsert(node);
+        assert!(
+            rx.try_recv().is_err(),
+            "a capacity refresh is not a new connection"
+        );
+        assert_eq!(
+            registry
+                .get_node("worker-1._aiupcycler-worker._tcp.local.")
+                .unwrap()
+                .free_ram_bytes,
+            1
+        );
     }
 
     #[test]

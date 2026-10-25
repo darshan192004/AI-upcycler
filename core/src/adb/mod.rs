@@ -9,14 +9,27 @@ use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
 use crate::rpc::engine::http_endpoint;
 use crate::rpc::proto::aiupcycler::rpc::HandshakeResponse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Local TCP port bridged to the worker RPC port on each USB-attached device.
 pub const ADB_FORWARD_PORT: u16 = 50052;
+
+/// How often the USB device list and each phone's live memory are refreshed.
+///
+/// The worker health poll already runs at 5 s; matching it keeps the dashboard
+/// on one cadence. `adb shell cat /proc/meminfo` is read-only and does not wake
+/// or launch the worker app.
+pub const ADB_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemInfo {
+    total_bytes: u64,
+    available_bytes: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdbDevice {
@@ -180,13 +193,15 @@ impl AdbTunnelManager {
         Ok(forwarded)
     }
 
-    /// USB bootstrap: forwards every authorized device, probes each tunneled
-    /// worker over RPC so only nodes with known RAM capacity are registered,
-    /// then stays alive until `shutdown` flips to `true`, at which point every
-    /// forward this task established is removed again.
+    /// USB bootstrap: polls every authorized device, keeps a forward per
+    /// device, and registers a node as soon as ADB can read its memory — even
+    /// before the worker app answers. The node is upgraded with worker-reported
+    /// capacity when the handshake succeeds.
     ///
-    /// Devices that fail to handshake are skipped rather than registered with
-    /// unknown capacity; their forwards are removed immediately.
+    /// Polling (rather than a one-shot startup pass) is what makes a phone
+    /// attached after launch appear, and what keeps its live RAM current. The
+    /// only device-side work is read-only `adb shell cat /proc/meminfo`; the
+    /// worker app is never launched here.
     pub async fn start(
         registry: Arc<NodeRegistry>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -196,59 +211,108 @@ impl AdbTunnelManager {
             return;
         }
 
-        let devices = match Self::new().forward_all() {
-            Ok(devices) => devices,
-            Err(e) => {
-                warn!("ADB: {e}");
-                return;
-            }
-        };
-
-        if devices.is_empty() {
-            info!("ADB: no authorized USB devices attached");
-            return;
-        }
-
-        let mut registered = 0;
         let manager = Self::new();
-        let mut established: Vec<(AdbDevice, u16)> = Vec::new();
-        for (device, local_port) in devices {
-            match probe_device(local_port).await {
-                Some(handshake) => {
-                    registry
-                        .register_or_update(node_from_handshake(&device, local_port, handshake));
-                    registered += 1;
-                    established.push((device, local_port));
+        let mut forwards: HashMap<String, u16> = HashMap::new();
+        info!(
+            "ADB: polling USB devices every {}s; unpaired phones are listed with live capacity",
+            ADB_POLL_INTERVAL.as_secs()
+        );
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            match Self::list_devices() {
+                Ok(devices) => {
+                    let devices: Vec<AdbDevice> = devices
+                        .into_iter()
+                        .filter(|device| device.state == "device")
+                        .collect();
+                    let present: HashSet<String> =
+                        devices.iter().map(|device| device.serial.clone()).collect();
+
+                    let departed: Vec<String> = forwards
+                        .keys()
+                        .filter(|serial| !present.contains(*serial))
+                        .cloned()
+                        .collect();
+                    for serial in departed {
+                        if let Some(local_port) = forwards.remove(&serial) {
+                            if let Err(e) = manager.remove_forward(&serial, local_port) {
+                                warn!("ADB: cleanup failed for {serial}: {e}");
+                            }
+                        }
+                        registry.remove(&format!("adb:{serial}"));
+                    }
+
+                    for device in devices {
+                        let local_port = match forwards.get(&device.serial) {
+                            Some(local_port) => *local_port,
+                            None => {
+                                let local_port = next_free_port(&forwards);
+                                match manager.forward(&device.serial, local_port) {
+                                    Ok(()) => {
+                                        forwards.insert(device.serial.clone(), local_port);
+                                        local_port
+                                    }
+                                    Err(e) => {
+                                        warn!("ADB: {e}");
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+
+                        let node_id = format!("adb:{}", device.serial);
+                        let existing = registry.get_node(&node_id);
+                        let node = merge_usb_node(
+                            existing.as_ref(),
+                            usb_detected_node(&device, read_meminfo(&device.serial)),
+                        );
+                        if existing.is_some() {
+                            registry.upsert(node);
+                        } else {
+                            registry.register_or_update(node);
+                        }
+
+                        // The phone is listed before its worker app runs. Probe
+                        // the RPC port until it answers; success upgrades this
+                        // same node with worker-reported capacity and a
+                        // dialable port, which puts it on the health-poll path.
+                        let needs_probe = registry
+                            .get_node(&node_id)
+                            .map(|node| node.port == 0)
+                            .unwrap_or(false);
+                        if needs_probe {
+                            if let Some(handshake) = probe_device(local_port).await {
+                                registry.register_or_update(node_from_handshake(
+                                    &device, local_port, handshake,
+                                ));
+                            }
+                        }
+                    }
                 }
-                None => {
-                    warn!(
-                        "ADB: no handshake from {}; leaving device unregistered",
-                        device.serial
-                    );
-                    if let Err(e) = manager.remove_forward(&device.serial, local_port) {
-                        warn!("ADB: cleanup failed for {}: {e}", device.serial);
+                Err(e) => warn!("ADB: {e}"),
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(ADB_POLL_INTERVAL) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() {
+                        break;
                     }
                 }
             }
         }
 
-        info!(
-            "ADB: registered {registered} USB device(s); waiting for shutdown to tear down {} tunnel(s)",
-            established.len()
-        );
-
-        while !*shutdown.borrow() {
-            if shutdown.changed().await.is_err() {
-                break;
+        for (serial, local_port) in forwards {
+            if let Err(e) = manager.remove_forward(&serial, local_port) {
+                warn!("ADB: shutdown cleanup failed for {serial}: {e}");
             }
+            registry.remove(&format!("adb:{serial}"));
         }
-
-        for (device, local_port) in &established {
-            if let Err(e) = manager.remove_forward(&device.serial, *local_port) {
-                warn!("ADB: shutdown cleanup failed for {}: {e}", device.serial);
-            }
-        }
-        info!("ADB: removed {} tunnel(s) on shutdown", established.len());
+        info!("ADB: USB polling stopped");
     }
 }
 
@@ -341,6 +405,95 @@ fn node_from_handshake(
         latency_ms: 0.0,
         last_seen_epoch_ms: now_epoch_ms(),
     }
+}
+
+/// A phone ADB can see, but whose worker app has not answered the RPC
+/// handshake yet. Port 0 means "not dialable": the health poll skips it, and
+/// the topology still shows its real total/available memory.
+fn usb_detected_node(device: &AdbDevice, mem: Option<MemInfo>) -> DiscoveredNode {
+    DiscoveredNode {
+        node_id: format!("adb:{}", device.serial),
+        device_name: device.label(),
+        ip_address: "127.0.0.1".to_string(),
+        port: 0,
+        total_ram_bytes: mem.map(|mem| mem.total_bytes).unwrap_or(0),
+        free_ram_bytes: mem.map(|mem| mem.available_bytes).unwrap_or(0),
+        connection_type: "USB_ADB".to_string(),
+        latency_ms: 0.0,
+        last_seen_epoch_ms: now_epoch_ms(),
+    }
+}
+
+/// Keeps the worker handshake's dialable port and name while refreshing the
+/// phone's live memory from `/proc/meminfo`. Without this, every ADB poll
+/// would reset the port to 0 and knock the worker off the health-poll path.
+fn merge_usb_node(existing: Option<&DiscoveredNode>, fresh: DiscoveredNode) -> DiscoveredNode {
+    let Some(existing) = existing else {
+        return fresh;
+    };
+    let mut node = fresh;
+    node.port = existing.port;
+    node.latency_ms = existing.latency_ms;
+    if node.total_ram_bytes == 0 {
+        node.total_ram_bytes = existing.total_ram_bytes;
+        node.free_ram_bytes = existing.free_ram_bytes;
+    }
+    if !existing.device_name.is_empty() {
+        node.device_name = existing.device_name.clone();
+    }
+    node
+}
+
+/// Reads the phone's live memory without touching the worker app.
+fn read_meminfo(serial: &str) -> Option<MemInfo> {
+    let output = Command::new("adb")
+        .args(["-s", serial, "shell", "cat", "/proc/meminfo"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_meminfo(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses the `MemTotal`/`MemAvailable` lines from Android's `/proc/meminfo`.
+/// Older devices may omit `MemAvailable`; `MemFree` is the honest fallback.
+fn parse_meminfo(output: &str) -> Option<MemInfo> {
+    let mut total_kb = None;
+    let mut available_kb = None;
+    let mut free_kb = None;
+    for line in output.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(value) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(value) = value.parse::<u64>() else {
+            continue;
+        };
+        match key.trim() {
+            "MemTotal" => total_kb = Some(value),
+            "MemAvailable" => available_kb = Some(value),
+            "MemFree" => free_kb = Some(value),
+            _ => {}
+        }
+    }
+    let total_kb = total_kb.filter(|total| *total > 0)?;
+    let available_kb = available_kb.or(free_kb).unwrap_or(0).min(total_kb);
+    Some(MemInfo {
+        total_bytes: total_kb.saturating_mul(1024),
+        available_bytes: available_kb.saturating_mul(1024),
+    })
+}
+
+/// Lowest loopback port not already assigned to another attached device.
+fn next_free_port(forwards: &HashMap<String, u16>) -> u16 {
+    let mut port = ADB_FORWARD_PORT;
+    while forwards.values().any(|used| *used == port) {
+        port = port.saturating_add(1);
+    }
+    port
 }
 
 /// Argument vector for the pairing reverse tunnel, factored out so unit tests
@@ -544,9 +697,85 @@ mod tests {
     }
 
     #[test]
-    fn distinct_devices_get_distinct_local_ports() {
-        let base = ADB_FORWARD_PORT;
-        assert_ne!(base, base + 1);
-        assert_eq!(base + 1, 50053);
+    fn parses_android_meminfo() {
+        let info = parse_meminfo(
+            "MemTotal:        5714584 kB\n\
+             MemFree:          164068 kB\n\
+             MemAvailable:    2527724 kB\n",
+        )
+        .expect("meminfo parsed");
+
+        assert_eq!(info.total_bytes, 5_714_584 * 1024);
+        assert_eq!(info.available_bytes, 2_527_724 * 1024);
+    }
+
+    #[test]
+    fn meminfo_falls_back_to_mem_free_and_rejects_unknown_total() {
+        let info = parse_meminfo("MemTotal: 1000 kB\nMemFree: 250 kB\n").expect("parsed");
+        assert_eq!(info.available_bytes, 250 * 1024);
+
+        assert!(parse_meminfo("MemFree: 250 kB\n").is_none());
+        assert!(parse_meminfo("MemTotal: 0 kB\n").is_none());
+    }
+
+    #[test]
+    fn a_usb_device_is_listed_before_its_worker_app_answers() {
+        let device = device("16284c49", "Redmi_Note_9_Pro_Max");
+        let node = usb_detected_node(
+            &device,
+            Some(MemInfo {
+                total_bytes: 5_714_584 * 1024,
+                available_bytes: 2_527_724 * 1024,
+            }),
+        );
+
+        assert_eq!(node.node_id, "adb:16284c49");
+        assert_eq!(node.device_name, "Redmi_Note_9_Pro_Max");
+        assert_eq!(node.port, 0, "not dialable until the handshake");
+        assert_eq!(node.total_ram_bytes, 5_714_584 * 1024);
+        assert_eq!(node.free_ram_bytes, 2_527_724 * 1024);
+        assert_eq!(node.connection_type, "USB_ADB");
+    }
+
+    #[test]
+    fn a_meminfo_refresh_keeps_the_handshake_port_and_name() {
+        let handshake = HandshakeResponse {
+            worker_id: "w1".to_string(),
+            device_name: "Redmi Note 9 Pro Max".to_string(),
+            total_ram_bytes: 6 * 1024 * 1024 * 1024,
+            free_ram_bytes: 3 * 1024 * 1024 * 1024,
+            cpu_cores: 8,
+            has_npu_acceleration: false,
+            supports_last_row_logits: false,
+        };
+        let existing = node_from_handshake(
+            &device("16284c49", "Redmi_Note_9_Pro_Max"),
+            50052,
+            handshake,
+        );
+        let fresh = usb_detected_node(
+            &device("16284c49", "Redmi_Note_9_Pro_Max"),
+            Some(MemInfo {
+                total_bytes: 5 * 1024 * 1024 * 1024,
+                available_bytes: 2 * 1024 * 1024 * 1024,
+            }),
+        );
+
+        let merged = merge_usb_node(Some(&existing), fresh);
+
+        assert_eq!(merged.port, 50052, "the handshake port survives polling");
+        assert_eq!(merged.device_name, "Redmi Note 9 Pro Max");
+        assert_eq!(merged.total_ram_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(merged.free_ram_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn next_free_port_skips_ports_already_in_use() {
+        let mut forwards = HashMap::new();
+        forwards.insert("a".to_string(), ADB_FORWARD_PORT);
+        assert_eq!(next_free_port(&forwards), ADB_FORWARD_PORT + 1);
+
+        forwards.insert("b".to_string(), ADB_FORWARD_PORT + 1);
+        assert_eq!(next_free_port(&forwards), ADB_FORWARD_PORT + 2);
     }
 }
