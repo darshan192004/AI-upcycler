@@ -1,9 +1,9 @@
 //! ADB USB tunnel manager.
 //!
 //! Bridges Android worker devices into the master node's localhost namespace via
-//! `adb forward tcp:50052 tcp:50052`, then probes each tunneled worker over RPC
+//! `adb forward tcp:50062 tcp:50062`, then probes each tunneled worker over RPC
 //! so its real RAM/device metadata is known before scheduling. Workers reached
-//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50052`.
+//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50062`.
 
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use crate::rpc::client::{MASTER_ID, PROTOCOL_VERSION};
@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Local TCP port bridged to the worker RPC port on each USB-attached device.
-pub const ADB_FORWARD_PORT: u16 = 50052;
+pub const ADB_FORWARD_PORT: u16 = 50062;
 
 /// How often the USB device list and each phone's live memory are refreshed.
 ///
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn forward_port_matches_worker_rpc_port() {
-        assert_eq!(ADB_FORWARD_PORT, 50052);
+        assert_eq!(ADB_FORWARD_PORT, 50062);
     }
 
     use crate::security::{PairingManager, PAIRING_TTL};
