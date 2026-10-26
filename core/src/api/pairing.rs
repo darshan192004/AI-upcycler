@@ -107,10 +107,13 @@ pub async fn enroll(
         .ca
         .issue_server_cert(&addresses)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    state
-        .security
-        .enrollments
-        .enroll(node_id, device_name, addresses);
+    let serial = state.pairing_tunnels.serial_for_pin(req.pin.trim());
+    for id in enrollment_ids(node_id, serial.as_deref()) {
+        state
+            .security
+            .enrollments
+            .enroll(&id, device_name, addresses.clone());
+    }
 
     Ok(Json(EnrollResponse {
         ca_pem: state.security.ca.ca_pem(),
@@ -152,10 +155,51 @@ fn declared_addresses(declared: Option<Vec<String>>) -> ApiResult<Vec<String>> {
     Ok(addresses)
 }
 
+/// The enrollment keys for one completed pairing: the worker's declared
+/// `node_id` plus the ADB serial alias when the dashboard created the session.
+fn enrollment_ids(node_id: &str, serial: Option<&str>) -> Vec<String> {
+    let mut ids = vec![node_id.to_string()];
+    if let Some(serial) = serial {
+        let alias = format!("adb:{serial}");
+        if alias != node_id {
+            ids.push(alias);
+        }
+    }
+    ids
+}
+
 fn map_pairing_error(e: PairingError) -> ApiError {
     match e {
         PairingError::AlreadyUsed => ApiError::Conflict(e.to_string()),
         PairingError::Credential(msg) => ApiError::Internal(msg),
         PairingError::InvalidPin | PairingError::Expired => ApiError::Forbidden(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enrollment_ids;
+
+    #[test]
+    fn enrollment_ids_include_the_adb_alias_when_a_tunnel_is_tracked() {
+        assert_eq!(
+            enrollment_ids("Redmi._aiupcycler-worker._tcp.local.", Some("16284c49")),
+            vec![
+                "Redmi._aiupcycler-worker._tcp.local.".to_string(),
+                "adb:16284c49".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn enrollment_ids_do_not_duplicate_an_adb_node_id() {
+        assert_eq!(
+            enrollment_ids("adb:16284c49", Some("16284c49")),
+            vec!["adb:16284c49".to_string()]
+        );
+        assert_eq!(
+            enrollment_ids("phone.local.", None),
+            vec!["phone.local.".to_string()]
+        );
     }
 }

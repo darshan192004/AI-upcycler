@@ -354,6 +354,19 @@ impl PairingTunnelRegistry {
             .expect("pairing tunnel lock")
             .contains_key(serial)
     }
+
+    /// The ADB serial whose pairing tunnel currently backs `pin`, if any.
+    ///
+    /// The enrollment handler uses this to record the `adb:<serial>` alias, so
+    /// a phone that enrolled under its mDNS fullname is also reachable by the
+    /// USB discovery identity.
+    pub fn serial_for_pin(&self, pin: &str) -> Option<String> {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .iter()
+            .find_map(|(serial, tracked)| (tracked == pin).then(|| serial.clone()))
+    }
 }
 
 /// Polls the registry and removes pairing reverse tunnels whose session has
@@ -611,6 +624,18 @@ mod tests {
 
         registry.track("emulator-5554", &pin);
         assert_eq!(registry.purge_inactive(&pairing), vec!["emulator-5554"]);
+    }
+
+    #[test]
+    fn serial_for_pin_finds_the_tracked_device() {
+        let tunnels = PairingTunnelRegistry::default();
+        tunnels.track("16284c49", "815896");
+
+        assert_eq!(
+            tunnels.serial_for_pin("815896"),
+            Some("16284c49".to_string())
+        );
+        assert_eq!(tunnels.serial_for_pin("000000"), None);
     }
 
     #[test]
