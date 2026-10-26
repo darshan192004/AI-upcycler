@@ -98,10 +98,6 @@ pub fn run() {
     // Bridge USB-attached Android workers on a background task. The task stays
     // alive after bootstrap so it can remove `adb forward` tunnels on shutdown.
     let (adb_shutdown_tx, adb_shutdown_rx) = tokio::sync::watch::channel(false);
-    let adb_registry = registry.clone();
-    tauri::async_runtime::spawn(async move {
-        ai_upcycler_core::adb::AdbTunnelManager::start(adb_registry, adb_shutdown_rx).await;
-    });
 
     let server_registry = registry.clone();
     let app = tauri::Builder::default()
@@ -131,6 +127,20 @@ pub fn run() {
             // `prepare_pairing` resolves this shared state; its Arcs are the
             // same instances the API listeners below serve from.
             app.manage(state.clone());
+
+            // The ADB probe must resolve the same enrollment-aware transport as
+            // the health poller; spawn it after the shared AppState (and its
+            // security state) exists.
+            let adb_registry = server_registry.clone();
+            let adb_transports = state.transports();
+            tauri::async_runtime::spawn(async move {
+                ai_upcycler_core::adb::AdbTunnelManager::start(
+                    adb_registry,
+                    adb_transports,
+                    adb_shutdown_rx,
+                )
+                .await;
+            });
 
             let api_port = api::resolve_api_port(API_PORT);
             let state_for_api = state.clone();

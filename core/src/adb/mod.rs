@@ -6,8 +6,8 @@
 //! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50052`.
 
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
-use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
-use crate::rpc::engine::http_endpoint;
+use crate::rpc::client::{MASTER_ID, PROTOCOL_VERSION};
+use crate::rpc::engine::{dial_worker, WorkerTransportSource};
 use crate::rpc::proto::aiupcycler::rpc::HandshakeResponse;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -204,6 +204,7 @@ impl AdbTunnelManager {
     /// worker app is never launched here.
     pub async fn start(
         registry: Arc<NodeRegistry>,
+        transports: Arc<dyn WorkerTransportSource>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         if !Self::is_available() {
@@ -285,7 +286,9 @@ impl AdbTunnelManager {
                             .map(|node| node.port == 0)
                             .unwrap_or(false);
                         if needs_probe {
-                            if let Some(handshake) = probe_device(local_port).await {
+                            if let Some(handshake) =
+                                probe_device(transports.as_ref(), &device.serial, local_port).await
+                            {
                                 registry.register_or_update(node_from_handshake(
                                     &device, local_port, handshake,
                                 ));
@@ -390,9 +393,23 @@ pub async fn pairing_tunnel_cleanup(
     }
 }
 
-async fn probe_device(local_port: u16) -> Option<HandshakeResponse> {
-    let endpoint = http_endpoint("127.0.0.1", local_port);
-    let mut client = WorkerRpcClient::connect(&endpoint).await.ok()?;
+async fn probe_device(
+    transports: &dyn WorkerTransportSource,
+    serial: &str,
+    local_port: u16,
+) -> Option<HandshakeResponse> {
+    let node = DiscoveredNode {
+        node_id: format!("adb:{serial}"),
+        device_name: String::new(),
+        ip_address: "127.0.0.1".to_string(),
+        port: local_port,
+        total_ram_bytes: 0,
+        free_ram_bytes: 0,
+        connection_type: "USB_ADB".to_string(),
+        latency_ms: 0.0,
+        last_seen_epoch_ms: now_epoch_ms(),
+    };
+    let mut client = dial_worker(transports, &node).await.ok()?;
     client.handshake(MASTER_ID, PROTOCOL_VERSION).await.ok()
 }
 
@@ -636,6 +653,34 @@ mod tests {
             Some("16284c49".to_string())
         );
         assert_eq!(tunnels.serial_for_pin("000000"), None);
+    }
+
+    #[tokio::test]
+    async fn probe_uses_the_adb_alias_for_transport_lookup() {
+        struct RecordingTransports {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl crate::rpc::engine::WorkerTransportSource for RecordingTransports {
+            fn transport_for(
+                &self,
+                node_id: &str,
+            ) -> Result<crate::rpc::engine::WorkerTransport, String> {
+                self.seen.lock().unwrap().push(node_id.to_string());
+                Err("stop before dialing".to_string())
+            }
+        }
+
+        let transports = RecordingTransports {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = probe_device(&transports, "16284c49", 50052).await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            *transports.seen.lock().unwrap(),
+            vec!["adb:16284c49".to_string()]
+        );
     }
 
     #[test]
