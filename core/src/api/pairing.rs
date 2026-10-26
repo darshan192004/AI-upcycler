@@ -90,6 +90,12 @@ pub async fn enroll(
     }
     let addresses = declared_addresses(req.addresses)?;
 
+    // Capture the tunnel's serial before redeeming: redemption makes the
+    // session ineligible, and the cleanup task may purge the tunnel before the
+    // certificate work below finishes. The alias is only enrolled after the
+    // PIN itself is accepted.
+    let serial = state.pairing_tunnels.serial_for_pin(req.pin.trim());
+
     // The PIN is single-use, so only spend it once the request is known good.
     state
         .security
@@ -107,7 +113,6 @@ pub async fn enroll(
         .ca
         .issue_server_cert(&addresses)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let serial = state.pairing_tunnels.serial_for_pin(req.pin.trim());
     for id in enrollment_ids(node_id, serial.as_deref()) {
         state
             .security
