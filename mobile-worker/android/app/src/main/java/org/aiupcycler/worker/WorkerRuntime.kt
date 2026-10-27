@@ -34,6 +34,14 @@ class WorkerRuntime(private val context: Context) {
     private val library = ModelStore(context.filesDir.resolve(MODELS_DIR))
     @Volatile private var engine: WorkerEngine? = null
     @Volatile private var rpcServer: WorkerRpcServer? = null
+
+    /**
+     * Whether this runtime is meant to be serving. Set by [start], cleared by
+     * [stop], it is what lets [restartServing] tell "the caller never started
+     * us" apart from "our start failed" - both leave [rpcServer] `null`, but
+     * only the second should be recovered by a fresh pairing.
+     */
+    @Volatile private var shouldServe = false
     private val advertiser =
         MdnsAdvertiser(context, metrics, "AI Upcycler Worker ${identity.deviceName}")
     private val credentials = CredentialStore(context.filesDir.resolve(PAIRING_DIR))
@@ -71,6 +79,10 @@ class WorkerRuntime(private val context: Context) {
 
     @Synchronized
     fun start() {
+        // Set before the attempt: a failed start still leaves the runtime "meant
+        // to serve", so a later pairing can recover it instead of silently
+        // doing nothing.
+        shouldServe = true
         if (rpcServer != null) return
         if (engine == null) {
             val selected = library.selected()
@@ -91,6 +103,7 @@ class WorkerRuntime(private val context: Context) {
 
     @Synchronized
     fun stop() {
+        shouldServe = false
         advertiser.stop()
         rpcServer?.stop()
         rpcServer = null
@@ -150,9 +163,11 @@ class WorkerRuntime(private val context: Context) {
             try {
                 credentials.save(result.credentials)
                 // Only now, with the credentials on disk, does the port stop
-                // accepting plaintext (spec D-B5). A failure to restart leaves
-                // the worker serving plaintext rather than half-configured, and
-                // says so - the next start() picks TLS up from the store.
+                // accepting plaintext (spec D-B5). If the restart fails it
+                // throws, so this reports "Could not store credentials" instead
+                // of claiming a pairing that is not actually being served; the
+                // port is then closed - neither plaintext nor mTLS - and the
+                // next start() picks TLS up from the store.
                 restartServing()
                 Log.i(TAG, "paired with the master; credentials stored, serving mTLS")
             } catch (e: Exception) {
@@ -164,16 +179,31 @@ class WorkerRuntime(private val context: Context) {
 
     /**
      * Re-reads the pairing and the current engine, then restarts the server in
-     * the mode they imply. A stopped runtime stays stopped; the next start()
-     * picks both up from disk.
+     * the mode they imply.
+     *
+     * A runtime that was never started, or whose start failed, is started here -
+     * that is the recovery path after a pairing replaces credentials the worker
+     * could not read. A runtime the caller has [stop]ped stays stopped; the next
+     * start() picks both up from disk.
+     *
+     * Throws if the new credentials cannot be read, so the caller cannot report
+     * a pairing as complete while nothing is serving.
      */
     @Synchronized
     private fun restartServing() {
-        val running = rpcServer ?: return
-        running.stop()
+        val running = rpcServer
         rpcServer = null
+        running?.stop()
+        if (!shouldServe) return
         val server = WorkerRpcServer(identity, metrics, engine)
-        server.start(credentials.load())
+        try {
+            server.start(credentials.load())
+        } catch (e: Exception) {
+            // Leave nothing half-started; the port being closed is the safe
+            // half-state, and the caller is told by the rethrow.
+            server.stop()
+            throw e
+        }
         rpcServer = server
     }
 
