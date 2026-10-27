@@ -7,7 +7,7 @@
 //! worker→master — then records the enrollment against the declared `node_id`.
 //! Both live on the loopback-only local API.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -30,17 +30,48 @@ pub struct PairingSessionResponse {
     pub fingerprint: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateSessionParams {
+    /// ADB serial of the device this session is for.
+    ///
+    /// Without it the session still works, but a device that enrols under its
+    /// mDNS name gets no `adb:<serial>` alias - and the USB probe dials exactly
+    /// that alias, so the pairing would never be usable over USB. Tracking also
+    /// makes [`crate::adb::pairing_tunnel_cleanup`] open and keep re-asserting
+    /// the device's `adb reverse` to the pairing listener, which is how the
+    /// worker reaches `POST /api/pairing/enroll` at its own loopback.
+    #[serde(default)]
+    pub serial: Option<String>,
+}
+
 pub async fn create_session(
     State(state): State<AppState>,
+    Query(params): Query<CreateSessionParams>,
 ) -> ApiResult<Json<PairingSessionResponse>> {
     let fingerprint = state.security.ca.fingerprint().to_string();
     let (pin, qr_payload, expires_in_secs) = state.security.pairing.create_session(&fingerprint);
+
+    // Only after the session exists: the tunnel is keyed by the PIN it serves.
+    if let Some(serial) = tracked_serial(&params) {
+        state.pairing_tunnels.track(serial, &pin);
+    }
+
     Ok(Json(PairingSessionResponse {
         pin,
         qr_payload,
         expires_in_secs,
         fingerprint,
     }))
+}
+
+/// The serial to track, treating blank input as absent so a stray `?serial=`
+/// cannot enrol an alias literally named `adb:`.
+fn tracked_serial(params: &CreateSessionParams) -> Option<&str> {
+    params
+        .serial
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,7 +214,27 @@ fn map_pairing_error(e: PairingError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::enrollment_ids;
+    use super::{enrollment_ids, tracked_serial, CreateSessionParams};
+
+    #[test]
+    fn a_blank_serial_is_not_tracked() {
+        // A stray `?serial=` must not track a tunnel whose alias would be the
+        // bare string "adb:" - that would enrol a device identity nothing can
+        // ever dial, and leave a reverse tunnel keyed to it.
+        assert_eq!(tracked_serial(&CreateSessionParams::default()), None);
+        assert_eq!(
+            tracked_serial(&CreateSessionParams {
+                serial: Some("   ".into())
+            }),
+            None
+        );
+        assert_eq!(
+            tracked_serial(&CreateSessionParams {
+                serial: Some("  16284c49 ".into())
+            }),
+            Some("16284c49")
+        );
+    }
 
     #[test]
     fn enrollment_ids_include_the_adb_alias_when_a_tunnel_is_tracked() {
