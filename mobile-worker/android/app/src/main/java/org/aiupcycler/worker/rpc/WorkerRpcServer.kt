@@ -66,15 +66,16 @@ class WorkerRpcServer(
     }
 
     /**
-     * The TLS context, or a throw. [WorkerTls.serverContext] returning `null`
-     * means the stored credentials cannot be parsed; that throws rather than
-     * degrading to plaintext, because a paired worker silently serving
-     * plaintext on the mTLS port is the failure this whole slice exists to
-     * prevent.
+     * The TLS context for [credentials].
+     *
+     * [WorkerTls.serverContext] throws - with netty's own parse failure chained
+     * as the cause - when the stored credentials cannot be read. That throw
+     * propagates out of [start] rather than degrading to plaintext, because a
+     * paired worker silently serving plaintext on the mTLS port is the failure
+     * this whole slice exists to prevent.
      */
     private fun tlsContext(credentials: WorkerCredentials): SslContext =
         WorkerTls.serverContext(credentials)
-            ?: throw IllegalStateException("stored pairing credentials cannot be read")
 
     private companion object {
         const val SHUTDOWN_SECONDS = 5L
