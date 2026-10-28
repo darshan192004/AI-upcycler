@@ -144,11 +144,20 @@ pub async fn enroll(
         .ca
         .issue_server_cert(&addresses)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    for id in enrollment_ids(node_id, serial.as_deref()) {
+    let ids = enrollment_ids(node_id, serial.as_deref());
+    for id in &ids {
         state
             .security
             .enrollments
-            .enroll(&id, device_name, addresses.clone());
+            .enroll(id, device_name, addresses.clone());
+    }
+    // One phone reaches the master under two ids: its mDNS fullname over Wi-Fi
+    // and `adb:<serial>` over USB. Enrolment is the only moment both are known
+    // at once, so record the link here; the registry then reports the device
+    // once instead of showing a phantom third card and double-counting its RAM
+    // in the planner.
+    if let Some(alias) = ids.iter().find(|id| id.starts_with("adb:")) {
+        state.registry.link_alias(alias, node_id);
     }
 
     Ok(Json(EnrollResponse {

@@ -66,6 +66,15 @@ impl DiscoveredNode {
 #[derive(Clone, Default)]
 pub struct NodeRegistry {
     nodes: Arc<Mutex<HashMap<String, DiscoveredNode>>>,
+    /// `alias node_id -> canonical node_id` for one physical worker reachable
+    /// under more than one id.
+    ///
+    /// A paired phone appears twice: its mDNS fullname over Wi-Fi and
+    /// `adb:<serial>` over USB. Enrolment learns that those are the same
+    /// device, and [`NodeRegistry::list_nodes`] collapses them. Without this
+    /// the dashboard shows a phantom third card and the planner assigns layers
+    /// to the same phone twice, double-counting its RAM.
+    aliases: Arc<Mutex<HashMap<String, String>>>,
     /// Optional telemetry fan-out; `None` keeps the registry headless (pure
     /// state container). Attached via [`NodeRegistry::with_events`].
     events: Option<TelemetryBus>,
@@ -79,6 +88,7 @@ impl NodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
+            aliases: Arc::new(Mutex::new(HashMap::new())),
             events: None,
             mdns_active: Arc::new(AtomicBool::new(false)),
         }
@@ -88,9 +98,32 @@ impl NodeRegistry {
     pub fn with_events(bus: TelemetryBus) -> Self {
         Self {
             nodes: Arc::new(Mutex::new(HashMap::new())),
+            aliases: Arc::new(Mutex::new(HashMap::new())),
             events: Some(bus),
             mdns_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Records that `alias` and `canonical` are the same physical worker.
+    ///
+    /// Learned at enrolment, which is the only place both ids are known at
+    /// once. The mapping outlives a node leaving the registry: unplugging USB
+    /// and plugging it back in must not resurrect the duplicate.
+    pub fn link_alias(&self, alias: &str, canonical: &str) {
+        if alias.is_empty() || canonical.is_empty() || alias == canonical {
+            return;
+        }
+        self.aliases
+            .lock()
+            .unwrap()
+            .insert(alias.to_string(), canonical.to_string());
+    }
+
+    /// The id this node is reported under: itself unless enrolment linked it to
+    /// another.
+    pub fn canonical_id(&self, node_id: &str) -> String {
+        let aliases = self.aliases.lock().unwrap();
+        resolve_alias(&aliases, node_id)
     }
 
     /// Marks the mDNS browser as running (`true`) or stopped (`false`).
@@ -150,9 +183,27 @@ impl NodeRegistry {
         removed
     }
 
+    /// Every known worker, with aliases of the same physical device collapsed.
+    ///
+    /// The single place that decides "how many workers are there": topology,
+    /// the planner, the health poll and the dashboard all read this, so
+    /// collapsing here keeps them consistent instead of each de-duplicating
+    /// (or forgetting to) on its own.
     pub fn list_nodes(&self) -> Vec<DiscoveredNode> {
         let map = self.nodes.lock().unwrap();
-        map.values().cloned().collect()
+        let aliases = self.aliases.lock().unwrap();
+
+        let mut chosen: HashMap<String, &DiscoveredNode> = HashMap::new();
+        for node in map.values() {
+            let canonical = resolve_alias(&aliases, &node.node_id);
+            match chosen.get(&canonical) {
+                Some(current) if !preferred(node, current) => {}
+                _ => {
+                    chosen.insert(canonical, node);
+                }
+            }
+        }
+        chosen.into_values().cloned().collect()
     }
 
     pub fn get_node(&self, node_id: &str) -> Option<DiscoveredNode> {
@@ -177,6 +228,35 @@ impl NodeRegistry {
             TelemetryEvent::node_disconnected(data)
         };
         bus.publish(event);
+    }
+}
+
+/// Follows an alias to the id its device is reported under.
+///
+/// Enrolment only ever creates one hop; the bounded walk keeps a hypothetical
+/// alias-of-alias from looping forever.
+fn resolve_alias(aliases: &HashMap<String, String>, node_id: &str) -> String {
+    let mut current = node_id;
+    for _ in 0..4 {
+        match aliases.get(current) {
+            Some(next) if next != current => current = next.as_str(),
+            _ => break,
+        }
+    }
+    current.to_string()
+}
+
+/// Which of two ids for the same device to report.
+///
+/// USB wins: the ADB forward is the transport pairing establishes, and it keeps
+/// working when Wi-Fi drops off. Otherwise the freshest sighting wins, so a
+/// stale entry cannot mask a live one.
+fn preferred(candidate: &DiscoveredNode, current: &DiscoveredNode) -> bool {
+    let usb = |node: &DiscoveredNode| node.connection_type == "USB_ADB";
+    match (usb(candidate), usb(current)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => candidate.last_seen_epoch_ms > current.last_seen_epoch_ms,
     }
 }
 
@@ -416,5 +496,80 @@ mod tests {
         let node_id = node.node_id.clone();
         registry.register_or_update(node);
         registry.remove(&node_id);
+    }
+
+    fn sighting(node_id: &str, connection_type: &str, last_seen_epoch_ms: u64) -> DiscoveredNode {
+        DiscoveredNode {
+            node_id: node_id.to_string(),
+            device_name: "Redmi Note 9 Pro Max".to_string(),
+            ip_address: "192.168.1.13".to_string(),
+            port: 50062,
+            total_ram_bytes: 6_000_000_000,
+            free_ram_bytes: 2_300_000_000,
+            connection_type: connection_type.to_string(),
+            latency_ms: 1.0,
+            last_seen_epoch_ms,
+        }
+    }
+
+    #[test]
+    fn aliases_of_one_worker_are_reported_once() {
+        let registry = NodeRegistry::new();
+        let wifi = "Redmi._aiupcycler-worker._tcp.local.";
+        registry.register_or_update(sighting(wifi, "WIFI_MDNS", 10));
+        registry.register_or_update(sighting("adb:16284c49", "USB_ADB", 20));
+        assert_eq!(
+            registry.list_nodes().len(),
+            2,
+            "unlinked ids are still two sightings"
+        );
+
+        registry.link_alias("adb:16284c49", wifi);
+
+        let nodes = registry.list_nodes();
+        assert_eq!(nodes.len(), 1, "one phone must not be counted twice");
+        assert_eq!(
+            nodes[0].node_id, "adb:16284c49",
+            "the USB sighting is the one reported, because the ADB forward survives Wi-Fi loss"
+        );
+        assert_eq!(registry.canonical_id("adb:16284c49"), wifi);
+        assert_eq!(
+            registry.canonical_id(wifi),
+            wifi,
+            "the canonical id resolves to itself"
+        );
+    }
+
+    #[test]
+    fn an_alias_stays_linked_across_a_usb_replug() {
+        let registry = NodeRegistry::new();
+        let wifi = "Redmi._aiupcycler-worker._tcp.local.";
+        registry.register_or_update(sighting(wifi, "WIFI_MDNS", 10));
+        registry.link_alias("adb:16284c49", wifi);
+        registry.register_or_update(sighting("adb:16284c49", "USB_ADB", 20));
+
+        // USB unplugged: only the Wi-Fi sighting remains, still one device.
+        registry.remove("adb:16284c49");
+        assert_eq!(registry.list_nodes().len(), 1);
+        assert_eq!(registry.list_nodes()[0].node_id, wifi);
+
+        // Plugged back in: the link must survive, or the phantom card returns.
+        registry.register_or_update(sighting("adb:16284c49", "USB_ADB", 30));
+        let nodes = registry.list_nodes();
+        assert_eq!(nodes.len(), 1, "a replug must not resurrect the duplicate");
+        assert_eq!(nodes[0].node_id, "adb:16284c49");
+    }
+
+    #[test]
+    fn usb_sighting_wins_over_a_fresher_wifi_one() {
+        let registry = NodeRegistry::new();
+        let wifi = "Redmi._aiupcycler-worker._tcp.local.";
+        registry.register_or_update(sighting(wifi, "WIFI_MDNS", 50));
+        registry.link_alias("adb:16284c49", wifi);
+        registry.register_or_update(sighting("adb:16284c49", "USB_ADB", 10));
+
+        // USB is preferred on transport, not recency, so a stale USB entry still
+        // wins over a fresh Wi-Fi one - that is the transport we can dial.
+        assert_eq!(registry.list_nodes()[0].node_id, "adb:16284c49");
     }
 }
