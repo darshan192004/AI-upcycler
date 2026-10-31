@@ -28,7 +28,7 @@ jobs:
       # needed and none is present — see the official GitHub integration docs.
       - name: PR Agent action step
         id: pragent
-        uses: the-pr-agent/pr-agent@v0.47.0
+        uses: the-pr-agent/pr-agent@v0.49.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # litellm reads GEMINI_API_KEY natively for the "gemini/" provider
