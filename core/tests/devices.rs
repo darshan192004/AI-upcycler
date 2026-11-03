@@ -148,6 +148,30 @@ async fn revoking_an_enrolled_device_removes_the_enrollment() {
 }
 
 #[tokio::test]
+async fn revoking_works_even_when_adb_is_missing() {
+    // Taking a device out of the cluster must not depend on the control-plane
+    // binary: a build with no platform-tools can still revoke.
+    let state = AppState::new(
+        "cluster-1".into(),
+        Arc::new(NodeRegistry::new()),
+        Arc::new(Store::open_in_memory().expect("store")),
+        Arc::new(StubBackend::new()),
+        TelemetryBus::new(8),
+        HostInfo::default(),
+    );
+    state
+        .security
+        .enrollments
+        .enroll("phone-a", "Pixel 8", vec!["10.0.0.5".into()]);
+    let app = router(state);
+
+    let (status, body) = call(app, "DELETE", "/api/devices/phone-a").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["revoked"], true);
+}
+
+#[tokio::test]
 async fn onboarding_endpoints_say_why_they_are_off_when_adb_is_missing() {
     // A build without platform-tools still serves the cluster; it just cannot
     // touch devices, and says so instead of failing somewhere confusing.

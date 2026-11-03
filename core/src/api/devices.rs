@@ -94,17 +94,23 @@ pub async fn install(
 ///
 /// Removes the enrollment first, so a phone that keeps its ADB connection
 /// still cannot serve: the transport rule refuses a worker with no enrollment.
+///
+/// Revoking does **not** require adb. A build without platform-tools can still
+/// take a device out of the cluster; the disconnect is the only part that needs
+/// a control-plane binary, and it is best effort.
 pub async fn revoke(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RevokeResponse>, ApiError> {
-    let service = state.onboarding.clone().ok_or_else(unavailable)?;
+    let onboarding = state.onboarding.clone();
     let security = state.security.clone();
 
     let revoked = tokio::task::spawn_blocking(move || {
-        // Best effort: the device may already be gone from ADB, and that must
-        // not stop the enrollment from being removed.
-        let _ = service.disconnect(&id);
+        if let Some(service) = onboarding {
+            // Best effort: the device may already be gone from ADB, and that
+            // must not stop the enrollment from being removed.
+            let _ = service.disconnect(&id);
+        }
         security.enrollments.revoke(&id)
     })
     .await
