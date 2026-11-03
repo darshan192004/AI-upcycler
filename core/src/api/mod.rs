@@ -285,10 +285,14 @@ fn discover_onboarding() -> Option<Arc<crate::onboarding::OnboardingService>> {
     let mut service = crate::onboarding::OnboardingService::new(Arc::new(adb), discovery, version);
 
     // The APK is optional: without it, Install explains that this build does
-    // not ship one instead of failing at the last moment.
-    match std::env::var("AI_UPCYCLER_WORKER_APK") {
-        Ok(apk) if !apk.is_empty() => service = service.with_worker_apk(apk),
-        _ => {}
+    // not ship one instead of failing at the last moment. An explicit path wins
+    // over the bundled copy so a developer can point at a fresh debug build.
+    let apk = crate::onboarding::resolve_worker_apk(
+        std::env::var_os("AI_UPCYCLER_WORKER_APK").map(PathBuf::from),
+        crate::onboarding::bundled_worker_apk(),
+    );
+    if let Some(apk) = apk {
+        service = service.with_worker_apk(apk.to_string_lossy().to_string());
     }
 
     Some(Arc::new(service))

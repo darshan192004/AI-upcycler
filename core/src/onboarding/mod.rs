@@ -31,6 +31,33 @@ pub const CONSENT_POLL: Duration = Duration::from_secs(2);
 /// `AI_UPCYCLER_WORKER_VERSION` when it ships a different APK.
 pub const DEFAULT_WORKER_VERSION: &str = "0.1.0";
 
+/// Picks the APK to install: an explicit path wins, then a bundled one, and
+/// only if the file is actually there.
+///
+/// A path that does not exist is treated as absent rather than as an error, so
+/// a stale environment variable cannot turn Install into a confusing
+/// `INSTALL_FAILED` from adb.
+pub fn resolve_worker_apk(
+    explicit: Option<std::path::PathBuf>,
+    bundled: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    explicit
+        .filter(|path| path.is_file())
+        .or_else(|| bundled.filter(|path| path.is_file()))
+}
+
+/// `resources/worker/ai-upcycler-worker.apk` beside the executable, which is
+/// where a bundled Tauri resource lands.
+pub fn bundled_worker_apk() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(
+        exe.parent()?
+            .join("resources")
+            .join("worker")
+            .join("ai-upcycler-worker.apk"),
+    )
+}
+
 /// What the dashboard shows for one device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -720,5 +747,53 @@ mod tests {
         let record = service.connect("not-a-device");
 
         assert!(matches!(record.state, OnboardingState::Failed { .. }));
+    }
+
+    fn apk_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ai-upcycler-apk-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn an_explicit_apk_wins_over_the_bundled_copy() {
+        let dir = apk_dir("explicit");
+        let explicit = dir.join("explicit.apk");
+        let bundled = dir.join("bundled.apk");
+        std::fs::write(&explicit, b"explicit").expect("write");
+        std::fs::write(&bundled, b"bundled").expect("write");
+
+        assert_eq!(
+            resolve_worker_apk(Some(explicit.clone()), Some(bundled)),
+            Some(explicit),
+            "a developer pointing at a fresh debug build should get that build"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_explicit_path_falls_back_to_the_bundled_apk() {
+        let dir = apk_dir("stale");
+        let bundled = dir.join("bundled.apk");
+        std::fs::write(&bundled, b"bundled").expect("write");
+
+        assert_eq!(
+            resolve_worker_apk(Some(dir.join("deleted.apk")), Some(bundled.clone())),
+            Some(bundled),
+            "an environment variable pointing at a deleted file is not a failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_apk_anywhere_is_none_so_install_can_explain_itself() {
+        assert_eq!(resolve_worker_apk(None, None), None);
+        assert_eq!(
+            resolve_worker_apk(Some("does-not-exist.apk".into()), None),
+            None
+        );
     }
 }
