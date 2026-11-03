@@ -1,7 +1,11 @@
 import type {
+  AvailableDevice,
+  AvailableDevicesResponse,
   ChatRequest,
   DownloadRequest,
   ModelList,
+  RevokeResponse,
+  ScanResponse,
   Topology,
 } from './types';
 
@@ -14,15 +18,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...init?.headers },
   });
   if (!resp.ok) {
-    let detail = `${resp.status}`;
+    // Error bodies are plain text from the device endpoints and JSON from the
+    // older ones; read the text once so neither shape is lost.
+    const text = await resp.text();
+    let detail = text || `${resp.status}`;
     try {
-      const body = (await resp.json()) as {
+      const body = JSON.parse(text) as {
         detail?: string;
         error?: { message?: string };
       };
       detail = body.detail ?? body.error?.message ?? detail;
     } catch {
-      // keep status code as the error detail
+      // plain text is already the detail
     }
     throw new Error(detail);
   }
@@ -92,4 +99,45 @@ export async function streamChat(
     }
   }
   onDone();
+}
+
+// ---- device onboarding (spec 2026-11-03, slice A) --------------------------
+
+export function getAvailableDevices(): Promise<AvailableDevicesResponse> {
+  return request<AvailableDevicesResponse>('/api/devices/available');
+}
+
+/**
+ * Starts onboarding. This can take up to two minutes: the server waits for the
+ * user to approve Android's own "Allow USB debugging?" dialog, which we cannot
+ * draw or dismiss ourselves.
+ */
+export function connectDevice(id: string): Promise<AvailableDevice> {
+  return request<AvailableDevice>(
+    `/api/devices/${encodeURIComponent(id)}/connect`,
+    { method: 'POST' },
+  );
+}
+
+export function installWorker(id: string): Promise<AvailableDevice> {
+  return request<AvailableDevice>(
+    `/api/devices/${encodeURIComponent(id)}/install`,
+    { method: 'POST' },
+  );
+}
+
+/** Removes the enrollment and drops the ADB connection. */
+export function revokeDevice(id: string): Promise<RevokeResponse> {
+  return request<RevokeResponse>(
+    `/api/devices/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  );
+}
+
+/** One opt-in port sweep. `subnet` is the first three octets, e.g. 192.168.1. */
+export function scanNetwork(subnet: string): Promise<ScanResponse> {
+  return request<ScanResponse>(
+    `/api/devices/scan?subnet=${encodeURIComponent(subnet)}`,
+    { method: 'POST' },
+  );
 }
