@@ -162,15 +162,17 @@ nobody.
 adb shell am start -n org.aiupcycler.worker/.MainActivity \
   --es aiupcycler.auto_enroll true \
   --es aiupcycler.pin <pin> \
-  --es aiupcycler.api_base http://127.0.0.1:8081 \
-  --es aiupcycler.ca_fingerprint <hex>
+  --es aiupcycler.ca_fingerprint <64 hex chars>
 ```
 
 3. `MainActivity` reads the extras on create and on `onNewIntent`, and drives
    the existing enrollment client (`PairingState`/credential store) with no user
-   input.
-4. The phone posts to `/api/pairing/enroll` over the `adb reverse` tunnel, which
-   the existing code already sets up.
+   input. Extras are validated by `AutoEnrollExtras`, which delegates to
+   `PairingUri` — the same validation the typed path uses, so a malformed
+   fingerprint fails with the same message.
+4. The phone posts to `/api/pairing/enroll` over the `adb reverse` tunnel. The
+   enroll URL is already a constant (`127.0.0.1:<tunnel port>`), so no address
+   needs to be passed in the intent.
 
 **Why reuse the PIN rather than add a new endpoint:** the PIN is already
 single-use, TTL-bound, and covered by tests. The only new thing is delivery, and
