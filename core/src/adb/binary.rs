@@ -45,10 +45,13 @@ impl AdbBinary {
 
     /// Runs adb with `args`, returning the raw output.
     pub fn run(&self, args: &[&str]) -> Result<Output, String> {
-        Command::new(&self.path)
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to run {} {}: {e}", self.path.display(), args.join(" ")))
+        Command::new(&self.path).args(args).output().map_err(|e| {
+            format!(
+                "failed to run {} {}: {e}",
+                self.path.display(),
+                args.join(" ")
+            )
+        })
     }
 
     /// Runs adb and returns stdout, treating a non-zero exit as an error.
@@ -143,8 +146,12 @@ mod tests {
     fn an_explicit_binary_wins_over_everything_else() {
         let explicit = temp_file("adb-explicit");
         let bundled = temp_file("adb-bundled");
-        let chosen = resolve_from(Some(explicit.clone()), Some(bundled), Some(PathBuf::from("adb")))
-            .expect("explicit wins");
+        let chosen = resolve_from(
+            Some(explicit.clone()),
+            Some(bundled),
+            Some(PathBuf::from("adb")),
+        )
+        .expect("explicit wins");
         assert_eq!(chosen.path(), explicit);
     }
 
