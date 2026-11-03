@@ -5,6 +5,9 @@
 //! so its real RAM/device metadata is known before scheduling. Workers reached
 //! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50062`.
 
+pub mod binary;
+pub mod wireless;
+
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
 use crate::rpc::client::{MASTER_ID, PROTOCOL_VERSION};
 use crate::rpc::engine::{dial_worker, WorkerTransportSource};
