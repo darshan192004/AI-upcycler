@@ -1,13 +1,16 @@
 //! ADB USB tunnel manager.
 //!
 //! Bridges Android worker devices into the master node's localhost namespace via
-//! `adb forward tcp:50052 tcp:50052`, then probes each tunneled worker over RPC
+//! `adb forward tcp:50062 tcp:50062`, then probes each tunneled worker over RPC
 //! so its real RAM/device metadata is known before scheduling. Workers reached
-//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50052`.
+//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50062`.
+
+pub mod binary;
+pub mod wireless;
 
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
-use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
-use crate::rpc::engine::http_endpoint;
+use crate::rpc::client::{MASTER_ID, PROTOCOL_VERSION};
+use crate::rpc::engine::{dial_worker, WorkerTransportSource};
 use crate::rpc::proto::aiupcycler::rpc::HandshakeResponse;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -16,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Local TCP port bridged to the worker RPC port on each USB-attached device.
-pub const ADB_FORWARD_PORT: u16 = 50052;
+pub const ADB_FORWARD_PORT: u16 = 50062;
 
 /// How often the USB device list and each phone's live memory are refreshed.
 ///
@@ -84,20 +87,44 @@ impl AdbTunnelManager {
         Ok(parse_devices(&String::from_utf8_lossy(&output.stdout)))
     }
 
-    /// Establishes a port forward for a single device serial.
+    /// Establishes a port forward for a single device serial and reports it.
     ///
     /// `local_port` is the loopback port the master connects to; the worker's
     /// own RPC port is always [`ADB_FORWARD_PORT`] on the device side.
+    ///
+    /// This is the first-time path. [`Self::ensure_forward`] is the same
+    /// command without the log line, because the USB poll loop re-issues it on
+    /// every tick and a live binding is the expected result of each one.
     pub fn forward(&self, serial: &str, local_port: u16) -> Result<(), String> {
-        let remote = format!("tcp:{ADB_FORWARD_PORT}");
-        let local = format!("tcp:{local_port}");
+        self.ensure_forward(serial, local_port)?;
+        info!("ADB: forwarded {serial} -> 127.0.0.1:{local_port}");
+        Ok(())
+    }
+
+    /// Re-asserts a port forward for a single device serial.
+    ///
+    /// `adb forward <serial> tcp:P tcp:Q` is idempotent — re-issuing a binding
+    /// that already exists succeeds and leaves the carried traffic alone — so
+    /// the USB poll loop can run it every tick. It has to: `adb` drops every
+    /// forward when its server restarts or when a device re-enumerates, while
+    /// this process's own record of the bindings stays put. A loop that
+    /// trusted that record would keep dialing a tunnel that no longer exists,
+    /// and would never repair it either, because the node already carries a
+    /// port and so never gets re-probed — worker health then stays dead until
+    /// the phone is unplugged. Re-issuing costs one subprocess per device per
+    /// tick, the same as reading `adb forward --list` would, and needs no
+    /// parsing of what that command returned.
+    ///
+    /// Silent on success: a live binding is news only the first time. Failures
+    /// are still reported, so a loopback port taken by something else surfaces
+    /// as an error instead of a silently dead tunnel.
+    pub fn ensure_forward(&self, serial: &str, local_port: u16) -> Result<(), String> {
         let output = Command::new("adb")
-            .args(["-s", serial, "forward", &local, &remote])
+            .args(forward_args(serial, local_port))
             .output()
             .map_err(|e| format!("failed to run 'adb forward' for {serial}: {e}"))?;
 
         if output.status.success() {
-            info!("ADB: forwarded {serial} -> 127.0.0.1:{local_port}");
             Ok(())
         } else {
             Err(format!(
@@ -130,18 +157,43 @@ impl AdbTunnelManager {
     /// (`adb -s <serial> reverse tcp:8081 tcp:8081`), so the worker app can
     /// POST `/api/pairing/enroll` at `127.0.0.1:8081` without the API leaving
     /// host loopback (spec 2026-10-20, D-B2; docs/security.md §3).
+    ///
+    /// Reports the tunnel it opened; [`Self::ensure_reverse_pairing`] is the
+    /// quiet re-assert the cleanup task repeats while a session is pending.
     pub fn reverse_pairing(&self, serial: &str) -> Result<(), String> {
-        let args = reverse_pairing_args(serial);
+        self.ensure_reverse_pairing(serial)?;
+        info!(
+            "ADB: pairing reverse tunnel up for {serial} -> 127.0.0.1:{}",
+            crate::api::PAIRING_PORT
+        );
+        Ok(())
+    }
+
+    /// Re-asserts the pairing reverse tunnel for `serial`.
+    ///
+    /// The binding dies exactly when [`Self::ensure_forward`] does — an `adb`
+    /// server restart or a USB re-enumeration clears every reverse along with
+    /// every forward — and nothing else in this process recreates one: the
+    /// tunnel is opened once when the dashboard prepares a session, and after
+    /// that the cleanup task only ever *removes* it. A reverse dropped mid
+    /// session is therefore invisible from both ends — the worker's enroll
+    /// POST is simply refused at its own loopback, while the master still
+    /// shows a live PIN — so the cleanup task re-issues this for every session
+    /// still awaiting enrollment.
+    ///
+    /// Note that `adb reverse --list` keys a reverse by the device *transport*
+    /// (`UsbFfs`) rather than by the serial the command was issued with, so
+    /// presence cannot be checked against that listing by serial; re-issuing
+    /// the idempotent command avoids the question entirely.
+    ///
+    /// Silent on success, for the same reason as [`Self::ensure_forward`].
+    pub fn ensure_reverse_pairing(&self, serial: &str) -> Result<(), String> {
         let output = Command::new("adb")
-            .args(&args)
+            .args(reverse_pairing_args(serial))
             .output()
             .map_err(|e| format!("failed to run 'adb reverse' for {serial}: {e}"))?;
 
         if output.status.success() {
-            info!(
-                "ADB: pairing reverse tunnel up for {serial} -> 127.0.0.1:{}",
-                crate::api::PAIRING_PORT
-            );
             Ok(())
         } else {
             Err(format!(
@@ -204,6 +256,7 @@ impl AdbTunnelManager {
     /// worker app is never launched here.
     pub async fn start(
         registry: Arc<NodeRegistry>,
+        transports: Arc<dyn WorkerTransportSource>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         if !Self::is_available() {
@@ -247,22 +300,31 @@ impl AdbTunnelManager {
                     }
 
                     for device in devices {
-                        let local_port = match forwards.get(&device.serial) {
-                            Some(local_port) => *local_port,
-                            None => {
-                                let local_port = next_free_port(&forwards);
-                                match manager.forward(&device.serial, local_port) {
-                                    Ok(()) => {
-                                        forwards.insert(device.serial.clone(), local_port);
-                                        local_port
-                                    }
-                                    Err(e) => {
-                                        warn!("ADB: {e}");
-                                        continue;
-                                    }
-                                }
-                            }
+                        // Captured before the tick so a genuinely new binding
+                        // is reported once, not on every subsequent poll.
+                        let assigned = forwards.get(&device.serial).copied();
+                        let local_port = match assigned {
+                            Some(local_port) => local_port,
+                            None => next_free_port(&forwards),
                         };
+
+                        // Re-assert on every tick, not just on first sight.
+                        // `adb` drops all forwards when its server restarts or
+                        // when the device re-enumerates, while this map keeps
+                        // the binding it recorded. Trusting that record would
+                        // leave the loop dialing a tunnel that no longer
+                        // exists — and would never repair it either, because
+                        // the node already carries a port and so is never
+                        // re-probed — which is how worker health dies until
+                        // the phone is unplugged.
+                        if let Err(e) = manager.ensure_forward(&device.serial, local_port) {
+                            warn!("ADB: {e}");
+                            continue;
+                        }
+                        if assigned.is_none() {
+                            info!("ADB: forwarded {} -> 127.0.0.1:{local_port}", device.serial);
+                        }
+                        forwards.insert(device.serial.clone(), local_port);
 
                         let node_id = format!("adb:{}", device.serial);
                         let existing = registry.get_node(&node_id);
@@ -285,7 +347,9 @@ impl AdbTunnelManager {
                             .map(|node| node.port == 0)
                             .unwrap_or(false);
                         if needs_probe {
-                            if let Some(handshake) = probe_device(local_port).await {
+                            if let Some(handshake) =
+                                probe_device(transports.as_ref(), &device.serial, local_port).await
+                            {
                                 registry.register_or_update(node_from_handshake(
                                     &device, local_port, handshake,
                                 ));
@@ -354,32 +418,92 @@ impl PairingTunnelRegistry {
             .expect("pairing tunnel lock")
             .contains_key(serial)
     }
+
+    /// The serials whose session is still redeemable: the tunnels that must
+    /// keep accepting `POST /api/pairing/enroll`, as opposed to
+    /// [`Self::purge_inactive`], which returns the ones to tear down.
+    ///
+    /// Read by the cleanup task to re-assert a tunnel `adb` has dropped behind
+    /// its back while the session it serves is still live.
+    pub fn active(&self, pairing: &crate::security::PairingManager) -> Vec<String> {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .iter()
+            .filter(|(_, pin)| pairing.session_usable(pin))
+            .map(|(serial, _)| serial.clone())
+            .collect()
+    }
+
+    /// The ADB serial whose pairing tunnel currently backs `pin`, if any.
+    ///
+    /// The enrollment handler uses this to record the `adb:<serial>` alias, so
+    /// a phone that enrolled under its mDNS fullname is also reachable by the
+    /// USB discovery identity.
+    pub fn serial_for_pin(&self, pin: &str) -> Option<String> {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .iter()
+            .find_map(|(serial, tracked)| (tracked == pin).then(|| serial.clone()))
+    }
 }
 
-/// Polls the registry and removes pairing reverse tunnels whose session has
-/// completed or expired (spec 2026-10-20, D-B8). Removal is best-effort: a
-/// failed `adb reverse --remove` is logged and the entry dropped so the poll
-/// does not retry a device that is gone forever; the device-side entry itself
-/// only ever reaches a listener that refuses every redemption (the session
-/// behind it is already dead).
+/// Polls the registry, retires pairing reverse tunnels whose session has
+/// completed or expired (spec 2026-10-20, D-B8), and re-asserts the ones still
+/// awaiting enrollment.
+///
+/// Removal is best-effort: a failed `adb reverse --remove` is logged and the
+/// entry dropped so the poll does not retry a device that is gone forever; the
+/// device-side entry itself only ever reaches a listener that refuses every
+/// redemption (the session behind it is already dead).
+///
+/// Re-asserting matters just as much: `adb` clears every reverse when its
+/// server restarts or a device re-enumerates, and nothing else in this process
+/// opens one — the tunnel is created once when a session is prepared, after
+/// which this task only ever removed it. A reverse dropped mid-session is
+/// invisible from both ends: the worker's enroll POST is refused at its own
+/// loopback while the master still shows a live PIN, so pairing fails with no
+/// error on either side. The task therefore runs every 2 s for as long as a
+/// session is redeemable.
 pub async fn pairing_tunnel_cleanup(
     security: Arc<crate::security::SecurityState>,
     tunnels: Arc<PairingTunnelRegistry>,
 ) {
+    let manager = AdbTunnelManager::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         tick.tick().await;
         for serial in tunnels.purge_inactive(&security.pairing) {
-            if let Err(e) = AdbTunnelManager::new().remove_reverse_pairing(&serial) {
+            if let Err(e) = manager.remove_reverse_pairing(&serial) {
                 warn!("ADB: pairing tunnel cleanup for {serial}: {e}");
+            }
+        }
+        for serial in tunnels.active(&security.pairing) {
+            if let Err(e) = manager.ensure_reverse_pairing(&serial) {
+                warn!("ADB: pairing tunnel re-assert failed for {serial}: {e}");
             }
         }
     }
 }
 
-async fn probe_device(local_port: u16) -> Option<HandshakeResponse> {
-    let endpoint = http_endpoint("127.0.0.1", local_port);
-    let mut client = WorkerRpcClient::connect(&endpoint).await.ok()?;
+async fn probe_device(
+    transports: &dyn WorkerTransportSource,
+    serial: &str,
+    local_port: u16,
+) -> Option<HandshakeResponse> {
+    let node = DiscoveredNode {
+        node_id: format!("adb:{serial}"),
+        device_name: String::new(),
+        ip_address: "127.0.0.1".to_string(),
+        port: local_port,
+        total_ram_bytes: 0,
+        free_ram_bytes: 0,
+        connection_type: "USB_ADB".to_string(),
+        latency_ms: 0.0,
+        last_seen_epoch_ms: now_epoch_ms(),
+    };
+    let mut client = dial_worker(transports, &node).await.ok()?;
     client.handshake(MASTER_ID, PROTOCOL_VERSION).await.ok()
 }
 
@@ -496,6 +620,20 @@ fn next_free_port(forwards: &HashMap<String, u16>) -> u16 {
     port
 }
 
+/// Argument vector for establishing one forward, factored out so unit tests
+/// pin the exact `adb` invocation without a device. Both ends are pinned: the
+/// host side is `local_port` (one per attached device), the device side is
+/// always the worker's RPC port.
+fn forward_args(serial: &str, local_port: u16) -> Vec<String> {
+    vec![
+        "-s".into(),
+        serial.into(),
+        "forward".into(),
+        format!("tcp:{local_port}"),
+        format!("tcp:{ADB_FORWARD_PORT}"),
+    ]
+}
+
 /// Argument vector for the pairing reverse tunnel, factored out so unit tests
 /// pin the exact `adb` invocation without a device (spec 2026-10-20, D-B2).
 fn reverse_pairing_args(serial: &str) -> Vec<String> {
@@ -580,7 +718,7 @@ mod tests {
 
     #[test]
     fn forward_port_matches_worker_rpc_port() {
-        assert_eq!(ADB_FORWARD_PORT, 50052);
+        assert_eq!(ADB_FORWARD_PORT, 50062);
     }
 
     use crate::security::{PairingManager, PAIRING_TTL};
@@ -611,6 +749,91 @@ mod tests {
 
         registry.track("emulator-5554", &pin);
         assert_eq!(registry.purge_inactive(&pairing), vec!["emulator-5554"]);
+    }
+
+    #[test]
+    fn serial_for_pin_finds_the_tracked_device() {
+        let tunnels = PairingTunnelRegistry::default();
+        tunnels.track("16284c49", "815896");
+
+        assert_eq!(
+            tunnels.serial_for_pin("815896"),
+            Some("16284c49".to_string())
+        );
+        assert_eq!(tunnels.serial_for_pin("000000"), None);
+    }
+
+    #[test]
+    fn forward_args_pin_the_host_port_to_the_worker_rpc_port() {
+        // `adb -s <serial> forward tcp:<host> tcp:50062`: the host side walks
+        // upward per attached device, the device side never moves. Re-issuing
+        // this every poll is what repairs a binding `adb` dropped behind the
+        // poll loop's back, so the exact invocation is pinned here.
+        assert_eq!(
+            forward_args("16284c49", 50062),
+            vec!["-s", "16284c49", "forward", "tcp:50062", "tcp:50062"]
+        );
+        assert_eq!(
+            forward_args("emulator-5554", 50063),
+            vec!["-s", "emulator-5554", "forward", "tcp:50063", "tcp:50062"]
+        );
+    }
+
+    #[test]
+    fn active_lists_only_sessions_still_awaiting_enrollment() {
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (live, _, _) = pairing.create_session("fp");
+        let (done, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+        registry.track("16284c49", &live);
+        registry.track("emulator-5554", &done);
+        pairing.redeem(&done).expect("redeem");
+
+        // Both are tracked, but only the unredeemed session needs its reverse
+        // tunnel kept open; the redeemed one is handed to teardown instead.
+        assert_eq!(registry.active(&pairing), vec!["16284c49"]);
+        assert_eq!(registry.purge_inactive(&pairing), vec!["emulator-5554"]);
+        assert_eq!(registry.active(&pairing), vec!["16284c49"]);
+    }
+
+    #[test]
+    fn active_is_empty_once_every_session_is_spent() {
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (pin, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+        registry.track("16284c49", &pin);
+
+        assert_eq!(registry.active(&pairing), vec!["16284c49"]);
+        pairing.redeem(&pin).expect("redeem");
+        assert!(registry.active(&pairing).is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_uses_the_adb_alias_for_transport_lookup() {
+        struct RecordingTransports {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl crate::rpc::engine::WorkerTransportSource for RecordingTransports {
+            fn transport_for(
+                &self,
+                node_id: &str,
+            ) -> Result<crate::rpc::engine::WorkerTransport, String> {
+                self.seen.lock().unwrap().push(node_id.to_string());
+                Err("stop before dialing".to_string())
+            }
+        }
+
+        let transports = RecordingTransports {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = probe_device(&transports, "16284c49", 50052).await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            *transports.seen.lock().unwrap(),
+            vec!["adb:16284c49".to_string()]
+        );
     }
 
     #[test]

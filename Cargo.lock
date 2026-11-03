@@ -24,6 +24,7 @@ dependencies = [
  "ai-upcycler-model-io",
  "async-stream",
  "axum 0.7.9",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "mdns-sd",
@@ -46,6 +47,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

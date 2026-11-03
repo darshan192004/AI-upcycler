@@ -158,3 +158,46 @@ export interface DownloadRequest {
   repo_id: string;
   file_name: string;
 }
+
+/** How a phone is reachable (spec 2026-11-03, slice A). */
+export type DeviceTransport = 'usb' | 'wireless_debugging' | 'wifi_adb';
+
+/**
+ * The onboarding state machine, as the server reports it.
+ *
+ * `needs_enrol` is deliberately not called "ready": the phone is reachable and
+ * running the right app, but it is not in the cluster until the PIN hand-off
+ * finishes.
+ */
+export type OnboardingState =
+  | { state: 'discovered' }
+  | { state: 'connecting' }
+  | { state: 'awaiting_consent' }
+  | { state: 'connected' }
+  | { state: 'needs_install'; installed: string | null; available: string }
+  | { state: 'installing' }
+  | { state: 'needs_enrol'; installed: string }
+  | { state: 'ready'; node_id: string }
+  | { state: 'failed'; reason: string; remedy: string };
+
+export interface AvailableDevice {
+  id: string;
+  display_name: string;
+  address: string;
+  transport: DeviceTransport;
+  state: OnboardingState;
+  updated_epoch_ms: number;
+}
+
+export interface AvailableDevicesResponse {
+  devices: AvailableDevice[];
+}
+
+export interface ScanResponse {
+  found: number;
+  devices: AvailableDevice[];
+}
+
+export interface RevokeResponse {
+  revoked: boolean;
+}

@@ -19,6 +19,8 @@ import android.widget.TextView
 import java.util.concurrent.Executors
 import org.aiupcycler.worker.identity.WorkerIdentity
 import org.aiupcycler.worker.model.ModelFile
+import org.aiupcycler.worker.pairing.AutoEnrollExtras
+import org.aiupcycler.worker.pairing.Launch
 import org.aiupcycler.worker.pairing.PairingInput
 import org.aiupcycler.worker.pairing.PairingState
 
@@ -61,6 +63,58 @@ class MainActivity : Activity() {
 
         render(runtime.pairingState())
         WorkerForegroundService.start(applicationContext)
+        handleLaunch(intent)
+    }
+
+    /**
+     * The desktop app starts this activity through `adb shell am start`, so a
+     * second onboarding of the same session arrives here rather than in
+     * [onCreate].
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunch(intent)
+    }
+
+    /**
+     * Decides whether this launch is a desktop-driven enrollment (spec
+     * D-A2). An ordinary launch does nothing: the form is already rendered and
+     * the user's own tap is the only thing that should spend a PIN.
+     */
+    private fun handleLaunch(intent: Intent?) {
+        if (intent == null) return
+        val launch = AutoEnrollExtras.parse(
+            autoEnroll = intent.getBooleanExtra(AutoEnrollExtras.AUTO_ENROLL, false),
+            pin = intent.getStringExtra(AutoEnrollExtras.PIN),
+            fingerprint = intent.getStringExtra(AutoEnrollExtras.CA_FINGERPRINT),
+        )
+        when (launch) {
+            is Launch.Interactive -> Unit
+            is Launch.Malformed -> render(PairingState.Failed(launch.reason))
+            is Launch.AutoEnroll -> autoEnroll(launch)
+        }
+    }
+
+    /**
+     * Redeems the PIN the desktop app handed us. Re-enrolling a device that
+     * already holds credentials would spend the PIN and rotate its identity for
+     * no reason, so a paired device ignores the request.
+     */
+    private fun autoEnroll(request: Launch.AutoEnroll) {
+        if (runtime.pairingState() is PairingState.Paired) return
+        render(PairingState.Working)
+        worker.execute {
+            val result = runtime.pair(
+                pin = request.pin,
+                fingerprint = request.fingerprint,
+                fingerprintIsComplete = true,
+            )
+            uiThread.post {
+                if (isFinishing || isDestroyed) return@post
+                render(runtime.pairingState(result))
+            }
+        }
     }
 
     override fun onDestroy() {

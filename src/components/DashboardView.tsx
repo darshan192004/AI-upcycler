@@ -9,6 +9,7 @@ import { NumberTicker } from './ui/NumberTicker';
 import { Sparkline } from './ui/Sparkline';
 import { StatusDot } from './ui/StatusDot';
 import { NodeCard } from './NodeCard';
+import { AvailableDevices } from './AvailableDevices';
 import { PairingPanel } from './PairingPanel';
 
 const container = {
@@ -314,6 +315,10 @@ export function DashboardView() {
             receive layers.
           </p>
         )}
+      </motion.div>
+
+      <motion.div variants={item}>
+        <AvailableDevices />
       </motion.div>
 
       <motion.div variants={item}>

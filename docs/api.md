@@ -4,7 +4,7 @@
 
 **AI Upcycler** exposes two primary API surfaces:
 1. **Host Desktop External REST & WebSocket API**: Exposed on port `8080` of the Master Node (OpenAI-compatible) for consumption by frontend UIs, scripts, and local extensions.
-2. **Inter-Node RPC Protocol**: Protocol Buffer binary protocol over TCP port `50052` between the Master Node and Worker Nodes.
+2. **Inter-Node RPC Protocol**: Protocol Buffer binary protocol over TCP port `50062` between the Master Node and Worker Nodes.
 
 ---
 

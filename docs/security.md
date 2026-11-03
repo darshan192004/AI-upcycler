@@ -31,7 +31,7 @@ sequenceDiagram
     Master->>Worker: Send TLS Server Hello + Ephemeral Server Cert
     Master->>Worker: Validate Client Cert against Pairing Token
     Worker->>Master: Validate Server Cert Fingerprint
-    note over Master, Worker: Establish Encrypted mTLS 1.3 RPC Channel (Port 50052)
+    note over Master, Worker: Establish Encrypted mTLS 1.3 RPC Channel (Port 50062)
 ```
 
 **Implementation status (master side):** the ephemeral CA, 6-digit single-use PIN sessions, QR payload (`aiupcycler://pair?fp=…&token=…`), enrollment REST endpoints (`/api/pairing/session`, `/api/pairing/enroll` — `docs/api.md` §3.4), and the mTLS gRPC client (`WorkerRpcClient::connect_tls`) are implemented in `ai-upcycler-core` and covered by end-to-end handshake tests. **Both link directions are now provisioned.** Enrollment issues the worker a `ServerAuth` certificate — its SANs are the addresses the worker declared it will be dialed at — alongside its `ClientAuth` one, and the master holds its own `ClientAuth` identity, so the master-as-client links the split driver opens can actually complete. `LoadedPipeline::load_secure` takes a per-worker `WorkerTransportSource`; the production source, `EnrolledWorkerSource`, resolves a transport only for a `node_id` that finished pairing, so an unpaired or renamed worker is an error rather than a plaintext dial. The loop is covered end-to-end in `core/tests/api.rs` (pair over the real HTTP API, serve the certificate that was issued, drive it) and at the driver level in `core/tests/distributed.rs`. The worker half (Android mTLS server, QR display UI, server-fingerprint validation on-device) awaits the §5 hardware phase.

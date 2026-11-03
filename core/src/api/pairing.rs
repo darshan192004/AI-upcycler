@@ -7,7 +7,7 @@
 //! worker→master — then records the enrollment against the declared `node_id`.
 //! Both live on the loopback-only local API.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -30,17 +30,48 @@ pub struct PairingSessionResponse {
     pub fingerprint: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateSessionParams {
+    /// ADB serial of the device this session is for.
+    ///
+    /// Without it the session still works, but a device that enrols under its
+    /// mDNS name gets no `adb:<serial>` alias - and the USB probe dials exactly
+    /// that alias, so the pairing would never be usable over USB. Tracking also
+    /// makes [`crate::adb::pairing_tunnel_cleanup`] open and keep re-asserting
+    /// the device's `adb reverse` to the pairing listener, which is how the
+    /// worker reaches `POST /api/pairing/enroll` at its own loopback.
+    #[serde(default)]
+    pub serial: Option<String>,
+}
+
 pub async fn create_session(
     State(state): State<AppState>,
+    Query(params): Query<CreateSessionParams>,
 ) -> ApiResult<Json<PairingSessionResponse>> {
     let fingerprint = state.security.ca.fingerprint().to_string();
     let (pin, qr_payload, expires_in_secs) = state.security.pairing.create_session(&fingerprint);
+
+    // Only after the session exists: the tunnel is keyed by the PIN it serves.
+    if let Some(serial) = tracked_serial(&params) {
+        state.pairing_tunnels.track(serial, &pin);
+    }
+
     Ok(Json(PairingSessionResponse {
         pin,
         qr_payload,
         expires_in_secs,
         fingerprint,
     }))
+}
+
+/// The serial to track, treating blank input as absent so a stray `?serial=`
+/// cannot enrol an alias literally named `adb:`.
+fn tracked_serial(params: &CreateSessionParams) -> Option<&str> {
+    params
+        .serial
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +121,12 @@ pub async fn enroll(
     }
     let addresses = declared_addresses(req.addresses)?;
 
+    // Capture the tunnel's serial before redeeming: redemption makes the
+    // session ineligible, and the cleanup task may purge the tunnel before the
+    // certificate work below finishes. The alias is only enrolled after the
+    // PIN itself is accepted.
+    let serial = state.pairing_tunnels.serial_for_pin(req.pin.trim());
+
     // The PIN is single-use, so only spend it once the request is known good.
     state
         .security
@@ -107,10 +144,21 @@ pub async fn enroll(
         .ca
         .issue_server_cert(&addresses)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    state
-        .security
-        .enrollments
-        .enroll(node_id, device_name, addresses);
+    let ids = enrollment_ids(node_id, serial.as_deref());
+    for id in &ids {
+        state
+            .security
+            .enrollments
+            .enroll(id, device_name, addresses.clone());
+    }
+    // One phone reaches the master under two ids: its mDNS fullname over Wi-Fi
+    // and `adb:<serial>` over USB. Enrolment is the only moment both are known
+    // at once, so record the link here; the registry then reports the device
+    // once instead of showing a phantom third card and double-counting its RAM
+    // in the planner.
+    if let Some(alias) = ids.iter().find(|id| id.starts_with("adb:")) {
+        state.registry.link_alias(alias, node_id);
+    }
 
     Ok(Json(EnrollResponse {
         ca_pem: state.security.ca.ca_pem(),
@@ -152,10 +200,71 @@ fn declared_addresses(declared: Option<Vec<String>>) -> ApiResult<Vec<String>> {
     Ok(addresses)
 }
 
+/// The enrollment keys for one completed pairing: the worker's declared
+/// `node_id` plus the ADB serial alias when the dashboard created the session.
+fn enrollment_ids(node_id: &str, serial: Option<&str>) -> Vec<String> {
+    let mut ids = vec![node_id.to_string()];
+    if let Some(serial) = serial {
+        let alias = format!("adb:{serial}");
+        if alias != node_id {
+            ids.push(alias);
+        }
+    }
+    ids
+}
+
 fn map_pairing_error(e: PairingError) -> ApiError {
     match e {
         PairingError::AlreadyUsed => ApiError::Conflict(e.to_string()),
         PairingError::Credential(msg) => ApiError::Internal(msg),
         PairingError::InvalidPin | PairingError::Expired => ApiError::Forbidden(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enrollment_ids, tracked_serial, CreateSessionParams};
+
+    #[test]
+    fn a_blank_serial_is_not_tracked() {
+        // A stray `?serial=` must not track a tunnel whose alias would be the
+        // bare string "adb:" - that would enrol a device identity nothing can
+        // ever dial, and leave a reverse tunnel keyed to it.
+        assert_eq!(tracked_serial(&CreateSessionParams::default()), None);
+        assert_eq!(
+            tracked_serial(&CreateSessionParams {
+                serial: Some("   ".into())
+            }),
+            None
+        );
+        assert_eq!(
+            tracked_serial(&CreateSessionParams {
+                serial: Some("  16284c49 ".into())
+            }),
+            Some("16284c49")
+        );
+    }
+
+    #[test]
+    fn enrollment_ids_include_the_adb_alias_when_a_tunnel_is_tracked() {
+        assert_eq!(
+            enrollment_ids("Redmi._aiupcycler-worker._tcp.local.", Some("16284c49")),
+            vec![
+                "Redmi._aiupcycler-worker._tcp.local.".to_string(),
+                "adb:16284c49".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn enrollment_ids_do_not_duplicate_an_adb_node_id() {
+        assert_eq!(
+            enrollment_ids("adb:16284c49", Some("16284c49")),
+            vec!["adb:16284c49".to_string()]
+        );
+        assert_eq!(
+            enrollment_ids("phone.local.", None),
+            vec!["phone.local.".to_string()]
+        );
     }
 }
