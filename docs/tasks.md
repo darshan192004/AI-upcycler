@@ -118,6 +118,14 @@
   3. **Enroll from the phone** — ✅ done through the D-B3 fallback (8-char fingerprint prefix + PIN typed; the paste path was not used). The master retired the tunnel on the completing tick (`ADB: removed pairing reverse tunnel for 16284c49`) and `adb reverse --list` went empty.
   4. **Verify TLS-only serving** — ✅ on-device, against `127.0.0.1:50062` (ADB-forwarded): a plaintext HTTP dial is closed; a TLS 1.3 client with **no** certificate is refused with `fatal certificate_required` (alert 116); a client presenting the **old, untrusted CA's** certificate is refused with `fatal certificate_unknown` (alert 46). `clientAuth(REQUIRE)` and the enrollment CA are therefore enforced by the Android worker itself, not only in the JVM handshake test.
   5. **Master `load_secure` dial** — ⚠️ partial: the master's health poll over the enrolled transport succeeds (`supports_compute: true`), which is a real mTLS dial using the issued credentials; a distributed chat request across host + phone was not run (that is the chat-path epic's milestone, not a claim of this epic).
+- [ ] **Wireless onboarding (slice A, spec 2026-11-03 — ⛔ hardware-gated: a physical Android device)** — implemented and covered device-free: the adb resolver (`core/src/adb/binary.rs`), wireless ADB wrappers (`core/src/adb/wireless.rs`), LAN discovery with merge/preference tests (`core/src/discovery/lan.rs`), the onboarding state machine tested against a `FakeAdb` (`core/src/onboarding/`), five HTTP endpoints with router-level end-to-end tests (`core/tests/devices.rs`), the Android launcher-intent hand-off with JVM tests, and the dashboard section (type-checked). Nothing below is claimed as working on hardware until this run:
+  1. Plug in over USB → Connect → `tcpip` → unplug → the device stays reachable.
+  2. Reboot the phone → the card asks for one USB replug → replug → reachable again.
+  3. Android 11+ Wireless debugging → discovered over `_adb-tls-connect._tcp` → enroll.
+  4. Fresh phone with no worker app → `NeedsInstall` → Install → `NeedsEnrol`.
+  5. Revoke → enrollment gone, transport refused, `adb disconnect` issued.
+  6. Restart the host → the device reconnects without re-enrollment.
+  7. Record that `adb tcpip` is plaintext ADB and does not survive a reboot; only Wireless debugging persists. The APK is also not bundled yet, so Install reports that this build does not ship the worker app until a release APK is copied into `src-tauri/resources/worker/`.
 - [ ] **On-device benchmark values (spec 2026-10-21, D-C9/D-C10 — ⛔ hardware-gated: a physical Android device on USB)** — everything about the probe is proven device-free; this is the run that records real phone numbers:
   1. Build and install the worker APK, side-load a GGUF, and start serving.
   2. `POST /api/cluster/benchmark` against the phone (paired → mTLS, or plaintext over ADB) and confirm `status: "success"`, `nodes_failed: 0`, and one `node_benchmark` row.

@@ -7,6 +7,45 @@ Each task is independently committable and leaves the tree green. Tasks 1–5 ar
 host-only and fully testable without a phone; 6–8 need the Android build; 9 needs
 the device.
 
+## Status (2026-11-03)
+
+| Task | State | Evidence |
+|---|---|---|
+| 0 — persistent trust | done | `fccf855`; 238 core tests green at the time |
+| 1 — adb resolver | done | `1b1480e`; 6 resolver tests, `resolve_from` is pure |
+| 2 — wireless wrappers | done | `1b1480e`; 9 parser/classifier tests |
+| 3 — LAN discovery | done | `29ad190`; 8 merge/preference tests |
+| 4 — state machine | done | `0815157`; 13 tests against `FakeAdb` |
+| 5 — HTTP surface | done | `65480ea`; `core/tests/devices.rs`, 4 end-to-end tests |
+| 6 — Android hand-off | done | `9e01794`; `AutoEnrollExtrasTest` green on the JVM |
+| 7 — APK + version gate | done (APK not shipped) | `501c52f`; resolver tests |
+| 8 — dashboard UI | done | `dbfedef`; `tsc --noEmit` clean |
+| 9 — on-device run | **blocked** | phone not attached; `adb devices` empty |
+| 10 — PR | **blocked** | `gh` is not authenticated |
+
+Full core suite at Task 7: 280 passed, 0 failed, 4 ignored.
+
+Rulings taken while executing (each is also in the SDD ledger at
+`.superpowers/sdd/2026-11-03-wireless-onboarding/progress.md`):
+
+- Task 1: the plan's `FakeAdb` script executable was replaced by pure parsers
+  plus an `AdbControl` trait — a script stub is not portable to the Linux CI
+  runner, and parsing is where the defects are. Cost: `WirelessAdb`'s argv
+  construction is covered by the on-device checklist, not by a unit test.
+- Task 3: a phone seen over USB and over Wi-Fi stays two entries until it
+  enrols, because mDNS does not carry the serial and merging on an IP address
+  would collapse two phones behind one NAT.
+- Task 4: the post-install state is `NeedsEnrol`, not `Ready`. `Ready` is only
+  claimed once the API layer completes the PIN hand-off.
+- Task 4: telemetry events deferred; the dashboard polls
+  `GET /api/devices/available` every 4 s.
+- Task 5: the device endpoints stay mounted and answer 503 when adb is missing,
+  so a build without platform-tools still serves the cluster.
+- Task 7: the resolver ships, the APK does not. A release build has to produce
+  it and copy it into `src-tauri/resources/worker/`; until then Install says
+  this build does not ship the worker app.
+
+
 ## Task 0 — Land persistent trust (prerequisite)
 
 The CA currently rotates on every host start, which would make every wireless
