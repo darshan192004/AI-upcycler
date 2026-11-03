@@ -37,9 +37,9 @@ impl ConnectOutcome {
     pub fn remedy(&self) -> Option<String> {
         match self {
             Self::Connected => None,
-            Self::Unauthorized => Some(
-                "Approve the “Allow USB debugging?” prompt on the phone, then retry.".into(),
-            ),
+            Self::Unauthorized => {
+                Some("Approve the “Allow USB debugging?” prompt on the phone, then retry.".into())
+            }
             Self::Refused(_) => Some(
                 "The phone is not listening. If it was rebooted, connect USB once to \
                  re-enable wireless ADB."
@@ -144,13 +144,23 @@ pub fn install_remedy(stderr: &str) -> String {
 }
 
 /// Wireless operations against one resolved adb binary.
-pub struct WirelessAdb<'a> {
-    adb: &'a AdbBinary,
+pub struct WirelessAdb {
+    adb: AdbBinary,
 }
 
-impl<'a> WirelessAdb<'a> {
-    pub fn new(adb: &'a AdbBinary) -> Self {
+impl WirelessAdb {
+    pub fn new(adb: AdbBinary) -> Self {
         Self { adb }
+    }
+
+    /// Convenience for a binary at a known path.
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        Self::new(AdbBinary::at(path))
+    }
+
+    /// Resolves adb the way the app does at startup.
+    pub fn resolve() -> Result<Self, String> {
+        AdbBinary::resolve().map(Self::new)
     }
 
     /// Connects to `addr` (`ip:port`) and reports whether the phone is usable.
@@ -181,10 +191,9 @@ impl<'a> WirelessAdb<'a> {
             {
                 Some(entry) if entry.state == "device" => ConnectOutcome::Connected,
                 Some(entry) if entry.state == "unauthorized" => ConnectOutcome::Unauthorized,
-                Some(entry) => ConnectOutcome::Refused(format!(
-                    "the phone reports state {:?}",
-                    entry.state
-                )),
+                Some(entry) => {
+                    ConnectOutcome::Refused(format!("the phone reports state {:?}", entry.state))
+                }
                 None => ConnectOutcome::Refused(
                     "adb accepted the address but does not list the device".into(),
                 ),
@@ -234,6 +243,53 @@ impl<'a> WirelessAdb<'a> {
             .run(&["shell", "dumpsys", "package", WORKER_PACKAGE])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(parse_version_name(&stdout))
+    }
+
+    /// Every device adb currently knows about, USB and network alike.
+    pub fn devices(&self) -> Result<Vec<DeviceEntry>, String> {
+        self.adb
+            .run_text(&["devices"])
+            .map(|output| parse_devices(&output))
+    }
+}
+
+/// The ADB operations onboarding needs.
+///
+/// A trait rather than concrete calls so the state machine is tested against a
+/// `FakeAdb` in `cargo test` — no phone, no subprocess, and the same code paths
+/// on every platform.
+pub trait AdbControl: Send + Sync {
+    fn connect(&self, addr: &str) -> ConnectOutcome;
+    fn disconnect(&self, addr: &str) -> Result<(), String>;
+    fn tcpip(&self, serial: &str, port: u16) -> Result<(), String>;
+    fn install(&self, apk: &str) -> Result<(), String>;
+    fn version_name(&self) -> Result<Option<String>, String>;
+    fn devices(&self) -> Result<Vec<DeviceEntry>, String>;
+}
+
+impl AdbControl for WirelessAdb {
+    fn connect(&self, addr: &str) -> ConnectOutcome {
+        WirelessAdb::connect(self, addr)
+    }
+
+    fn disconnect(&self, addr: &str) -> Result<(), String> {
+        WirelessAdb::disconnect(self, addr)
+    }
+
+    fn tcpip(&self, serial: &str, port: u16) -> Result<(), String> {
+        WirelessAdb::tcpip(self, serial, port)
+    }
+
+    fn install(&self, apk: &str) -> Result<(), String> {
+        WirelessAdb::install(self, apk)
+    }
+
+    fn version_name(&self) -> Result<Option<String>, String> {
+        WirelessAdb::version_name(self)
+    }
+
+    fn devices(&self) -> Result<Vec<DeviceEntry>, String> {
+        WirelessAdb::devices(self)
     }
 }
 
@@ -338,10 +394,13 @@ mod tests {
 
     #[test]
     fn install_failures_become_actionable_sentences() {
-        assert!(install_remedy("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]")
-            .contains("storage"));
-        assert!(install_remedy("Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]")
-            .contains("different key"));
+        assert!(
+            install_remedy("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]").contains("storage")
+        );
+        assert!(
+            install_remedy("Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]")
+                .contains("different key")
+        );
         assert!(install_remedy("Failure [INSTALL_FAILED_VERSION_DOWNGRADE]")
             .contains("newer worker app"));
         // An unknown failure still says something rather than an empty string.
