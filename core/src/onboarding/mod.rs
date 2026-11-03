@@ -25,6 +25,12 @@ pub const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the consent wait re-reads `adb devices`.
 pub const CONSENT_POLL: Duration = Duration::from_secs(2);
 
+/// The worker version this build expects.
+///
+/// Kept in step with the Android `versionName`; a build can override it with
+/// `AI_UPCYCLER_WORKER_VERSION` when it ships a different APK.
+pub const DEFAULT_WORKER_VERSION: &str = "0.1.0";
+
 /// What the dashboard shows for one device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -134,6 +140,12 @@ impl OnboardingService {
         self.consent_timeout = timeout;
         self.consent_poll = poll;
         self
+    }
+
+    /// The discovery store this service reads, so a sweep can add what it finds
+    /// without the API layer holding a second copy.
+    pub fn discovery(&self) -> Arc<LanDiscovery> {
+        self.discovery.clone()
     }
 
     /// Every device, whether or not onboarding has started.

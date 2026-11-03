@@ -250,6 +250,24 @@ pub fn spawn_adb_browsers(discovery: Arc<LanDiscovery>) -> Result<ServiceDaemon,
     Ok(daemon)
 }
 
+/// Process-wide handle that keeps the ADB browsers alive.
+static ADB_BROWSER: Mutex<Option<ServiceDaemon>> = Mutex::new(None);
+
+/// Starts ADB discovery once per process.
+///
+/// The daemon has to outlive the call to keep the responder running, and the
+/// app has exactly one master, so a process-wide slot is the honest place for
+/// it. Calling twice is a no-op rather than an error: a second bootstrap (a
+/// test, a restarted listener) should not fight over the socket.
+pub fn start_adb_discovery(discovery: Arc<LanDiscovery>) -> Result<(), String> {
+    let mut slot = ADB_BROWSER.lock().unwrap();
+    if slot.is_some() {
+        return Ok(());
+    }
+    *slot = Some(spawn_adb_browsers(discovery)?);
+    Ok(())
+}
+///
 /// Projects an mDNS record onto a sighting.
 ///
 /// The serial is not in these records, so `ip:port` is the key. It stops being

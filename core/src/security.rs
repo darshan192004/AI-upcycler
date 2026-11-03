@@ -436,6 +436,31 @@ impl EnrollmentRegistry {
     pub fn is_empty(&self) -> bool {
         self.workers.lock().expect("enrollment lock").is_empty()
     }
+
+    /// Forgets an enrollment and persists the removal.
+    ///
+    /// Returns whether a record was actually removed, so the caller can tell
+    /// "revoked" from "was never enrolled". Revoking is authoritative: a
+    /// revoked worker is dialed over plaintext no more than an unpaired one.
+    pub fn revoke(&self, node_id: &str) -> bool {
+        let (removed, snapshot) = {
+            let mut workers = self.workers.lock().expect("enrollment lock");
+            let removed = workers.remove(node_id).is_some();
+            (removed, self.store.as_ref().map(|_| workers.clone()))
+        };
+
+        let (Some(store), Some(workers)) = (self.store.as_ref(), snapshot) else {
+            return removed;
+        };
+        let entries: Vec<_> = workers
+            .into_iter()
+            .map(|(node_id, worker)| (node_id, worker.device_name, worker.addresses))
+            .collect();
+        if let Err(error) = store.save_enrollments(&entries) {
+            tracing::warn!("could not persist the revocation ({error})");
+        }
+        removed
+    }
 }
 
 /// The production [`WorkerTransportSource`]: a worker is dialed over mTLS only
@@ -767,6 +792,37 @@ mod tests {
         assert_eq!(
             registry.get("phone-a").expect("enrolled").addresses,
             vec!["10.0.0.6".to_string()]
+        );
+    }
+
+    #[test]
+    fn revoking_removes_the_enrollment_and_says_whether_there_was_one() {
+        let registry = EnrollmentRegistry::new();
+        registry.enroll("phone-a", "Pixel 8", vec!["10.0.0.5".into()]);
+
+        assert!(registry.revoke("phone-a"), "an enrolled device is revoked");
+        assert!(!registry.is_enrolled("phone-a"));
+        assert!(
+            !registry.revoke("phone-a"),
+            "revoking twice reports that the second did nothing"
+        );
+    }
+
+    #[test]
+    fn a_revoked_enrollment_does_not_come_back_after_a_restart() {
+        let dir = temp_trust_dir();
+        {
+            let state = SecurityState::load_or_generate(&dir);
+            state
+                .enrollments
+                .enroll("phone-a", "Pixel 8", vec!["10.0.0.5".into()]);
+            assert!(state.enrollments.revoke("phone-a"));
+        }
+
+        let restarted = SecurityState::load_or_generate(&dir);
+        assert!(
+            !restarted.enrollments.is_enrolled("phone-a"),
+            "a revocation that only lived in memory would let a revoked phone back in"
         );
     }
 

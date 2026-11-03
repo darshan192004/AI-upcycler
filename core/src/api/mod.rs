@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod chat;
 pub mod cluster;
+pub mod devices;
 pub mod distributed;
 pub mod downloads;
 mod error;
@@ -25,7 +26,7 @@ use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
 use axum::http::{header, HeaderValue, Method};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -69,6 +70,9 @@ pub struct AppState {
     pub telemetry_cache: Arc<crate::worker_health::TelemetryCache>,
     /// How the master reads its own memory (spec 2026-10-22, D-E6).
     pub host_memory: Arc<dyn crate::worker_health::HostMemorySource>,
+    /// Wireless device onboarding. None when adb could not be found, so a
+    /// build without platform-tools still serves the cluster.
+    pub onboarding: Option<Arc<crate::onboarding::OnboardingService>>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -118,6 +122,7 @@ impl AppState {
             worker_transports: None,
             telemetry_cache: Arc::new(crate::worker_health::TelemetryCache::new()),
             host_memory: Arc::new(crate::worker_health::SysinfoHostMemory),
+            onboarding: None,
         }
     }
 
@@ -182,6 +187,16 @@ impl AppState {
         self
     }
 
+    /// Attaches wireless onboarding. `None` keeps the device endpoints off and
+    /// every one of them answers 503 with the reason.
+    pub fn with_onboarding(
+        mut self,
+        onboarding: Option<Arc<crate::onboarding::OnboardingService>>,
+    ) -> Self {
+        self.onboarding = onboarding;
+        self
+    }
+
     /// Standard wiring for the desktop shell: real registry/store/telemetry.
     ///
     /// Uses the real llama.cpp engine when [`llama::LlamaCppBackend::discover`]
@@ -243,7 +258,40 @@ impl AppState {
         .with_security(security)
         .with_telemetry_cache(telemetry_cache)
         .with_models_dir(models_dir)
+        .with_onboarding(discover_onboarding())
     }
+}
+
+/// Builds the onboarding service, or `None` when adb cannot be found.
+///
+/// Starting the LAN browsers is best-effort: mDNS failing must not take the
+/// cluster down, and the USB path still works without it.
+fn discover_onboarding() -> Option<Arc<crate::onboarding::OnboardingService>> {
+    let discovery = Arc::new(crate::discovery::lan::LanDiscovery::new());
+    if let Err(error) = crate::discovery::lan::start_adb_discovery(discovery.clone()) {
+        tracing::warn!("ADB discovery is off: {error}");
+    }
+
+    let adb = match crate::adb::wireless::WirelessAdb::resolve() {
+        Ok(adb) => adb,
+        Err(error) => {
+            tracing::warn!("device onboarding is off: {error}");
+            return None;
+        }
+    };
+
+    let version = std::env::var("AI_UPCYCLER_WORKER_VERSION")
+        .unwrap_or_else(|_| crate::onboarding::DEFAULT_WORKER_VERSION.to_string());
+    let mut service = crate::onboarding::OnboardingService::new(Arc::new(adb), discovery, version);
+
+    // The APK is optional: without it, Install explains that this build does
+    // not ship one instead of failing at the last moment.
+    match std::env::var("AI_UPCYCLER_WORKER_APK") {
+        Ok(apk) if !apk.is_empty() => service = service.with_worker_apk(apk),
+        _ => {}
+    }
+
+    Some(Arc::new(service))
 }
 
 /// Download destination when no explicit directory was configured: `models/`
@@ -306,7 +354,7 @@ fn cors_layer() -> CorsLayer {
                 .map(browser_origin_is_allowed)
                 .unwrap_or(false)
         }))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE])
         // Some Chromium builds send a Private Network Access preflight when a
         // page asks for a loopback address; grant it only to allowed origins.
@@ -323,6 +371,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models/download", post(downloads::download))
         .route("/api/pairing/session", post(pairing::create_session))
         .route("/api/pairing/enroll", post(pairing::enroll))
+        .route("/api/devices/available", get(devices::available))
+        .route("/api/devices/scan", post(devices::scan))
+        .route("/api/devices/:id/connect", post(devices::connect))
+        .route("/api/devices/:id/install", post(devices::install))
+        .route("/api/devices/:id", delete(devices::revoke))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())
