@@ -12,6 +12,13 @@ data class ModelFile(
     val sizeBytes: Long,
 )
 
+/** Outcome of asking the library to accept a pushed model. */
+sealed class ReceiveStart {
+    data class Accepted(val resumeFrom: Long) : ReceiveStart()
+
+    data class Refused(val reason: String) : ReceiveStart()
+}
+
 /**
  * The worker's side-loaded model library.
  *
@@ -24,6 +31,9 @@ class ModelStore(
     private val dir: File,
     private val freeSpace: () -> Long = { dir.usableSpace },
 ) {
+    /** The transfer currently being written, if any. */
+    @Volatile
+    private var receiving: Receiving? = null
     /** Every complete `.gguf` in the library, sorted case-insensitively. */
     fun list(): List<ModelFile> {
         val files = dir.listFiles { file ->
@@ -95,6 +105,136 @@ class ModelStore(
         return ModelFile(target, target.name, target.length())
     }
 
+    // --- pushed models (spec 2026-11-03-model-provisioning, D-P3/D-P4) -------
+
+    /**
+     * Accepts a model pushed by the master and reports how much of it the
+     * library already holds.
+     *
+     * The digest is the resume contract: a `.part` whose sidecar records a
+     * different digest or total is discarded rather than stitched onto new
+     * bytes. The sidecar exists because a partial file cannot be hashed
+     * against the whole-file digest until it is complete.
+     */
+    fun beginReceive(fileName: String, totalBytes: Long, sha256Hex: String): ReceiveStart {
+        val safe = safeName(fileName)
+            ?: return ReceiveStart.Refused("not a .gguf file name: $fileName")
+        if (totalBytes <= 0) {
+            return ReceiveStart.Refused("total_bytes must be positive")
+        }
+        val digest = sha256Hex.trim().lowercase()
+        if (digest.length != SHA256_HEX_CHARS || digest.any { it !in HEX_DIGITS }) {
+            return ReceiveStart.Refused("sha256 must be 64 lowercase hex characters")
+        }
+        dir.mkdirs()
+        val target = uniqueTarget(safe)
+        val part = File(dir, "${target.name}.part")
+        val meta = File(dir, "${target.name}.part.meta")
+
+        var resumeFrom = 0L
+        if (part.isFile) {
+            val recorded = readMeta(meta)
+            resumeFrom = if (recorded != null &&
+                recorded.first == digest &&
+                recorded.second == totalBytes
+            ) {
+                part.length()
+            } else {
+                part.delete()
+                0L
+            }
+            if (resumeFrom > totalBytes) {
+                part.delete()
+                resumeFrom = 0L
+            }
+        }
+        if (!part.isFile) meta.delete()
+
+        val needed = (totalBytes - resumeFrom) + RESERVE_BYTES_RECEIVE
+        val available = freeSpace()
+        if (needed > available) {
+            return ReceiveStart.Refused(
+                "not enough free space: need $needed bytes, have $available",
+            )
+        }
+        meta.writeText("sha256=$digest\ntotal=$totalBytes\n", Charsets.UTF_8)
+        receiving = Receiving(part, meta, target, totalBytes, digest)
+        return ReceiveStart.Accepted(resumeFrom)
+    }
+
+    /**
+     * Appends one chunk, which must start exactly where the previous one
+     * stopped. A reordered or duplicated chunk fails instead of corrupting the
+     * file.
+     */
+    fun appendReceive(offset: Long, data: ByteArray): Long {
+        val current = receiving
+            ?: throw IllegalStateException("no model push in progress")
+        val written = current.part.length()
+        require(offset == written) { "chunk offset $offset does not match $written written" }
+        require(written + data.size <= current.totalBytes) {
+            "chunk would exceed the declared total ${current.totalBytes}"
+        }
+        current.part.appendBytes(data)
+        return current.part.length()
+    }
+
+    /** Verifies the completed file and installs it, or deletes the partial. */
+    fun finishReceive(sha256Hex: String): ModelFile {
+        val current = receiving
+            ?: throw IllegalStateException("no model push in progress")
+        receiving = null
+        try {
+            if (current.part.length() != current.totalBytes) {
+                throw IOException(
+                    "incomplete model: ${current.part.length()} of " +
+                        "${current.totalBytes} bytes",
+                )
+            }
+            val actual = sha256Of(current.part)
+            if (actual != current.sha256Hex || !actual.equals(sha256Hex.trim(), ignoreCase = true)) {
+                throw IOException("sha256 mismatch: expected ${current.sha256Hex}, got $actual")
+            }
+            Files.move(current.part.toPath(), current.target.toPath())
+            current.meta.delete()
+            return ModelFile(current.target, current.target.name, current.target.length())
+        } catch (e: Exception) {
+            current.part.delete()
+            current.meta.delete()
+            throw e
+        }
+    }
+
+    private data class Receiving(
+        val part: File,
+        val meta: File,
+        val target: File,
+        val totalBytes: Long,
+        val sha256Hex: String,
+    )
+
+    private fun readMeta(meta: File): Pair<String, Long>? {
+        val lines = runCatching { meta.readLines(Charsets.UTF_8) }.getOrNull() ?: return null
+        val digest = lines.firstOrNull { it.startsWith("sha256=") }
+            ?.removePrefix("sha256=") ?: return null
+        val total = lines.firstOrNull { it.startsWith("total=") }
+            ?.removePrefix("total=")?.toLongOrNull() ?: return null
+        return digest to total
+    }
+
+    private fun sha256Of(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(BUFFER_BYTES)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun safeName(displayName: String): String? {
         val base = File(displayName).name.trim()
         if (base.isEmpty() || base == "." || base == "..") return null
@@ -124,5 +264,14 @@ class ModelStore(
 
         /** Keep this much free after an import so the app can still write. */
         const val RESERVE_BYTES = 64L * 1024 * 1024
+
+        /**
+         * A pushed model is larger than an import and the engine maps it, so
+         * the headroom is bigger (spec D-P6).
+         */
+        const val RESERVE_BYTES_RECEIVE = 256L * 1024 * 1024
+
+        const val SHA256_HEX_CHARS = 64
+        const val HEX_DIGITS = "0123456789abcdef"
     }
 }
