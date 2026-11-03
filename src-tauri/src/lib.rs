@@ -122,6 +122,9 @@ pub fn run() {
                 store,
                 telemetry.clone(),
                 models_dir,
+                // Persist the CA under the app data dir: without this every
+                // host restart rotates it and every paired worker is dropped.
+                Some(data_dir.join("trust")),
             );
 
             // `prepare_pairing` resolves this shared state; its Arcs are the

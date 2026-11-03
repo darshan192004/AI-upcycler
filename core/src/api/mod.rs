@@ -193,6 +193,10 @@ impl AppState {
         store: Arc<Store>,
         telemetry: TelemetryBus,
         models_dir: PathBuf,
+        // Where the CA and enrollment records live. `None` keeps the CA
+        // in-memory, so every restart forces workers to pair again; `Some`
+        // persists it so a pairing outlives the process.
+        trust_dir: Option<PathBuf>,
     ) -> Self {
         let fallback: Arc<dyn GenerationBackend> =
             match llama::LlamaCppBackend::discover(&models_dir) {
@@ -213,7 +217,10 @@ impl AppState {
         // Cluster-first chat serving (design D1): the pairing-registry-backed
         // adaptive backend serves through LoadedPipeline when enrolled workers
         // exist; llama-server stays the fallback of last resort.
-        let security = Arc::new(SecurityState::default());
+        let security = Arc::new(match trust_dir {
+            Some(dir) => SecurityState::load_or_generate(dir),
+            None => SecurityState::default(),
+        });
         // One cache for the worker health the poll loop writes and the
         // planner reads (spec 2026-10-22, D-F1): a hot worker gets a smaller
         // share of the model.

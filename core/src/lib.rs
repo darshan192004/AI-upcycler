@@ -7,4 +7,5 @@ pub mod scheduler;
 pub mod security;
 pub mod store;
 pub mod telemetry;
+pub mod trust;
 pub mod worker_health;
