@@ -126,6 +126,12 @@
   5. Revoke → enrollment gone, transport refused, `adb disconnect` issued.
   6. Restart the host → the device reconnects without re-enrollment.
   7. Record that `adb tcpip` is plaintext ADB and does not survive a reboot; only Wireless debugging persists. The APK is also not bundled yet, so Install reports that this build does not ship the worker app until a release APK is copied into `src-tauri/resources/worker/`.
+- [ ] **Model provisioning (slice B, spec 2026-11-03 — ⛔ hardware-gated: a physical Android device)** — implemented and covered device-free: the three push RPCs on the worker (JVM tests with resume, hash mismatch, free-space refusal), the host streaming client (`core/tests/provisioning.rs`, 5 tests), the HTTP surface (`core/tests/devices.rs`, 12 tests incl. an end-to-end 202 → done push against a mock worker), and the dashboard card (type-checked + built). Nothing below is claimed as working on hardware until this run:
+  1. Enroll a phone, download the 3B Q4 model on the host, press **Provision model** on its card → `202`, progress ticks to 100%, card says installed.
+  2. Kill the host mid-push → restart → press provision again → the worker resumes from the byte it holds, and the finished file's SHA-256 matches the host's.
+  3. Deny Wi-Fi on the phone mid-push → card reports the failure; re-enable → a second push succeeds.
+  4. Provision while the phone is not enrolled → `409` with the pairing message; provision a second time while one runs → `409` "already running".
+  5. After a successful push, confirm the worker reopens the engine on the new file and the cluster serves it (honest note: `engine_started` may lag the `done` state by ~1 s by design, D-P7).
 - [ ] **On-device benchmark values (spec 2026-10-21, D-C9/D-C10 — ⛔ hardware-gated: a physical Android device on USB)** — everything about the probe is proven device-free; this is the run that records real phone numbers:
   1. Build and install the worker APK, side-load a GGUF, and start serving.
   2. `POST /api/cluster/benchmark` against the phone (paired → mTLS, or plaintext over ADB) and confirm `status: "success"`, `nodes_failed: 0`, and one `node_benchmark` row.

@@ -12,13 +12,13 @@ unproven until one is attached.
 
 | Task | State | Evidence |
 |---|---|---|
-| 1 — proto contract | todo | |
-| 2 — worker receive path | todo | |
-| 3 — worker RPC handlers | todo | |
-| 4 — host provisioning core | todo | |
-| 5 — host streaming client | todo | |
-| 6 — HTTP surface | todo | |
-| 7 — dashboard action | todo | |
+| 1 — proto contract | done | `7cbe396` — cargo build + gradlew compile green |
+| 2 — worker receive path | done | `de2d2f4` — Android suite green |
+| 3 — worker RPC handlers | done | `3712ed3` — Android suite 166 tests, 0 failures |
+| 4 — host provisioning core | done | `d456b09`, `a4dc562` — mutation-verified; core 298 green |
+| 5 — host streaming client | done | `2fee0bc` — 5 tests in `core/tests/provisioning.rs`; clippy 0, 298 passed |
+| 6 — HTTP surface | done | `3d6bab9` — `core/tests/devices.rs` 12/12 incl. end-to-end 202→done; two mutations bit; 305 passed, clippy 0 |
+| 7 — dashboard action | done | `344ef5d` — `tsc --noEmit` 0, `npm run build` 0 |
 | 8 — docs + PR | todo | |
 
 ## Task 1 — Proto contract
