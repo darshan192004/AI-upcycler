@@ -7,6 +7,7 @@ use crate::rpc::proto::aiupcycler::rpc::{
     UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::scheduler::planner::LayerAssignment;
+use futures::StreamExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
@@ -322,6 +323,21 @@ impl WorkerRpcClient {
         source: &crate::provisioning::ModelSource,
         model_id: &str,
     ) -> Result<FinishModelPushResponse, String> {
+        self.provision_model_with_progress(source, model_id, |_| {})
+            .await
+    }
+
+    /// [`provision_model`] plus a cumulative byte count as chunks leave the
+    /// host (spec D-P8).
+    ///
+    /// The count starts at the worker's resume offset, so it is what the phone
+    /// holds rather than what this session happened to send.
+    pub async fn provision_model_with_progress(
+        &mut self,
+        source: &crate::provisioning::ModelSource,
+        model_id: &str,
+        progress: impl Fn(u64) + Send + 'static,
+    ) -> Result<FinishModelPushResponse, String> {
         let total = source.size_bytes();
         let digest = source
             .sha256_hex()
@@ -347,9 +363,13 @@ impl WorkerRpcClient {
         if resume > 0 {
             info!("RPC client: provision {model_id} resuming at {resume}/{total} bytes");
         }
-        let streamed = self
-            .push_model_chunks(source.clone().chunk_stream(resume))
-            .await?;
+        progress(resume);
+        let mut sent = resume;
+        let chunks = source.clone().chunk_stream(resume).inspect(move |chunk| {
+            sent += chunk.data.len() as u64;
+            progress(sent);
+        });
+        let streamed = self.push_model_chunks(chunks).await?;
         if !streamed.success {
             return Err(format!("provision {model_id}: {}", streamed.error_message));
         }
