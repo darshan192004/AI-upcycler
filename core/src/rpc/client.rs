@@ -1,8 +1,10 @@
 use crate::rpc::engine::{ActivationType, ExecutionResult, TensorPayload};
 use crate::rpc::proto::aiupcycler::rpc::{
-    worker_service_client::WorkerServiceClient, BenchmarkRequest, BenchmarkResponse,
-    ExecuteForwardRequest, HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse,
-    LoadLayersRequest, LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
+    worker_service_client::WorkerServiceClient, BeginModelPushRequest, BeginModelPushResponse,
+    BenchmarkRequest, BenchmarkResponse, ExecuteForwardRequest, FinishModelPushRequest,
+    FinishModelPushResponse, HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse,
+    LoadLayersRequest, LoadLayersResponse, ModelChunk, PushModelChunksResponse, TensorBuffer,
+    UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::scheduler::planner::LayerAssignment;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -254,6 +256,112 @@ impl WorkerRpcClient {
             .map_err(|e| format!("benchmark failed: {e}"))?
             .into_inner();
         Ok(response)
+    }
+
+    /// Asks the worker to accept a model push (spec D-P1).
+    ///
+    /// This is a separate call from the stream because only a unary reply can
+    /// carry back the offset the worker already holds before any bytes move.
+    pub async fn begin_model_push(
+        &mut self,
+        model_id: &str,
+        file_name: &str,
+        total_bytes: u64,
+        sha256_hex: &str,
+    ) -> Result<BeginModelPushResponse, String> {
+        let request = BeginModelPushRequest {
+            model_id: model_id.to_string(),
+            file_name: file_name.to_string(),
+            total_bytes: total_bytes as i64,
+            sha256_hex: sha256_hex.to_string(),
+        };
+        self.inner
+            .begin_model_push(request)
+            .await
+            .map_err(|e| format!("begin_model_push failed: {e}"))
+            .map(|r| r.into_inner())
+    }
+
+    /// Streams the model's bytes. Each chunk must start at the offset the
+    /// worker has written so far, so a resumed push is just a later start.
+    pub async fn push_model_chunks(
+        &mut self,
+        chunks: impl futures::Stream<Item = ModelChunk> + Send + 'static,
+    ) -> Result<PushModelChunksResponse, String> {
+        self.inner
+            .push_model_chunks(chunks)
+            .await
+            .map_err(|e| format!("push_model_chunks failed: {e}"))
+            .map(|r| r.into_inner())
+    }
+
+    /// Asks the worker to verify the file it received and install it.
+    pub async fn finish_model_push(
+        &mut self,
+        model_id: &str,
+        sha256_hex: &str,
+    ) -> Result<FinishModelPushResponse, String> {
+        let request = FinishModelPushRequest {
+            model_id: model_id.to_string(),
+            sha256_hex: sha256_hex.to_string(),
+        };
+        self.inner
+            .finish_model_push(request)
+            .await
+            .map_err(|e| format!("finish_model_push failed: {e}"))
+            .map(|r| r.into_inner())
+    }
+
+    /// Delivers `source` to this worker: hash, begin, stream from the offset
+    /// the worker reports, then verify (spec 2026-11-03-model-provisioning).
+    ///
+    /// A refusal from `begin` stops before a byte moves; a file that vanished
+    /// mid-stream ends early and is caught by the worker's own length check.
+    pub async fn provision_model(
+        &mut self,
+        source: &crate::provisioning::ModelSource,
+        model_id: &str,
+    ) -> Result<FinishModelPushResponse, String> {
+        let total = source.size_bytes();
+        let digest = source
+            .sha256_hex()
+            .await
+            .map_err(|error| format!("provision {model_id}: {error}"))?;
+        let begin = self
+            .begin_model_push(model_id, source.file_name(), total, &digest)
+            .await?;
+        if !begin.accepted {
+            let reason = if begin.error_message.is_empty() {
+                "worker refused the push".to_string()
+            } else {
+                begin.error_message
+            };
+            return Err(format!("provision {model_id}: {reason}"));
+        }
+        let resume = begin.resume_from_bytes.max(0) as u64;
+        if resume > total {
+            return Err(format!(
+                "provision {model_id}: worker holds {resume} bytes of a {total} byte file"
+            ));
+        }
+        if resume > 0 {
+            info!("RPC client: provision {model_id} resuming at {resume}/{total} bytes");
+        }
+        let streamed = self
+            .push_model_chunks(source.clone().chunk_stream(resume))
+            .await?;
+        if !streamed.success {
+            return Err(format!("provision {model_id}: {}", streamed.error_message));
+        }
+        let finished = self.finish_model_push(model_id, &digest).await?;
+        if !finished.success {
+            return Err(format!("provision {model_id}: {}", finished.error_message));
+        }
+        info!(
+            "RPC client: provisioned {model_id} to the worker ({} bytes)",
+            finished.size_bytes
+        );
+        Ok(finished)
     }
 }
 

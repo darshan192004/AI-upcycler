@@ -1,6 +1,7 @@
 //! A GGUF on the host, addressed for the push protocol
 //! (spec `2026-11-03-model-provisioning`, D-P2/D-P4).
 
+use crate::rpc::proto::aiupcycler::rpc::ModelChunk;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -117,6 +118,40 @@ pub fn chunk_len(total: u64, offset: u64, chunk: usize) -> usize {
     }
     let remaining = total - offset;
     remaining.min(chunk as u64) as usize
+}
+
+impl ModelSource {
+    /// The push messages for this file, starting at `offset`.
+    ///
+    /// Reads one chunk per item and never buffers the file, so a 1.9 GB model
+    /// costs [`CHUNK_BYTES`] on the master rather than 1.9 GB. A read failure
+    /// ends the stream instead of emitting a wrong byte: the worker then
+    /// reports the file as incomplete when it finishes (spec D-P3).
+    pub fn chunk_stream(
+        self,
+        offset: u64,
+    ) -> impl futures::Stream<Item = ModelChunk> + Send + 'static {
+        futures::stream::unfold(Some((self, offset)), |state| async move {
+            let (source, offset) = state?;
+            if offset >= source.size_bytes {
+                return None;
+            }
+            let len = chunk_len(source.size_bytes, offset, CHUNK_BYTES);
+            match source.read_chunk(offset, len).await {
+                Ok(data) => {
+                    let message = ModelChunk {
+                        offset: offset as i64,
+                        data,
+                    };
+                    Some((message, Some((source, offset + len as u64))))
+                }
+                Err(error) => {
+                    tracing::warn!("provisioning: stopped at offset {offset}: {error}");
+                    None
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
