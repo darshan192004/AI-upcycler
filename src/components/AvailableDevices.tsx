@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Radar, RefreshCw, Trash2 } from 'lucide-react';
+import { Radar, RefreshCw, Trash2, Upload } from 'lucide-react';
 import {
   connectDevice,
   getAvailableDevices,
+  getProvisionState,
   installWorker,
   revokeDevice,
   scanNetwork,
+  startProvision,
 } from '../lib/api';
-import type { AvailableDevice, DeviceTransport, OnboardingState } from '../lib/types';
+import type {
+  AvailableDevice,
+  DeviceTransport,
+  OnboardingState,
+  ProvisionState,
+} from '../lib/types';
+import { useClusterStore } from '../store/cluster';
 import { GlowCard } from './ui/GlowCard';
 
 /**
@@ -25,6 +33,13 @@ const TRANSPORT_LABEL: Record<DeviceTransport, string> = {
 };
 
 type Action = 'connect' | 'install' | 'revoke' | null;
+
+/** The same units the Models page uses, so sizes read consistently. */
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+  return `${bytes} B`;
+}
 
 function describe(state: OnboardingState): { label: string; action: Action; tone: string } {
   switch (state.state) {
@@ -73,6 +88,14 @@ export function AvailableDevices() {
   const [error, setError] = useState<string | null>(null);
   const [subnet, setSubnet] = useState('');
   const [scanning, setScanning] = useState(false);
+  /** The push each device is in, keyed by device id (spec D-P8). */
+  const [provision, setProvision] = useState<Record<string, ProvisionState>>({});
+
+  // What a push would deliver: the library head the topology reports as
+  // active, so the card's size and name match what the cluster serves.
+  const models = useClusterStore((s) => s.models);
+  const activeModelId = useClusterStore((s) => s.topology?.active_model ?? null);
+  const activeModel = models.find((model) => model.id === activeModelId) ?? null;
 
   const refresh = useCallback(async () => {
     try {
@@ -91,16 +114,68 @@ export function AvailableDevices() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  const refreshProvision = useCallback(async (id: string) => {
+    try {
+      const state = await getProvisionState(id);
+      setProvision((prev) => ({ ...prev, [id]: state }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  // While any push runs, ask for its state every 2 s (spec D-P8: the server
+  // keeps progress in memory and the dashboard polls; no telemetry event).
+  const hasRunningPush = Object.values(provision).some(
+    (state) => state.state === 'running',
+  );
+  useEffect(() => {
+    if (!hasRunningPush) return;
+    const timer = window.setInterval(() => {
+      for (const [id, state] of Object.entries(provision)) {
+        if (state.state === 'running') void refreshProvision(id);
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningPush, provision, refreshProvision]);
+
   const run = async (device: AvailableDevice, action: Exclude<Action, null>) => {
     setBusyId(device.id);
     setError(null);
     try {
       if (action === 'connect') await connectDevice(device.id);
       if (action === 'install') await installWorker(device.id);
-      if (action === 'revoke') await revokeDevice(device.id);
+      if (action === 'revoke') {
+        await revokeDevice(device.id);
+        // The enrollment is gone, so any earlier push state describes a
+        // device that no longer exists; drop it rather than show it again
+        // if the phone pairs a second time.
+        setProvision((prev) => {
+          const next = { ...prev };
+          delete next[device.id];
+          return next;
+        });
+      }
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /** Starts a push; the reply is only the starting state (spec D-P5/D-P8). */
+  const startPush = async (device: AvailableDevice) => {
+    if (!activeModel) return;
+    setBusyId(device.id);
+    setError(null);
+    try {
+      const state = await startProvision(device.id, activeModel.id);
+      setProvision((prev) => ({ ...prev, [device.id]: state }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      // A 409 means some push already owns the device; read its state so the
+      // card shows that transfer instead of only the refusal.
+      void refreshProvision(device.id);
     } finally {
       setBusyId(null);
     }
@@ -149,6 +224,18 @@ export function AvailableDevices() {
           {devices.map((device) => {
             const view = describe(device.state);
             const busy = busyId === device.id;
+            const push = provision[device.id];
+            const pct =
+              push?.state === 'running' && push.total_bytes > 0
+                ? Math.floor((push.bytes_done / push.total_bytes) * 100)
+                : 0;
+            // Hidden while a transfer is in flight or already delivered
+            // (spec D-P8): there is nothing left to start.
+            const canProvision =
+              device.state.state === 'ready' &&
+              activeModel !== null &&
+              push?.state !== 'running' &&
+              push?.state !== 'done';
             return (
               <li key={device.id} className="flex flex-wrap items-center gap-3 py-3">
                 <div className="min-w-0 flex-1">
@@ -164,37 +251,73 @@ export function AvailableDevices() {
                   {device.state.state === 'failed' && (
                     <p className="mt-1 text-xs text-slate-400">{device.state.remedy}</p>
                   )}
+                  {canProvision && activeModel && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Active model: {activeModel.id} ·{' '}
+                      {formatBytes(activeModel.meta.file_size_bytes)}
+                    </p>
+                  )}
+                  {push?.state === 'running' && (
+                    <p className="mt-1 text-xs text-cyan-300" role="status">
+                      Pushing {formatBytes(push.bytes_done)} /{' '}
+                      {formatBytes(push.total_bytes)} ({pct}%)
+                    </p>
+                  )}
+                  {push?.state === 'done' && (
+                    <p className="mt-1 text-xs text-emerald-300">
+                      Model installed ({formatBytes(push.bytes)}) — the worker
+                      reopens it a moment later
+                    </p>
+                  )}
+                  {push?.state === 'failed' && (
+                    <p className="mt-1 text-xs text-rose-300">{push.message}</p>
+                  )}
                 </div>
 
-                {view.action === 'revoke' ? (
-                  <button
-                    type="button"
-                    className={buttonClass}
-                    disabled={busy}
-                    onClick={() => void run(device, 'revoke')}
-                    title="Remove the enrollment and drop the connection"
-                  >
-                    <Trash2 className="mr-1 inline h-3 w-3" aria-hidden />
-                    Revoke
-                  </button>
-                ) : (
-                  view.action !== null && (
+                <div className="flex items-center gap-2">
+                  {canProvision && activeModel && (
                     <button
                       type="button"
                       className={buttonClass}
                       disabled={busy || busyId !== null}
-                      onClick={() => void run(device, view.action as Exclude<Action, null>)}
+                      onClick={() => void startPush(device)}
+                      title={`Push ${activeModel.id} to this phone over Wi-Fi`}
                     >
-                      {busy
-                        ? 'Working…'
-                        : device.state.state === 'failed'
-                          ? 'Retry'
-                          : device.state.state === 'needs_install'
-                            ? 'Install'
-                            : 'Connect'}
+                      <Upload className="mr-1 inline h-3 w-3" aria-hidden />
+                      Provision model ({formatBytes(activeModel.meta.file_size_bytes)})
                     </button>
-                  )
-                )}
+                  )}
+
+                  {view.action === 'revoke' ? (
+                    <button
+                      type="button"
+                      className={buttonClass}
+                      disabled={busy}
+                      onClick={() => void run(device, 'revoke')}
+                      title="Remove the enrollment and drop the connection"
+                    >
+                      <Trash2 className="mr-1 inline h-3 w-3" aria-hidden />
+                      Revoke
+                    </button>
+                  ) : (
+                    view.action !== null && (
+                      <button
+                        type="button"
+                        className={buttonClass}
+                        disabled={busy || busyId !== null}
+                        onClick={() => void run(device, view.action as Exclude<Action, null>)}
+                      >
+                        {busy
+                          ? 'Working…'
+                          : device.state.state === 'failed'
+                            ? 'Retry'
+                            : device.state.state === 'needs_install'
+                              ? 'Install'
+                              : 'Connect'}
+                      </button>
+                    )
+                  )}
+                </div>
               </li>
             );
           })}
