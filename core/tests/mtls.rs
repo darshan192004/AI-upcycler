@@ -6,9 +6,11 @@ use ai_upcycler_core::rpc::proto::aiupcycler::rpc::worker_service_server::{
     WorkerService, WorkerServiceServer,
 };
 use ai_upcycler_core::rpc::proto::aiupcycler::rpc::{
-    BenchmarkRequest, BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse,
+    BeginModelPushRequest, BeginModelPushResponse, BenchmarkRequest, BenchmarkResponse,
+    ExecuteForwardRequest, ExecuteForwardResponse, FinishModelPushRequest, FinishModelPushResponse,
     HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
-    LoadLayersResponse, UnloadLayersRequest, UnloadLayersResponse,
+    LoadLayersResponse, ModelChunk, PushModelChunksResponse, UnloadLayersRequest,
+    UnloadLayersResponse,
 };
 use ai_upcycler_core::security::{ClientIdentity, NodeCa, PairingManager, PAIRING_TTL};
 use std::net::SocketAddr;
@@ -40,6 +42,27 @@ impl WorkerService for TestWorker {
         &self,
         _request: tonic::Request<LoadLayersRequest>,
     ) -> Result<tonic::Response<LoadLayersResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not needed for mTLS test"))
+    }
+
+    async fn begin_model_push(
+        &self,
+        _request: tonic::Request<BeginModelPushRequest>,
+    ) -> Result<tonic::Response<BeginModelPushResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not needed for mTLS test"))
+    }
+
+    async fn push_model_chunks(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ModelChunk>>,
+    ) -> Result<tonic::Response<PushModelChunksResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not needed for mTLS test"))
+    }
+
+    async fn finish_model_push(
+        &self,
+        _request: tonic::Request<FinishModelPushRequest>,
+    ) -> Result<tonic::Response<FinishModelPushResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not needed for mTLS test"))
     }
 

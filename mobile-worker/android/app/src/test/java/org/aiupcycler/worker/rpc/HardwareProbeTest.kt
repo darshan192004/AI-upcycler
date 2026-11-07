@@ -107,9 +107,13 @@ class HardwareProbeTest {
     @Test
     fun an_out_of_memory_probe_fails_the_rpc_instead_of_the_worker() {
         val name = InProcessServerBuilder.generateName()
-        val failing = WorkerRpcService(identity, metrics) {
-            throw OutOfMemoryError("simulated exhaustion")
-        }
+        val failing = WorkerRpcService(
+            identity,
+            metrics,
+            // Named, not a trailing lambda: a parameter added after `probe`
+            // would silently bind this call to it instead (it did, once).
+            probe = { throw OutOfMemoryError("simulated exhaustion") },
+        )
         val failingServer = InProcessServerBuilder.forName(name)
             .directExecutor()
             .addService(failing)

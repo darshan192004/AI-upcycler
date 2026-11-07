@@ -12,15 +12,35 @@ use ai_upcycler_core::rpc::proto::aiupcycler::rpc::worker_service_server::{
     WorkerService, WorkerServiceServer,
 };
 use ai_upcycler_core::rpc::proto::aiupcycler::rpc::{
-    BenchmarkRequest, BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse,
+    BeginModelPushRequest, BeginModelPushResponse, BenchmarkRequest, BenchmarkResponse,
+    ExecuteForwardRequest, ExecuteForwardResponse, FinishModelPushRequest, FinishModelPushResponse,
     HandshakeRequest, HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest,
-    LoadLayersResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
+    LoadLayersResponse, ModelChunk, PushModelChunksResponse, TensorBuffer, UnloadLayersRequest,
+    UnloadLayersResponse,
 };
 use ai_upcycler_core::scheduler::planner::LayerAssignment;
 use ai_upcycler_core::security::{NodeCa, ServerIdentity};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+/// What a mock worker received through the push RPCs.
+///
+/// `bytes` is what `push_model_chunks` appended, in order, so a test can
+/// compare it against the host's file rather than a message count.
+#[derive(Debug, Default)]
+pub struct PushLog {
+    pub model_id: String,
+    pub file_name: String,
+    pub total_bytes: i64,
+    pub sha256_hex: String,
+    pub bytes: Vec<u8>,
+    /// Set by `finish_model_push`: the digest the worker verified, if any.
+    pub finished: Option<String>,
+    /// When set, `begin_model_push` refuses the push with this message.
+    pub refusal: Option<String>,
+}
 
 /// Shared ordered log of the RPCs a mock worker received.
 pub type Events = Arc<Mutex<Vec<String>>>;
@@ -53,6 +73,7 @@ pub struct MockWorker {
     /// behaviour of every worker built before the contract existed.
     supports_last_row_logits: bool,
     events: Events,
+    push: Arc<Mutex<PushLog>>,
 }
 
 impl MockWorker {
@@ -72,7 +93,13 @@ impl MockWorker {
             health: (80.0, 40.0),
             supports_last_row_logits: false,
             events,
+            push: Arc::default(),
         }
+    }
+
+    /// What this worker received through the model push RPCs.
+    pub fn push_log(&self) -> Arc<Mutex<PushLog>> {
+        Arc::clone(&self.push)
     }
 
     pub fn refusing_load(mut self) -> Self {
@@ -149,6 +176,92 @@ impl WorkerService for MockWorker {
             success: true,
             error_message: String::new(),
             allocated_ram_bytes: 1 << 20,
+        }))
+    }
+
+    async fn begin_model_push(
+        &self,
+        request: tonic::Request<BeginModelPushRequest>,
+    ) -> Result<tonic::Response<BeginModelPushResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let mut log = self.push.lock().expect("push lock");
+        if let Some(reason) = log.refusal.clone() {
+            return Ok(tonic::Response::new(BeginModelPushResponse {
+                accepted: false,
+                error_message: reason,
+                resume_from_bytes: 0,
+            }));
+        }
+        log.model_id = request.model_id;
+        log.file_name = request.file_name;
+        log.total_bytes = request.total_bytes;
+        log.sha256_hex = request.sha256_hex;
+        let resume_from = log.bytes.len() as i64;
+        self.record(format!("begin:{}", log.model_id));
+        Ok(tonic::Response::new(BeginModelPushResponse {
+            accepted: true,
+            error_message: String::new(),
+            resume_from_bytes: resume_from,
+        }))
+    }
+
+    async fn push_model_chunks(
+        &self,
+        request: tonic::Request<tonic::Streaming<ModelChunk>>,
+    ) -> Result<tonic::Response<PushModelChunksResponse>, tonic::Status> {
+        // Collected before the lock: a `std::sync::MutexGuard` held across an
+        // await would make this future non-Send.
+        let mut stream = request.into_inner();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            chunks.push(chunk);
+        }
+        let mut log = self.push.lock().expect("push lock");
+        for chunk in chunks {
+            let expected = log.bytes.len() as i64;
+            if chunk.offset != expected {
+                return Err(tonic::Status::invalid_argument(format!(
+                    "chunk offset {} does not match {expected} written",
+                    chunk.offset
+                )));
+            }
+            log.bytes.extend_from_slice(&chunk.data);
+        }
+        let received = log.bytes.len() as i64;
+        Ok(tonic::Response::new(PushModelChunksResponse {
+            success: true,
+            error_message: String::new(),
+            received_bytes: received,
+        }))
+    }
+
+    async fn finish_model_push(
+        &self,
+        request: tonic::Request<FinishModelPushRequest>,
+    ) -> Result<tonic::Response<FinishModelPushResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let mut log = self.push.lock().expect("push lock");
+        let digest = format!("{:x}", Sha256::digest(&log.bytes));
+        if !request.sha256_hex.is_empty() && digest != request.sha256_hex {
+            log.finished = None;
+            return Ok(tonic::Response::new(FinishModelPushResponse {
+                success: false,
+                error_message: format!(
+                    "sha256 mismatch: expected {}, got {digest}",
+                    request.sha256_hex
+                ),
+                model_path: String::new(),
+                size_bytes: log.bytes.len() as i64,
+                engine_started: false,
+            }));
+        }
+        log.finished = Some(digest);
+        Ok(tonic::Response::new(FinishModelPushResponse {
+            success: true,
+            error_message: String::new(),
+            model_path: log.file_name.clone(),
+            size_bytes: log.bytes.len() as i64,
+            engine_started: true,
         }))
     }
 
