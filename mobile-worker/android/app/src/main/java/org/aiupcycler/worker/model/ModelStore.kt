@@ -20,6 +20,20 @@ sealed class ReceiveStart {
 }
 
 /**
+ * The library operations a model push needs (spec 2026-11-03-model-
+ * provisioning, D-P3). Dependency inversion in the same shape as
+ * `EngineSource`: the RPC layer holds this, and [ModelStore] is the real
+ * implementation, so the push rules are unit-tested on the JVM.
+ */
+interface ModelReceiver {
+    fun beginReceive(fileName: String, totalBytes: Long, sha256Hex: String): ReceiveStart
+
+    fun appendReceive(offset: Long, data: ByteArray): Long
+
+    fun finishReceive(sha256Hex: String): ModelFile
+}
+
+/**
  * The worker's side-loaded model library.
  *
  * Models live in app-private storage and are imported through the system
@@ -30,7 +44,7 @@ sealed class ReceiveStart {
 class ModelStore(
     private val dir: File,
     private val freeSpace: () -> Long = { dir.usableSpace },
-) {
+) : ModelReceiver {
     /** The transfer currently being written, if any. */
     @Volatile
     private var receiving: Receiving? = null
@@ -116,7 +130,7 @@ class ModelStore(
      * bytes. The sidecar exists because a partial file cannot be hashed
      * against the whole-file digest until it is complete.
      */
-    fun beginReceive(fileName: String, totalBytes: Long, sha256Hex: String): ReceiveStart {
+    override fun beginReceive(fileName: String, totalBytes: Long, sha256Hex: String): ReceiveStart {
         val safe = safeName(fileName)
             ?: return ReceiveStart.Refused("not a .gguf file name: $fileName")
         if (totalBytes <= 0) {
@@ -167,7 +181,7 @@ class ModelStore(
      * stopped. A reordered or duplicated chunk fails instead of corrupting the
      * file.
      */
-    fun appendReceive(offset: Long, data: ByteArray): Long {
+    override fun appendReceive(offset: Long, data: ByteArray): Long {
         val current = receiving
             ?: throw IllegalStateException("no model push in progress")
         val written = current.part.length()
@@ -180,7 +194,7 @@ class ModelStore(
     }
 
     /** Verifies the completed file and installs it, or deletes the partial. */
-    fun finishReceive(sha256Hex: String): ModelFile {
+    override fun finishReceive(sha256Hex: String): ModelFile {
         val current = receiving
             ?: throw IllegalStateException("no model push in progress")
         receiving = null

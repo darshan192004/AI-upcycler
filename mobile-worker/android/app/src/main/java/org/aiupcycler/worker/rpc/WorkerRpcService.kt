@@ -1,15 +1,21 @@
 package org.aiupcycler.worker.rpc
 
+import aiupcycler.rpc.ClusterRpc.BeginModelPushRequest
+import aiupcycler.rpc.ClusterRpc.BeginModelPushResponse
 import aiupcycler.rpc.ClusterRpc.BenchmarkRequest
 import aiupcycler.rpc.ClusterRpc.BenchmarkResponse
 import aiupcycler.rpc.ClusterRpc.ExecuteForwardRequest
 import aiupcycler.rpc.ClusterRpc.ExecuteForwardResponse
+import aiupcycler.rpc.ClusterRpc.FinishModelPushRequest
+import aiupcycler.rpc.ClusterRpc.FinishModelPushResponse
 import aiupcycler.rpc.ClusterRpc.HandshakeRequest
 import aiupcycler.rpc.ClusterRpc.HandshakeResponse
 import aiupcycler.rpc.ClusterRpc.HealthRequest
 import aiupcycler.rpc.ClusterRpc.HealthResponse
 import aiupcycler.rpc.ClusterRpc.LoadLayersRequest
 import aiupcycler.rpc.ClusterRpc.LoadLayersResponse
+import aiupcycler.rpc.ClusterRpc.ModelChunk
+import aiupcycler.rpc.ClusterRpc.PushModelChunksResponse
 import aiupcycler.rpc.ClusterRpc.TensorBuffer
 import aiupcycler.rpc.ClusterRpc.UnloadLayersRequest
 import aiupcycler.rpc.ClusterRpc.UnloadLayersResponse
@@ -25,6 +31,10 @@ import org.aiupcycler.worker.engine.LoadSuccess
 import org.aiupcycler.worker.engine.UnloadFailure
 import org.aiupcycler.worker.engine.UnloadSuccess
 import org.aiupcycler.worker.metrics.DeviceMetrics
+import org.aiupcycler.worker.model.ModelFile
+import org.aiupcycler.worker.model.ModelReceiver
+import org.aiupcycler.worker.model.ReceiveStart
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -92,7 +102,23 @@ class WorkerRpcService(
     private val identity: WorkerIdentitySource,
     private val metrics: DeviceMetricsSource,
     private val engine: EngineSource? = null,
-    /** Injected so a test can exercise the probe's failure mapping. */
+    /**
+     * The model library a push writes into; `null` on a build without one,
+     * which keeps the honest `UNIMPLEMENTED` surface (D-P7/D-A4).
+     */
+    private val receiver: ModelReceiver? = null,
+    /**
+     * Called after a pushed model verifies. Returns whether the engine is
+     * already serving it: production schedules the restart and returns
+     * `false`, because rebuilding the gRPC server from inside its own handler
+     * would deadlock on `awaitTermination` (D-P7).
+     */
+    private val onProvisioned: ((ModelFile) -> Boolean)? = null,
+    /**
+     * Last so the existing trailing-lambda call sites keep binding to it;
+     * call it `probe =` explicitly, since a parameter added after it would
+     * silently rebind them (as one did before this comment was written).
+     */
     private val probe: () -> HardwareProbe.Result = HardwareProbe::measure,
 ) : WorkerServiceGrpc.WorkerServiceImplBase() {
 
@@ -288,6 +314,148 @@ class WorkerRpcService(
         responseObserver.onNext(response)
         responseObserver.onCompleted()
     }
+
+    override fun beginModelPush(
+        request: BeginModelPushRequest,
+        responseObserver: StreamObserver<BeginModelPushResponse>,
+    ) {
+        val library = receiver
+            ?: return responseObserver.onError(noModelLibrary())
+        val start = library.beginReceive(
+            request.fileName,
+            request.totalBytes,
+            request.sha256Hex,
+        )
+        val response = when (start) {
+            is ReceiveStart.Accepted -> BeginModelPushResponse.newBuilder()
+                .setAccepted(true)
+                .setResumeFromBytes(start.resumeFrom)
+                .build()
+
+            is ReceiveStart.Refused -> BeginModelPushResponse.newBuilder()
+                .setAccepted(false)
+                .setErrorMessage(start.reason)
+                .build()
+        }
+        responseObserver.onNext(response)
+        responseObserver.onCompleted()
+    }
+
+    override fun pushModelChunks(
+        responseObserver: StreamObserver<PushModelChunksResponse>,
+    ): StreamObserver<ModelChunk> {
+        val library = receiver
+        if (library == null) {
+            responseObserver.onError(noModelLibrary())
+            return NoopChunkObserver
+        }
+        return object : StreamObserver<ModelChunk> {
+            private var received = 0L
+            private var failed = false
+
+            override fun onNext(chunk: ModelChunk) {
+                if (failed) return
+                try {
+                    received = library.appendReceive(chunk.offset, chunk.data.toByteArray())
+                } catch (e: IllegalArgumentException) {
+                    // A gap or an overlap is a protocol error, not a disk error.
+                    failed = true
+                    responseObserver.onError(
+                        Status.INVALID_ARGUMENT
+                            .withDescription(e.message)
+                            .withCause(e)
+                            .asRuntimeException(),
+                    )
+                } catch (e: IOException) {
+                    failed = true
+                    responseObserver.onError(
+                        Status.INTERNAL
+                            .withDescription(e.message)
+                            .withCause(e)
+                            .asRuntimeException(),
+                    )
+                }
+            }
+
+            override fun onError(t: Throwable) {
+                // The master cancelled; the partial stays for the next attempt.
+                failed = true
+            }
+
+            override fun onCompleted() {
+                if (failed) return
+                responseObserver.onNext(
+                    PushModelChunksResponse.newBuilder()
+                        .setSuccess(true)
+                        .setReceivedBytes(received)
+                        .build(),
+                )
+                responseObserver.onCompleted()
+            }
+        }
+    }
+
+    override fun finishModelPush(
+        request: FinishModelPushRequest,
+        responseObserver: StreamObserver<FinishModelPushResponse>,
+    ) {
+        val library = receiver
+            ?: return responseObserver.onError(noModelLibrary())
+        val model = try {
+            library.finishReceive(request.sha256Hex)
+        } catch (e: IOException) {
+            // The bytes arrived; the verification failed. That is an answer,
+            // not a transport error, so the master can report it.
+            responseObserver.onNext(
+                FinishModelPushResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.message ?: "model verification failed")
+                    .build(),
+            )
+            responseObserver.onCompleted()
+            return
+        } catch (e: IllegalStateException) {
+            responseObserver.onNext(
+                FinishModelPushResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.message ?: "no model push in progress")
+                    .build(),
+            )
+            responseObserver.onCompleted()
+            return
+        }
+        val started = onProvisioned?.let { callback ->
+            runCatching { callback(model) }.getOrDefault(false)
+        } ?: false
+        val warning = if (onProvisioned != null && !started) {
+            "model installed; the worker reopens it on its next start"
+        } else {
+            ""
+        }
+        responseObserver.onNext(
+            FinishModelPushResponse.newBuilder()
+                .setSuccess(true)
+                .setErrorMessage(warning)
+                .setModelPath(model.file.absolutePath)
+                .setSizeBytes(model.sizeBytes)
+                .setEngineStarted(started)
+                .build(),
+        )
+        responseObserver.onCompleted()
+    }
+
+    private object NoopChunkObserver : StreamObserver<ModelChunk> {
+        override fun onNext(value: ModelChunk) = Unit
+
+        override fun onError(t: Throwable) = Unit
+
+        override fun onCompleted() = Unit
+    }
+
+    private fun noModelLibrary() =
+        Status.UNIMPLEMENTED
+            .withDescription("this worker has no model library")
+            .asRuntimeException()
 
     private fun unimplemented() =
         Status.UNIMPLEMENTED

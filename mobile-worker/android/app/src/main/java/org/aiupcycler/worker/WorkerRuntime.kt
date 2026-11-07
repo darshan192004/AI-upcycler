@@ -92,7 +92,13 @@ class WorkerRuntime(private val context: Context) {
                     .getOrNull()
             }
         }
-        val server = WorkerRpcServer(identity, metrics, engine)
+        val server = WorkerRpcServer(
+            identity = identity,
+            metrics = metrics,
+            engine = engine,
+            receiver = library,
+            onProvisioned = ::provisionCallback,
+        )
         server.start(credentials.load())
         rpcServer = server
         advertiser.start()
@@ -195,7 +201,13 @@ class WorkerRuntime(private val context: Context) {
         rpcServer = null
         running?.stop()
         if (!shouldServe) return
-        val server = WorkerRpcServer(identity, metrics, engine)
+        val server = WorkerRpcServer(
+            identity = identity,
+            metrics = metrics,
+            engine = engine,
+            receiver = library,
+            onProvisioned = ::provisionCallback,
+        )
         try {
             server.start(credentials.load())
         } catch (e: Exception) {
@@ -205,6 +217,24 @@ class WorkerRuntime(private val context: Context) {
             throw e
         }
         rpcServer = server
+    }
+
+    /**
+     * Runs after a pushed model verifies.
+     *
+     * The restart is scheduled rather than performed inline: rebuilding the
+     * gRPC server from inside its own handler would block on
+     * `awaitTermination` and then lose the port race (spec D-P7). The RPC
+     * therefore reports `engine_started = false`, and the next handshake
+     * reports `supports_compute = true` once the reopen lands.
+     */
+    private fun provisionCallback(model: ModelFile): Boolean {
+        Thread {
+            Thread.sleep(RESTART_AFTER_PROVISION_MS)
+            runCatching { loadModel(model.file) }
+                .onFailure { Log.e(TAG, "could not reopen ${model.displayName}", it) }
+        }.start()
+        return false
     }
 
     /** Forgets the pairing (spec D-B4); the worker returns to plaintext ADB. */
@@ -307,6 +337,13 @@ class WorkerRuntime(private val context: Context) {
 
     private companion object {
         const val TAG = "WorkerRuntime"
+
+        /**
+         * Delay before reopening a freshly pushed model. The finish RPC's
+         * response has to reach the master before the server it arrived on is
+         * shut down (spec D-P7).
+         */
+        const val RESTART_AFTER_PROVISION_MS = 750L
 
         /** The credential directory under the app's private files dir. */
         const val PAIRING_DIR = "pairing"
