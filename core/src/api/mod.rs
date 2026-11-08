@@ -14,6 +14,7 @@ mod error;
 pub mod llama;
 pub mod models;
 pub mod pairing;
+pub mod provisioning;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
@@ -73,6 +74,9 @@ pub struct AppState {
     /// Wireless device onboarding. None when adb could not be found, so a
     /// build without platform-tools still serves the cluster.
     pub onboarding: Option<Arc<crate::onboarding::OnboardingService>>,
+    /// Per-device model push progress, in memory only (spec 2026-11-03-model-
+    /// provisioning, D-P8).
+    pub provisioning: Arc<provisioning::ProvisioningRegistry>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -123,6 +127,7 @@ impl AppState {
             telemetry_cache: Arc::new(crate::worker_health::TelemetryCache::new()),
             host_memory: Arc::new(crate::worker_health::SysinfoHostMemory),
             onboarding: None,
+            provisioning: Arc::new(provisioning::ProvisioningRegistry::default()),
         }
     }
 
@@ -171,6 +176,16 @@ impl AppState {
     /// Overrides the GGUF fetcher (tests inject [`downloads::StubFetcher`]).
     pub fn with_fetcher(mut self, fetcher: Arc<dyn ModelFetcher>) -> Self {
         self.fetcher = fetcher;
+        self
+    }
+
+    /// Overrides the provisioning registry (tests preset a push that is
+    /// already running; spec 2026-11-03-model-provisioning, D-P8).
+    pub fn with_provisioning(
+        mut self,
+        provisioning: Arc<provisioning::ProvisioningRegistry>,
+    ) -> Self {
+        self.provisioning = provisioning;
         self
     }
 
@@ -379,6 +394,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices/scan", post(devices::scan))
         .route("/api/devices/:id/connect", post(devices::connect))
         .route("/api/devices/:id/install", post(devices::install))
+        .route(
+            "/api/devices/:id/provision",
+            post(provisioning::start).get(provisioning::status),
+        )
         .route("/api/devices/:id", delete(devices::revoke))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())

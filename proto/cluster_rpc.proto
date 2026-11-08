@@ -9,6 +9,12 @@ service WorkerService {
   rpc UnloadLayers (UnloadLayersRequest) returns (UnloadLayersResponse);
   rpc GetHealthStatus (HealthRequest) returns (HealthResponse);
   rpc Benchmark (BenchmarkRequest) returns (BenchmarkResponse);
+  // Model provisioning (spec 2026-11-03-model-provisioning, D-P1). Three calls
+  // because a client-streaming reply cannot carry the resume offset back
+  // before the stream starts.
+  rpc BeginModelPush (BeginModelPushRequest) returns (BeginModelPushResponse);
+  rpc PushModelChunks (stream ModelChunk) returns (PushModelChunksResponse);
+  rpc FinishModelPush (FinishModelPushRequest) returns (FinishModelPushResponse);
 }
 
 message HandshakeRequest {
@@ -104,4 +110,50 @@ message BenchmarkResponse {
   double throughput_flops = 2;
   // The worker's own wall time for both probes, for degenerate-run sanity.
   double probe_duration_ms = 3;
+}
+
+// --- Model provisioning -----------------------------------------------------
+
+message BeginModelPushRequest {
+  string model_id = 1;
+  // Bare file name ending in `.gguf`; the worker rejects a path.
+  string file_name = 2;
+  int64 total_bytes = 3;
+  // Lowercase hex SHA-256 of the whole file. It is also the resume contract:
+  // a partial whose recorded digest differs is discarded (D-P3).
+  string sha256_hex = 4;
+}
+
+message BeginModelPushResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // Bytes the worker already holds and verified against the same digest.
+  int64 resume_from_bytes = 3;
+}
+
+message ModelChunk {
+  // Must equal the number of bytes already written (D-P1 / spec section 4).
+  int64 offset = 1;
+  bytes data = 2;
+}
+
+message PushModelChunksResponse {
+  bool success = 1;
+  string error_message = 2;
+  int64 received_bytes = 3;
+}
+
+message FinishModelPushRequest {
+  string model_id = 1;
+  string sha256_hex = 2;
+}
+
+message FinishModelPushResponse {
+  bool success = 1;
+  string error_message = 2;
+  string model_path = 3;
+  int64 size_bytes = 4;
+  // Whether the worker reopened its engine on the new file. A verified file
+  // with a failed engine start is still a successful transfer (D-P7).
+  bool engine_started = 5;
 }

@@ -4,6 +4,7 @@ import type {
   ChatRequest,
   DownloadRequest,
   ModelList,
+  ProvisionState,
   RevokeResponse,
   ScanResponse,
   Topology,
@@ -140,4 +141,25 @@ export function scanNetwork(subnet: string): Promise<ScanResponse> {
     `/api/devices/scan?subnet=${encodeURIComponent(subnet)}`,
     { method: 'POST' },
   );
+}
+
+// ---- model provisioning (spec 2026-11-03-model-provisioning) ---------------
+
+/**
+ * Starts a push and returns immediately: a 1.9 GB model over Wi-Fi takes
+ * minutes, so the reply is the starting state and the caller polls
+ * [`getProvisionState`].
+ */
+export function startProvision(id: string, modelId: string): Promise<ProvisionState> {
+  return request<ProvisionState>(
+    `/api/devices/${encodeURIComponent(id)}/provision`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ model_id: modelId }),
+    },
+  );
+}
+
+export function getProvisionState(id: string): Promise<ProvisionState> {
+  return request<ProvisionState>(`/api/devices/${encodeURIComponent(id)}/provision`);
 }

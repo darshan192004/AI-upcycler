@@ -201,3 +201,17 @@ export interface ScanResponse {
 export interface RevokeResponse {
   revoked: boolean;
 }
+
+/**
+ * A model push in progress, as the server reports it (spec 2026-11-03-model-
+ * provisioning, D-P8).
+ *
+ * `done` means the worker verified the bytes and installed the file, not that
+ * the engine is serving it: the worker reopens the model a moment later, so
+ * `supports_compute` flips on the next handshake rather than on this reply.
+ */
+export type ProvisionState =
+  | { state: 'idle' }
+  | { state: 'running'; bytes_done: number; total_bytes: number }
+  | { state: 'done'; bytes: number }
+  | { state: 'failed'; message: string };
