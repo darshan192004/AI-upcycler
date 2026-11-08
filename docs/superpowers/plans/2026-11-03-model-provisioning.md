@@ -19,7 +19,15 @@ unproven until one is attached.
 | 5 — host streaming client | done | `2fee0bc` — 5 tests in `core/tests/provisioning.rs`; clippy 0, 298 passed |
 | 6 — HTTP surface | done | `3d6bab9` — `core/tests/devices.rs` 12/12 incl. end-to-end 202→done; two mutations bit; 305 passed, clippy 0 |
 | 7 — dashboard action | done | `344ef5d` — `tsc --noEmit` 0, `npm run build` 0 |
-| 8 — docs + PR | todo | |
+| 8 — docs + PR | done | PR #127, merged as `f31fbe8`; all 7 checks green |
+
+Post-review fix: CI's worker-engine job failed `E0046` because `worker/src/engine.rs`
+also implements `WorkerService` and the plan covered the Android worker only.
+`9349be8` answers the three push RPCs with a reasoned refusal (the desktop engine
+is the split-driver peer, not a provisioning target): 61 worker tests, clippy 0.
+The review bot raised two suggestions; both were answered on the PR with
+reasoning (a fully-qualified `tracing::warn!` needs no import, and the
+short-stream failure is caught by the worker's D-P3 verification).
 
 ## Task 1 — Proto contract
 
