@@ -89,6 +89,20 @@ jobs:
       - name: Install Frontend Dependencies
         run: pnpm install
 
+      # The app resolves `AI_UPCYCLER_ADB` -> bundled `platform-tools/adb` ->
+      # `PATH` (core/src/adb/binary.rs). The Apache-2.0 binaries are fetched
+      # here instead of being committed (issue #125). Linux deliberately takes
+      # adb from the distro package, so it fetches nothing.
+      - name: Fetch Android platform-tools (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/fetch-platform-tools.ps1
+
+      - name: Fetch Android platform-tools (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: bash scripts/fetch-platform-tools.sh
+
       - name: Build and Publish
         uses: tauri-apps/tauri-action@v1
         env:
