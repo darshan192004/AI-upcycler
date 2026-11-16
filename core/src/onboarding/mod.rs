@@ -48,14 +48,29 @@ pub fn resolve_worker_apk(
 
 /// `resources/worker/ai-upcycler-worker.apk` beside the executable, which is
 /// where a bundled Tauri resource lands.
+///
+/// Mirrors [`super::adb::bundled_candidates`]: Windows installers keep resources
+/// next to the executable, a macOS `.app` keeps them in `Contents/Resources`, and
+/// a bundle that nests Tauri's resource directory under the executable is
+/// covered too. One resolver serves every bundle (issue #130).
 pub fn bundled_worker_apk() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(
-        exe.parent()?
-            .join("resources")
-            .join("worker")
-            .join("ai-upcycler-worker.apk"),
-    )
+    let dir = exe.parent()?;
+    bundled_worker_apk_candidates(dir)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+/// Every layout a bundle can put `resources/worker/ai-upcycler-worker.apk` in,
+/// in preference order. Split out so the precedence can be tested without
+/// depending on where the test binary itself happens to live.
+fn bundled_worker_apk_candidates(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let apk = "ai-upcycler-worker.apk";
+    let mut candidates = vec![exe_dir.join("resources").join("worker").join(apk)];
+    if let Some(contents) = exe_dir.parent() {
+        candidates.push(contents.join("Resources").join("worker").join(apk));
+    }
+    candidates
 }
 
 /// What the dashboard shows for one device.
@@ -795,5 +810,48 @@ mod tests {
             resolve_worker_apk(Some("does-not-exist.apk".into()), None),
             None
         );
+    }
+
+    #[test]
+    fn bundled_worker_apk_candidates_cover_every_installer_layout_in_order() {
+        let exe_dir = std::path::Path::new("C:/Program Files/AI Upcycler");
+        let candidates = bundled_worker_apk_candidates(exe_dir);
+
+        assert_eq!(
+            candidates[0],
+            exe_dir
+                .join("resources")
+                .join("worker")
+                .join("ai-upcycler-worker.apk")
+        );
+        assert_eq!(
+            candidates[1],
+            std::path::Path::new("C:/Program Files")
+                .join("Resources")
+                .join("worker")
+                .join("ai-upcycler-worker.apk")
+        );
+    }
+
+    #[test]
+    fn a_bundled_worker_apk_is_found_in_a_macos_app_layout() {
+        // A macOS `.app` layout: Contents/MacOS/ai-upcycler plus
+        // Contents/Resources/worker/ai-upcycler-worker.apk.
+        let contents =
+            std::env::temp_dir().join(format!("ai-upcycler-apk-bundle-{}", std::process::id()));
+        let exe_dir = contents.join("MacOS");
+        let bundled = contents
+            .join("Resources")
+            .join("worker")
+            .join("ai-upcycler-worker.apk");
+        std::fs::create_dir_all(bundled.parent().expect("parent")).expect("dirs");
+        std::fs::write(&bundled, b"stub").expect("stub apk");
+
+        let found = bundled_worker_apk_candidates(&exe_dir)
+            .into_iter()
+            .find(|candidate| candidate.is_file());
+        assert_eq!(found.as_deref(), Some(bundled.as_path()));
+
+        let _ = std::fs::remove_dir_all(&contents);
     }
 }

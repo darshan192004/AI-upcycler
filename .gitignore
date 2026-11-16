@@ -15,6 +15,12 @@ src-tauri/gen/
 src-tauri/resources/platform-tools/*
 !src-tauri/resources/platform-tools/.gitkeep
 
+# The worker APK is fetched at release time from the `worker-apk` workflow
+# artifact (issue #130). The directory is kept so the Tauri bundler always
+# finds its resource source.
+src-tauri/resources/worker/*
+!src-tauri/resources/worker/.gitkeep
+
 # Env / local config
 .env
 .env.*
