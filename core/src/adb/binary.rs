@@ -105,7 +105,25 @@ pub fn resolve_from(
 fn bundled_candidate() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    Some(dir.join("platform-tools").join(adb_file_name()))
+    bundled_candidates(dir)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+/// Every layout a bundle can put `platform-tools/` in, in preference order.
+///
+/// Windows installers keep resources next to the executable; a macOS `.app`
+/// keeps them in `Contents/Resources` — a sibling of `MacOS/`; and a bundle
+/// that nests Tauri's resource directory under the executable is covered too.
+/// Listing all three means one resolver serves every bundle (issue #125).
+fn bundled_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+    let adb = adb_file_name();
+    let mut candidates = vec![exe_dir.join("platform-tools").join(adb)];
+    candidates.push(exe_dir.join("resources").join("platform-tools").join(adb));
+    if let Some(contents) = exe_dir.parent() {
+        candidates.push(contents.join("Resources").join("platform-tools").join(adb));
+    }
+    candidates
 }
 
 /// `adb` on `PATH`, if invoking it works.
@@ -199,5 +217,45 @@ mod tests {
         )
         .expect("falls through to PATH");
         assert_eq!(chosen.path(), Path::new("adb"));
+    }
+
+    #[test]
+    fn bundled_candidates_cover_every_installer_layout_in_order() {
+        let exe_dir = Path::new("C:/Program Files/AI Upcycler");
+        let adb = adb_file_name();
+        let candidates = bundled_candidates(exe_dir);
+
+        assert_eq!(candidates[0], exe_dir.join("platform-tools").join(adb));
+        assert_eq!(
+            candidates[1],
+            exe_dir.join("resources").join("platform-tools").join(adb)
+        );
+        assert_eq!(
+            candidates[2],
+            Path::new("C:/Program Files")
+                .join("Resources")
+                .join("platform-tools")
+                .join(adb)
+        );
+    }
+
+    #[test]
+    fn a_bundle_resource_directory_is_found_where_tauri_puts_it() {
+        // A macOS `.app` layout: Contents/MacOS/ai-upcycler plus
+        // Contents/Resources/platform-tools/adb.
+        let contents =
+            std::env::temp_dir().join(format!("ai-upcycler-adb-bundle-{}", uuid::Uuid::new_v4()));
+        let exe_dir = contents.join("MacOS");
+        let bundled = contents
+            .join("Resources")
+            .join("platform-tools")
+            .join(adb_file_name());
+        std::fs::create_dir_all(bundled.parent().expect("parent")).expect("dirs");
+        std::fs::write(&bundled, b"stub").expect("stub adb");
+
+        let found = bundled_candidates(&exe_dir)
+            .into_iter()
+            .find(|candidate| candidate.is_file());
+        assert_eq!(found.as_deref(), Some(bundled.as_path()));
     }
 }

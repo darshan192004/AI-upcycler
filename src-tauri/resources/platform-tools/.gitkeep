@@ -1,0 +1,3 @@
+# Placeholder so the Tauri bundler always finds resources/platform-tools.
+# The binaries are fetched at build time by scripts/fetch-platform-tools.ps1
+# (Windows) or scripts/fetch-platform-tools.sh (macOS); they are not committed.
