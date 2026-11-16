@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.util.Log
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -84,11 +85,16 @@ class MainActivity : Activity() {
      */
     private fun handleLaunch(intent: Intent?) {
         if (intent == null) return
+        val autoEnrollBool = intent.getBooleanExtra(AutoEnrollExtras.AUTO_ENROLL, false)
+        val autoEnrollStr = intent.getStringExtra(AutoEnrollExtras.AUTO_ENROLL)
+        val pin = intent.getStringExtra(AutoEnrollExtras.PIN)
+        val fingerprint = intent.getStringExtra(AutoEnrollExtras.CA_FINGERPRINT)
         val launch = AutoEnrollExtras.parse(
-            autoEnroll = intent.getBooleanExtra(AutoEnrollExtras.AUTO_ENROLL, false),
-            pin = intent.getStringExtra(AutoEnrollExtras.PIN),
-            fingerprint = intent.getStringExtra(AutoEnrollExtras.CA_FINGERPRINT),
+            autoEnroll = autoEnrollBool || (autoEnrollStr?.lowercase() == "true"),
+            pin = pin,
+            fingerprint = fingerprint,
         )
+        Log.i("MainActivity", "handleLaunch parsed: ${launch::class.simpleName}")
         when (launch) {
             is Launch.Interactive -> Unit
             is Launch.Malformed -> render(PairingState.Failed(launch.reason))
@@ -110,6 +116,7 @@ class MainActivity : Activity() {
                 fingerprint = request.fingerprint,
                 fingerprintIsComplete = true,
             )
+            Log.i("MainActivity", "autoEnroll result: ${result::class.simpleName}")
             uiThread.post {
                 if (isFinishing || isDestroyed) return@post
                 render(runtime.pairingState(result))
