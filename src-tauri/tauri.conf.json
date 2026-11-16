@@ -29,7 +29,8 @@
     "targets": "all",
     "licenseFile": "../LICENSE",
     "resources": {
-      "resources/platform-tools": "platform-tools"
+      "resources/platform-tools": "platform-tools",
+      "resources/worker": "worker"
     },
     "icon": [
       "icons/32x32.png",
