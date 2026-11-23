@@ -3,6 +3,7 @@ pub mod api;
 pub mod discovery;
 pub mod mmap;
 pub mod onboarding;
+pub mod provisioning;
 pub mod rpc;
 pub mod scheduler;
 pub mod security;

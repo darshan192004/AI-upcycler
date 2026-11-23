@@ -160,6 +160,30 @@ pub async fn enroll(
         state.registry.link_alias(alias, node_id);
     }
 
+    // The PIN hand-off is complete, so this is the moment `Ready` becomes
+    // true (spec 2026-11-03-wireless-onboarding, "Enrolling → Ready"). The
+    // card is keyed three ways depending on how discovery saw the phone: the
+    // ADB serial, the `ip:port` sighting that precedes a serial, or the node
+    // id itself. Trying each keeps `Ready` from landing on no card at all —
+    // `mark_ready` only writes a record it can actually find.
+    if let Some(service) = state.onboarding.as_ref() {
+        let nodes = state.registry.list_nodes();
+        let canonical = state.registry.canonical_id(node_id);
+        let mut candidates: Vec<String> = serial.iter().cloned().collect();
+        if let Some(node) = nodes
+            .iter()
+            .find(|node| node.node_id == canonical || node.node_id == node_id)
+        {
+            candidates.push(format!("{}:{}", node.ip_address, node.port));
+        }
+        candidates.push(node_id.to_string());
+        for candidate in candidates {
+            if service.mark_ready(&candidate, node_id).is_some() {
+                break;
+            }
+        }
+    }
+
     Ok(Json(EnrollResponse {
         ca_pem: state.security.ca.ca_pem(),
         client_cert_pem: client.cert_pem,

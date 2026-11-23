@@ -139,4 +139,117 @@ class ModelStoreTest {
         assertFalse(File(dir, "m.gguf").exists())
         assertFalse(File(dir, "m.gguf.part").exists())
     }
+
+    // --- pushed models (spec 2026-11-03-model-provisioning, D-P3/D-P4) -------
+
+    private fun digestOf(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    @Test
+    fun freshReceiveStartsAtZero() = withDir { dir ->
+        val bytes = ByteArray(8) { it.toByte() }
+
+        val start = ModelStore(dir).beginReceive("m.gguf", bytes.size.toLong(), digestOf(bytes))
+
+        assertEquals(ReceiveStart.Accepted(0L), start)
+    }
+
+    @Test
+    fun interruptedReceiveResumesAtThePartialLength() = withDir { dir ->
+        val bytes = ByteArray(8) { it.toByte() }
+        val digest = digestOf(bytes)
+        val first = ModelStore(dir)
+        first.beginReceive("m.gguf", bytes.size.toLong(), digest)
+        first.appendReceive(0, bytes.copyOfRange(0, 3))
+
+        // A new instance is what the worker has after a process restart.
+        val resumed = ModelStore(dir).beginReceive("m.gguf", bytes.size.toLong(), digest)
+
+        assertEquals(ReceiveStart.Accepted(3L), resumed)
+    }
+
+    @Test
+    fun aPartialFromADifferentDigestIsDiscarded() = withDir { dir ->
+        val oldBytes = ByteArray(8) { 1 }
+        val newBytes = ByteArray(8) { 2 }
+        val store = ModelStore(dir)
+        store.beginReceive("m.gguf", 8, digestOf(oldBytes))
+        store.appendReceive(0, oldBytes.copyOfRange(0, 5))
+
+        val start = ModelStore(dir).beginReceive("m.gguf", 8, digestOf(newBytes))
+
+        assertEquals(ReceiveStart.Accepted(0L), start)
+        assertEquals(0L, File(dir, "m.gguf.part").length())
+    }
+
+    @Test
+    fun aChunkAtTheWrongOffsetIsRefused() = withDir { dir ->
+        val bytes = ByteArray(8) { it.toByte() }
+        val store = ModelStore(dir)
+        store.beginReceive("m.gguf", 8, digestOf(bytes))
+        store.appendReceive(0, bytes.copyOfRange(0, 4))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            store.appendReceive(2, bytes.copyOfRange(0, 4))
+        }
+        assertEquals(4L, File(dir, "m.gguf.part").length())
+    }
+
+    @Test
+    fun aHashMismatchDeletesThePartial() = withDir { dir ->
+        val bytes = ByteArray(8) { it.toByte() }
+        val store = ModelStore(dir)
+        store.beginReceive("m.gguf", 8, digestOf(bytes))
+        store.appendReceive(0, bytes)
+
+        assertThrows(IOException::class.java) {
+            store.finishReceive(digestOf(ByteArray(8) { 9 }))
+        }
+        assertFalse(File(dir, "m.gguf.part").exists())
+        assertFalse(File(dir, "m.gguf.part.meta").exists())
+        assertTrue(store.list().isEmpty())
+    }
+
+    @Test
+    fun aTornPartialIsNotListedAsAModel() = withDir { dir ->
+        val bytes = ByteArray(8) { it.toByte() }
+        val store = ModelStore(dir)
+        store.beginReceive("m.gguf", 8, digestOf(bytes))
+        store.appendReceive(0, bytes.copyOfRange(0, 4))
+
+        assertTrue(store.list().isEmpty())
+    }
+
+    @Test
+    fun aReceiveWithoutSpaceIsRefused() = withDir { dir ->
+        val store = ModelStore(dir) { 10L * 1024 * 1024 }
+
+        val start = store.beginReceive(
+            "big.gguf",
+            20L * 1024 * 1024,
+            digestOf(ByteArray(1)),
+        )
+
+        assertTrue(start is ReceiveStart.Refused)
+        assertTrue((start as ReceiveStart.Refused).reason.contains("free space"))
+    }
+
+    @Test
+    fun aCompletedReceiveInstallsTheExactBytes() = withDir { dir ->
+        val bytes = ByteArray(16) { (it * 7).toByte() }
+        val store = ModelStore(dir)
+        store.beginReceive("m.gguf", bytes.size.toLong(), digestOf(bytes))
+        store.appendReceive(0, bytes.copyOfRange(0, 9))
+        store.appendReceive(9, bytes.copyOfRange(9, bytes.size))
+
+        val model = store.finishReceive(digestOf(bytes))
+
+        assertEquals("m.gguf", model.displayName)
+        assertArrayEquals(bytes, model.file.readBytes())
+        assertFalse(File(dir, "m.gguf.part").exists())
+        assertFalse(File(dir, "m.gguf.part.meta").exists())
+        assertEquals(listOf("m.gguf"), store.list().map { it.displayName })
+    }
 }

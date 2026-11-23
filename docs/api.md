@@ -301,6 +301,49 @@ neither is the master (it is not a polled worker).
 
 ---
 
+### 3.5 Model Provisioning to a Device (spec 2026-11-03-model-provisioning)
+
+Pushes the host's registered GGUF to one enrolled worker over the mTLS data
+plane. The transfer never rides on the HTTP request — 1.9 GB over Wi-Fi takes
+minutes — so `POST` starts it and answers `202`, and `GET` reports progress
+(D-P5, D-P8). Progress lives in host memory only: a restart reports `idle`
+rather than a stale transfer.
+
+- **Endpoint**: `POST /api/devices/:id/provision`
+- **Request**:
+```json
+{
+  "model_id": "qwen2.5-coder-3b-instruct-q4_k_m"
+}
+```
+  - `model_id` is an id from `/v1/models`, never a file path (D-P10): the
+    server resolves the node from `:id` in its registry and the file from the
+    store row, so the body cannot name a path.
+  - `:id` resolves three forms — the mDNS node id, the bare ADB serial (or its
+    `adb:` alias), and the `ip:port` key discovery uses before a serial exists.
+- **Response**: `202 Accepted` — the push was claimed and spawned:
+```json
+{ "state": "running", "bytes_done": 0, "total_bytes": 2040000000 }
+```
+- **Endpoint**: `GET /api/devices/:id/provision`
+- **Response**: `200 OK` — the current state, one of:
+```json
+{ "state": "idle" }
+{ "state": "running", "bytes_done": 1048576, "total_bytes": 2040000000 }
+{ "state": "done", "bytes": 2040000000 }
+{ "state": "failed", "message": "provision tiny: ..." }
+```
+  `done` means the worker verified and installed the file; whether it
+  reopened its engine is reported separately over RPC (`engine_started`,
+  D-P7) — the worker reopens the file a moment after the transfer ends.
+- **Errors**: `404` when no registry node matches `:id`, or the `model_id` is
+  unknown; `409` when the device is not enrolled (D-P9 — provisioning rides
+  the mTLS data plane), when the model file is missing on disk, or when a push
+  to that device is already running. The checks run in that order, before a
+  byte moves.
+
+---
+
 ## 4. WebSocket Real-Time Telemetry API
 
 - **URL**: `ws://localhost:8080/api/telemetry`

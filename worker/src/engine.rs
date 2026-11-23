@@ -8,10 +8,11 @@ use crate::gguf::GgufFile;
 use crate::layers::{embed_ids, lm_head, run_block, BlockWeights, KvLayer};
 use crate::math::rms_norm;
 use crate::proto::aiupcycler::rpc::{
-    tensor_buffer::DataType, worker_service_server::WorkerService, BenchmarkRequest,
-    BenchmarkResponse, ExecuteForwardRequest, ExecuteForwardResponse, HandshakeRequest,
+    tensor_buffer::DataType, worker_service_server::WorkerService, BeginModelPushRequest,
+    BeginModelPushResponse, BenchmarkRequest, BenchmarkResponse, ExecuteForwardRequest,
+    ExecuteForwardResponse, FinishModelPushRequest, FinishModelPushResponse, HandshakeRequest,
     HandshakeResponse, HealthRequest, HealthResponse, LoadLayersRequest, LoadLayersResponse,
-    TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
+    ModelChunk, PushModelChunksResponse, TensorBuffer, UnloadLayersRequest, UnloadLayersResponse,
 };
 use crate::quant::{dequantize, GgmlType};
 use std::collections::HashMap;
@@ -592,6 +593,50 @@ impl WorkerService for WorkerEngine {
             memory_bandwidth_mbs: measured.0,
             throughput_flops: measured.1,
             probe_duration_ms: measured.2,
+        }))
+    }
+
+    /// Model provisioning is implemented by the Android worker (spec
+    /// 2026-11-03-model-provisioning): this engine is the desktop
+    /// split-driver peer, and the master never provisions to it — the
+    /// dashboard only offers devices that came through onboarding.
+    ///
+    /// It answers the contract honestly with a refusal and a reason, rather
+    /// than accepting a multi-gigabyte stream it would then discard.
+    async fn begin_model_push(
+        &self,
+        _request: Request<BeginModelPushRequest>,
+    ) -> Result<Response<BeginModelPushResponse>, Status> {
+        Ok(Response::new(BeginModelPushResponse {
+            accepted: false,
+            error_message:
+                "this worker engine does not accept model pushes; provision the Android worker"
+                    .into(),
+            resume_from_bytes: 0,
+        }))
+    }
+
+    async fn push_model_chunks(
+        &self,
+        _request: Request<tonic::Streaming<ModelChunk>>,
+    ) -> Result<Response<PushModelChunksResponse>, Status> {
+        Ok(Response::new(PushModelChunksResponse {
+            success: false,
+            error_message: "this worker engine does not accept model pushes".into(),
+            received_bytes: 0,
+        }))
+    }
+
+    async fn finish_model_push(
+        &self,
+        _request: Request<FinishModelPushRequest>,
+    ) -> Result<Response<FinishModelPushResponse>, Status> {
+        Ok(Response::new(FinishModelPushResponse {
+            success: false,
+            error_message: "this worker engine does not accept model pushes".into(),
+            model_path: String::new(),
+            size_bytes: 0,
+            engine_started: false,
         }))
     }
 }
