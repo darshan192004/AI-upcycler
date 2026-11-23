@@ -70,5 +70,5 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
 async fn send_event(socket: &mut WebSocket, event: &TelemetryEvent) -> Result<(), axum::Error> {
     let payload = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-    socket.send(Message::Text(payload)).await
+    socket.send(Message::Text(payload.into())).await
 }
