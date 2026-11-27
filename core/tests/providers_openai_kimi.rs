@@ -113,7 +113,8 @@ fn generation_request(model: &str) -> GenerationRequest {
             },
         }]),
         stop: Some(Stop::One("END".to_string())),
-        top_p: Some(0.9),
+        // 0.5 is exact in both f32 and f64, so the wire assertion is stable.
+        top_p: Some(0.5),
         seed: Some(7),
         ..Default::default()
     }
@@ -158,11 +159,7 @@ async fn openai_sends_bearer_key_bare_model_and_stream_flag() {
     let captured = Arc::new(Mutex::new(None));
     let (base_url, handle): (String, JoinHandle<()>) =
         common::spawn_mock_provider(sse_app(captured.clone(), OPENAI_SSE)).await;
-    let registry = registry(
-        ProviderId::OpenAI,
-        OPENAI_KEY,
-        format!("{base_url}/v1"),
-    );
+    let registry = registry(ProviderId::OpenAI, OPENAI_KEY, format!("{base_url}/v1"));
     let route = CloudRoute {
         provider: ProviderId::OpenAI,
         model: "openai:gpt-4o".to_string(),
@@ -171,19 +168,26 @@ async fn openai_sends_bearer_key_bare_model_and_stream_flag() {
     let chunks = collect(&registry, &route, "openai:gpt-4o").await;
     handle.abort();
 
-    let seen = captured.lock().expect("captured lock").clone().expect("request");
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
     assert_eq!(seen.authorization, format!("Bearer {OPENAI_KEY}"));
     assert_eq!(seen.body["model"], json!("gpt-4o"));
     assert_eq!(seen.body["stream"], json!(true));
     assert_eq!(seen.body["temperature"], json!(0.25));
     assert_eq!(seen.body["max_tokens"], json!(64));
     assert_eq!(seen.body["stop"], json!("END"));
-    assert_eq!(seen.body["top_p"], json!(0.9));
+    assert_eq!(seen.body["top_p"], json!(0.5));
     assert_eq!(seen.body["seed"], json!(7));
     assert_eq!(seen.body["messages"].as_array().map(Vec::len), Some(2));
     assert!(seen.body.get("tools").is_none(), "must never forward tools");
     let raw = seen.body.to_string();
-    assert!(!raw.contains("openai:gpt-4o"), "model must be bare on the wire");
+    assert!(
+        !raw.contains("openai:gpt-4o"),
+        "model must be bare on the wire"
+    );
 
     let text: String = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
     assert_eq!(text, "Hello from OpenAI");
@@ -200,14 +204,15 @@ async fn openai_sends_bearer_key_bare_model_and_stream_flag() {
 async fn openai_non_200_error_names_provider_and_status_without_body_or_key() {
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(|| async { (StatusCode::UNAUTHORIZED, format!("secret-body-{OPENAI_KEY}")) }),
+        post(|| async {
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("secret-body-{OPENAI_KEY}"),
+            )
+        }),
     );
     let (base_url, handle) = common::spawn_mock_provider(app).await;
-    let registry = registry(
-        ProviderId::OpenAI,
-        OPENAI_KEY,
-        format!("{base_url}/v1"),
-    );
+    let registry = registry(ProviderId::OpenAI, OPENAI_KEY, format!("{base_url}/v1"));
     let route = CloudRoute {
         provider: ProviderId::OpenAI,
         model: "gpt-4o".to_string(),
@@ -225,21 +230,22 @@ async fn openai_non_200_error_names_provider_and_status_without_body_or_key() {
     let message = errors.first().expect("one error chunk");
     assert!(message.contains("openai"), "{message}");
     assert!(message.contains("401"), "{message}");
-    assert!(!message.contains(OPENAI_KEY), "key leaked into error: {message}");
-    assert!(!message.contains("secret-body"), "body leaked into error: {message}");
+    assert!(
+        !message.contains(OPENAI_KEY),
+        "key leaked into error: {message}"
+    );
+    assert!(
+        !message.contains("secret-body"),
+        "body leaked into error: {message}"
+    );
     assert!(errors.len() == 1, "expected only the error chunk");
 }
 
 #[tokio::test]
 async fn kimi_uses_the_same_openai_compatible_shape() {
     let captured = Arc::new(Mutex::new(None));
-    let (base_url, handle) =
-        common::spawn_mock_provider(sse_app(captured.clone(), KIMI_SSE)).await;
-    let registry = registry(
-        ProviderId::Kimi,
-        KIMI_KEY,
-        format!("{base_url}/v1"),
-    );
+    let (base_url, handle) = common::spawn_mock_provider(sse_app(captured.clone(), KIMI_SSE)).await;
+    let registry = registry(ProviderId::Kimi, KIMI_KEY, format!("{base_url}/v1"));
     let route = CloudRoute {
         provider: ProviderId::Kimi,
         model: "moonshot-v1-8k".to_string(),
@@ -248,7 +254,11 @@ async fn kimi_uses_the_same_openai_compatible_shape() {
     let chunks = collect(&registry, &route, "kimi:moonshot-v1-8k").await;
     handle.abort();
 
-    let seen = captured.lock().expect("captured lock").clone().expect("request");
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
     assert_eq!(seen.authorization, format!("Bearer {KIMI_KEY}"));
     assert_eq!(seen.body["model"], json!("moonshot-v1-8k"));
     assert_eq!(seen.body["stream"], json!(true));

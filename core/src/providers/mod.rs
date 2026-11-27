@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+mod kimi;
+mod openai;
+pub(crate) mod openai_compat;
+
 /// Known cloud providers that can hold a credential in the OS keychain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -258,6 +262,9 @@ impl CloudProvider for PlaceholderProvider {
 pub struct ProviderRegistry {
     secrets: Arc<dyn SecretStore>,
     base_urls: HashMap<ProviderId, String>,
+    /// Shared HTTP transport. Production uses reqwest's normal proxy
+    /// behaviour; tests inject a `.no_proxy()` client for loopback mocks.
+    client: reqwest::Client,
     adapters: HashMap<ProviderId, Box<dyn CloudProvider>>,
 }
 
@@ -288,6 +295,7 @@ impl ProviderRegistry {
         let mut registry = Self {
             secrets,
             base_urls,
+            client: reqwest::Client::new(),
             adapters: HashMap::new(),
         };
         registry.rebuild_adapters();
@@ -298,6 +306,15 @@ impl ProviderRegistry {
     /// server). No secret value is accepted or stored here.
     pub fn with_base_url(mut self, id: ProviderId, url: impl Into<String>) -> Self {
         self.base_urls.insert(id, url.into());
+        self.rebuild_adapters();
+        self
+    }
+
+    /// Replaces the HTTP client used by every adapter. Tests inject a client
+    /// built with `.no_proxy()` so loopback mocks are never routed through a
+    /// system proxy; production keeps the default client from [`Self::new`].
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
         self.rebuild_adapters();
         self
     }
@@ -313,9 +330,16 @@ impl ProviderRegistry {
     fn rebuild_adapters(&mut self) {
         self.adapters.clear();
         for id in ProviderId::ALL {
-            let descriptor = descriptor_for(id);
-            self.adapters
-                .insert(id, Box::new(PlaceholderProvider { descriptor }));
+            let base_url = self.base_urls[&id].clone();
+            let adapter: Box<dyn CloudProvider> = match id {
+                ProviderId::OpenAI => Box::new(openai::provider(self.client.clone(), base_url)),
+                ProviderId::Kimi => Box::new(kimi::provider(self.client.clone(), base_url)),
+                // Tasks 5 and 6 replace these with Anthropic and Gemini.
+                _ => Box::new(PlaceholderProvider {
+                    descriptor: descriptor_for(id),
+                }),
+            };
+            self.adapters.insert(id, adapter);
         }
     }
 
@@ -481,7 +505,7 @@ fn split_model(model: &str) -> Option<(ProviderId, &str)> {
 }
 
 /// The bare model id, with a known prefix stripped when present.
-fn bare_model(model: &str) -> &str {
+pub(crate) fn bare_model(model: &str) -> &str {
     split_model(model).map(|(_, bare)| bare).unwrap_or(model)
 }
 

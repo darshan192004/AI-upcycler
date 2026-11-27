@@ -404,9 +404,7 @@ pub async fn serve_mock_identity(
 /// axum's graceful shutdown: the sender is held by the server task for its
 /// whole life, so an in-flight request can be drained if a signal is ever
 /// published, while normal teardown stays an explicit `JoinHandle::abort()`.
-pub async fn spawn_mock_provider(
-    app: axum::Router,
-) -> (String, tokio::task::JoinHandle<()>) {
+pub async fn spawn_mock_provider(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock provider");
