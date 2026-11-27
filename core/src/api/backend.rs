@@ -150,6 +150,10 @@ pub struct GenerationChunk {
     /// The engine's finish reason, when it sent one. The API defaults to
     /// `"stop"`, or `"tool_calls"` when the turn produced calls.
     pub finish_reason: Option<String>,
+    /// Where this chunk came from: `local`, `adb:<serial>`, or a provider id.
+    /// `None` is legacy/unknown. Every real backend labels the chunks it emits
+    /// so the metrics layer can report the execution source.
+    pub source: Option<String>,
 }
 
 /// Produces a stream of token chunks for a chat request.
@@ -166,6 +170,12 @@ pub trait GenerationBackend: Send + Sync + 'static {
     /// otherwise would return text that looks like a call but is not one.
     fn tool_calling_available(&self) -> bool {
         false
+    }
+
+    /// True when this backend can actually produce model output. The labelled
+    /// offline stub is false so `Auto` can fall through to a cloud provider.
+    fn is_real(&self) -> bool {
+        true
     }
 }
 
@@ -202,6 +212,10 @@ impl StubBackend {
 }
 
 impl GenerationBackend for StubBackend {
+    fn is_real(&self) -> bool {
+        false
+    }
+
     fn generate(
         &self,
         request: GenerationRequest,
@@ -215,6 +229,7 @@ impl GenerationBackend for StubBackend {
                 yield Ok(GenerationChunk {
                     content: word.to_string(),
                     tokens_emitted: 1,
+                    source: Some("local".into()),
                     ..Default::default()
                 });
             }
@@ -383,5 +398,20 @@ mod tests {
             },
         }]);
         assert!(req.wants_tools());
+    }
+
+    #[test]
+    fn stub_backend_is_not_a_real_local_engine() {
+        assert!(!StubBackend::new().is_real());
+    }
+
+    #[test]
+    fn chunks_can_carry_their_execution_source() {
+        let chunk = GenerationChunk {
+            source: Some("adb:192.168.1.9:5555".into()),
+            ..Default::default()
+        };
+        assert_eq!(chunk.source.as_deref(), Some("adb:192.168.1.9:5555"));
+        assert_eq!(GenerationChunk::default().source, None);
     }
 }

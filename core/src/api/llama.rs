@@ -478,6 +478,7 @@ fn finalize_buffered_turn(
         if !content.is_empty() {
             chunks.push(GenerationChunk {
                 content,
+                source: Some("local".into()),
                 ..Default::default()
             });
         }
@@ -485,11 +486,13 @@ fn finalize_buffered_turn(
             chunks.push(GenerationChunk {
                 tool_calls: Some(vec![call]),
                 tokens_emitted: call_tokens,
+                source: Some("local".into()),
                 ..Default::default()
             });
         }
         chunks.push(GenerationChunk {
             finish_reason: Some("tool_calls".into()),
+            source: Some("local".into()),
             ..Default::default()
         });
         return chunks;
@@ -508,6 +511,7 @@ fn finalize_buffered_turn(
             }]),
             tokens_emitted: tokens,
             finish_reason: Some("tool_calls".into()),
+            source: Some("local".into()),
             ..Default::default()
         }];
     }
@@ -516,6 +520,7 @@ fn finalize_buffered_turn(
         return vec![GenerationChunk {
             finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".into())),
             tokens_emitted: tokens,
+            source: Some("local".into()),
             ..Default::default()
         }];
     }
@@ -524,6 +529,7 @@ fn finalize_buffered_turn(
         content,
         tokens_emitted: tokens,
         finish_reason: finish_reason.or_else(|| Some("stop".into())),
+        source: Some("local".into()),
         ..Default::default()
     }]
 }
@@ -595,6 +601,7 @@ where
                                 tokens_emitted: chunk_tokens,
                                 tool_calls: delta.tool_calls,
                                 finish_reason: delta.finish_reason,
+                                source: Some("local".into()),
                                 ..Default::default()
                             });
                         }

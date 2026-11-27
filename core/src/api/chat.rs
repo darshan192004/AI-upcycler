@@ -161,8 +161,12 @@ async fn buffered_response(
     let mut prompt_tokens: Option<u64> = None;
     let mut tool_deltas: Vec<ToolCallDelta> = Vec::new();
     let mut finish_reason: Option<String> = None;
+    let mut source: Option<String> = None;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(ApiError::Internal)?;
+        if let Some(chunk_source) = chunk.source {
+            source = Some(chunk_source);
+        }
         if chunk.prompt_tokens.is_some() {
             prompt_tokens = chunk.prompt_tokens.map(u64::from);
         }
@@ -196,6 +200,7 @@ async fn buffered_response(
         &state.telemetry,
         &state.registry,
         &state.telemetry_cache,
+        source.as_deref().unwrap_or("local"),
         completion_tokens,
         elapsed,
     );
@@ -256,13 +261,24 @@ fn stream_response(
         let mut finish_reason: Option<String> = None;
         let mut saw_tool_calls = false;
         let mut tool_indices: HashSet<u32> = HashSet::new();
+        let mut source: Option<String> = None;
         let mut backend = state.backend.generate(generation.clone());
         while let Some(item) = backend.next().await {
             match item {
                 Ok(chunk) => {
                     completion_tokens += u64::from(chunk.tokens_emitted);
                     content.push_str(&chunk.content);
-                    publish_metrics(&telemetry, &registry, &cache, completion_tokens, started.elapsed().as_secs_f64());
+                    if let Some(chunk_source) = chunk.source {
+                        source = Some(chunk_source);
+                    }
+                    publish_metrics(
+                        &telemetry,
+                        &registry,
+                        &cache,
+                        source.as_deref().unwrap_or("local"),
+                        completion_tokens,
+                        started.elapsed().as_secs_f64(),
+                    );
                     if !chunk.content.is_empty() {
                         yield Ok(sse_event(chunk_value(&id, &model, json!({ "content": chunk.content }), None)));
                     }
@@ -401,6 +417,7 @@ fn publish_metrics(
     telemetry: &TelemetryBus,
     registry: &NodeRegistry,
     cache: &TelemetryCache,
+    source: &str,
     current_token: u64,
     elapsed_secs: f64,
 ) {
@@ -428,6 +445,7 @@ fn publish_metrics(
     telemetry.publish(TelemetryEvent::generation_metrics(GenerationMetrics {
         tokens_per_second,
         current_token,
+        source: source.to_string(),
         master_ram_utilization_pct: cache.master_ram().and_then(|(value, _)| value),
         worker_nodes,
     }));
@@ -595,6 +613,7 @@ mod tests {
             &state.telemetry,
             &state.registry,
             &state.telemetry_cache,
+            "local",
             10,
             1.0,
         );
@@ -606,6 +625,7 @@ mod tests {
                 assert_eq!(data.worker_nodes[0].temp_celsius, Some(38.5));
                 assert_eq!(data.worker_nodes[0].battery_pct, Some(92.0));
                 assert_eq!(data.master_ram_utilization_pct, Some(42.0));
+                assert_eq!(data.source, "local");
             }
             other => panic!("expected generation metrics, got {other:?}"),
         }
@@ -632,6 +652,7 @@ mod tests {
             &state.telemetry,
             &state.registry,
             &state.telemetry_cache,
+            "local",
             10,
             1.0,
         );
@@ -642,6 +663,7 @@ mod tests {
                 assert_eq!(data.worker_nodes[0].temp_celsius, None);
                 assert_eq!(data.worker_nodes[0].battery_pct, None);
                 assert_eq!(data.master_ram_utilization_pct, None);
+                assert_eq!(data.source, "local");
             }
             other => panic!("expected generation metrics, got {other:?}"),
         }

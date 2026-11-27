@@ -63,6 +63,9 @@ pub struct WorkerHealthEventData {
 pub struct GenerationMetrics {
     pub tokens_per_second: f64,
     pub current_token: u64,
+    /// Where the generation ran: `local`, `adb:<serial>`, or a provider id.
+    /// Defaults to `"local"` when no chunk supplied a source.
+    pub source: String,
     /// The master's own RAM utilization; `None` when it could not be read.
     pub master_ram_utilization_pct: Option<f64>,
     pub worker_nodes: Vec<WorkerTelemetry>,
