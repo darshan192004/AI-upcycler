@@ -7,13 +7,13 @@
 mod common;
 
 use ai_upcycler_core::api::backend::{
-    ChatMessage, GenerationChunk, GenerationRequest, ToolDef, FunctionDef,
+    ChatMessage, FunctionDef, GenerationChunk, GenerationRequest, ToolDef,
 };
 use ai_upcycler_core::providers::{CloudRoute, ProviderId, ProviderRegistry};
 use ai_upcycler_core::secrets::{SecretScope, SecretStore};
 use axum::http::StatusCode;
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -102,12 +102,8 @@ fn generation_request() -> GenerationRequest {
 }
 
 fn sse_app(captured: Arc<Mutex<Option<Captured>>>, body: &'static str) -> Router {
-    Router::new().route(
-        "/v1beta/models/{model}:streamGenerateContent",
-        post(move |axum::extract::Path(model): axum::extract::Path<String>,
-                   uri: axum::http::Uri,
-                   headers: axum::http::HeaderMap,
-                   Json(payload): Json<Value>| {
+    Router::new().fallback(post(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap, request_body: String| {
             let captured = captured.clone();
             async move {
                 let api_key = headers
@@ -115,16 +111,20 @@ fn sse_app(captured: Arc<Mutex<Option<Captured>>>, body: &'static str) -> Router
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
+                let parsed = serde_json::from_str::<Value>(&request_body).unwrap_or(Value::Null);
                 *captured.lock().expect("captured lock") = Some(Captured {
                     api_key,
-                    path: format!("/v1beta/models/{model}:streamGenerateContent"),
+                    path: uri.path().to_string(),
                     query: uri.query().unwrap_or_default().to_string(),
-                    body: payload,
+                    body: parsed,
                 });
-                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body.to_string())
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    body.to_string(),
+                )
             }
-        }),
-    )
+        },
+    ))
 }
 
 #[tokio::test]
@@ -147,14 +147,25 @@ async fn gemini_sends_api_key_header_and_contents_then_reassembles_the_stream() 
         .collect();
     handle.abort();
 
-    let seen = captured.lock().expect("captured lock").clone().expect("request");
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
     assert_eq!(seen.api_key, GEMINI_KEY);
-    assert_eq!(seen.path, "/v1beta/models/gemini-2.5-flash:streamGenerateContent");
+    assert_eq!(
+        seen.path,
+        "/v1beta/models/gemini-2.5-flash:streamGenerateContent"
+    );
     assert_eq!(seen.query, "alt=sse", "key must not be in the query string");
     assert!(!seen.query.contains(GEMINI_KEY), "key leaked into URL");
 
     let contents = seen.body["contents"].as_array().expect("contents array");
-    assert_eq!(contents.len(), 3, "system turns must be folded into a user turn");
+    assert_eq!(
+        contents.len(),
+        3,
+        "system turns must be folded into a user turn"
+    );
     assert_eq!(contents[0]["role"], json!("user"));
     assert_eq!(
         contents[0]["parts"][0]["text"],
@@ -180,15 +191,12 @@ async fn gemini_sends_api_key_header_and_contents_then_reassembles_the_stream() 
 
 #[tokio::test]
 async fn gemini_non_200_error_names_provider_and_status_without_key_or_body() {
-    let app = Router::new().route(
-        "/v1beta/models/{model}:streamGenerateContent",
-        post(|| async {
-            (
-                StatusCode::UNAUTHORIZED,
-                format!("secret-body-{GEMINI_KEY}"),
-            )
-        }),
-    );
+    let app = Router::new().fallback(post(|| async {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("secret-body-{GEMINI_KEY}"),
+        )
+    }));
     let (base_url, handle) = common::spawn_mock_provider(app).await;
     let registry = registry(base_url);
     let route = CloudRoute {

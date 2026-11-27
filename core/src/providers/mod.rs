@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 mod anthropic;
+mod gemini;
 mod kimi;
 mod openai;
 pub(crate) mod openai_compat;
@@ -230,34 +231,6 @@ pub trait CloudProvider: Send + Sync + 'static {
     ) -> BoxStream<'static, Result<GenerationChunk, String>>;
 }
 
-/// Temporary adapter used until Tasks 4–6 install the real transports. It
-/// returns a clear error stream and never holds or emits a credential.
-#[derive(Debug)]
-struct PlaceholderProvider {
-    descriptor: &'static ProviderDescriptor,
-}
-
-impl CloudProvider for PlaceholderProvider {
-    fn id(&self) -> ProviderId {
-        self.descriptor.id
-    }
-
-    fn descriptor(&self) -> &'static ProviderDescriptor {
-        self.descriptor
-    }
-
-    fn chat_stream(
-        &self,
-        _request: GenerationRequest,
-        _api_key: &str,
-    ) -> BoxStream<'static, Result<GenerationChunk, String>> {
-        let message = format!("{} adapter is not implemented yet", self.id().as_str());
-        Box::pin(async_stream::stream! {
-            yield Err(message);
-        })
-    }
-}
-
 /// Resolves routes, reads credentials from the injected secret store, and
 /// dispatches to the matching adapter.
 pub struct ProviderRegistry {
@@ -337,11 +310,8 @@ impl ProviderRegistry {
                 ProviderId::Anthropic => {
                     Box::new(anthropic::provider(self.client.clone(), base_url))
                 }
+                ProviderId::Gemini => Box::new(gemini::provider(self.client.clone(), base_url)),
                 ProviderId::Kimi => Box::new(kimi::provider(self.client.clone(), base_url)),
-                // Task 6 replaces Gemini with the real adapter.
-                _ => Box::new(PlaceholderProvider {
-                    descriptor: descriptor_for(id),
-                }),
             };
             self.adapters.insert(id, adapter);
         }
