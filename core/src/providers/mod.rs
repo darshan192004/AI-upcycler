@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+mod anthropic;
 mod kimi;
 mod openai;
 pub(crate) mod openai_compat;
@@ -333,8 +334,11 @@ impl ProviderRegistry {
             let base_url = self.base_urls[&id].clone();
             let adapter: Box<dyn CloudProvider> = match id {
                 ProviderId::OpenAI => Box::new(openai::provider(self.client.clone(), base_url)),
+                ProviderId::Anthropic => {
+                    Box::new(anthropic::provider(self.client.clone(), base_url))
+                }
                 ProviderId::Kimi => Box::new(kimi::provider(self.client.clone(), base_url)),
-                // Tasks 5 and 6 replace these with Anthropic and Gemini.
+                // Task 6 replaces Gemini with the real adapter.
                 _ => Box::new(PlaceholderProvider {
                     descriptor: descriptor_for(id),
                 }),

@@ -77,7 +77,7 @@ fn payload(request: &GenerationRequest) -> Value {
 /// Drains `chunk` into `buffer` and returns every complete SSE line. A line
 /// split across byte frames stays in the buffer until its `\n` arrives, so a
 /// JSON object is never parsed half-written.
-fn take_complete_lines(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+pub(crate) fn take_complete_lines(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
     buffer.extend_from_slice(chunk);
     let mut lines = Vec::new();
     while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {

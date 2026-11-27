@@ -7,7 +7,7 @@
 mod common;
 
 use ai_upcycler_core::api::backend::{
-    ChatMessage, GenerationChunk, GenerationRequest, Stop, ToolDef, FunctionDef,
+    ChatMessage, FunctionDef, GenerationChunk, GenerationRequest, Stop, ToolDef,
 };
 use ai_upcycler_core::providers::{CloudRoute, ProviderId, ProviderRegistry};
 use ai_upcycler_core::secrets::{SecretScope, SecretStore};
@@ -137,7 +137,10 @@ fn sse_app(captured: Arc<Mutex<Option<Captured>>>, body: &'static str) -> Router
                     authorization: header(AUTHORIZATION.as_str()),
                     body: payload,
                 });
-                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body.to_string())
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    body.to_string(),
+                )
             }
         }),
     )
@@ -163,16 +166,27 @@ async fn anthropic_sends_headers_and_contract_payload_then_reassembles_the_strea
         .collect();
     handle.abort();
 
-    let seen = captured.lock().expect("captured lock").clone().expect("request");
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
     assert_eq!(seen.api_key, ANTHROPIC_KEY);
     assert_eq!(seen.version, ANTHROPIC_VERSION);
-    assert!(seen.authorization.is_empty(), "must not send a Bearer header");
+    assert!(
+        seen.authorization.is_empty(),
+        "must not send a Bearer header"
+    );
     assert_eq!(seen.body["model"], json!("claude-3-5-sonnet-latest"));
     assert_eq!(seen.body["system"], json!("Be brief.\nBe kind."));
     assert_eq!(seen.body["stream"], json!(true));
     assert_eq!(seen.body["max_tokens"], json!(64));
     let messages = seen.body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 3, "system messages must not be forwarded as turns");
+    assert_eq!(
+        messages.len(),
+        3,
+        "system messages must not be forwarded as turns"
+    );
     assert_eq!(messages[0]["role"], json!("user"));
     assert_eq!(messages[1]["role"], json!("assistant"));
     assert_eq!(messages[2]["role"], json!("user"));
