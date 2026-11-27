@@ -5,6 +5,7 @@ pub mod mmap;
 pub mod onboarding;
 pub mod providers;
 pub mod provisioning;
+pub mod routing;
 pub mod rpc;
 pub mod scheduler;
 pub mod secrets;

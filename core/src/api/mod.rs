@@ -23,6 +23,8 @@ use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::NodeRegistry;
+use crate::providers::ProviderRegistry;
+use crate::secrets::{KeyringSecretStore, SecretStore, UnconfiguredSecretStore};
 use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
@@ -77,6 +79,12 @@ pub struct AppState {
     /// Per-device model push progress, in memory only (spec 2026-11-03-model-
     /// provisioning, D-P8).
     pub provisioning: Arc<provisioning::ProvisioningRegistry>,
+    /// OS-keychain-backed credentials. Never holds a plaintext fallback and
+    /// is never serialized into an API response.
+    pub secrets: Arc<dyn SecretStore>,
+    /// Cloud provider registry. Rebuilt whenever the secret store is swapped
+    /// so `configured` statuses cannot go stale.
+    pub providers: Arc<ProviderRegistry>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -111,6 +119,8 @@ impl AppState {
         host: HostInfo,
     ) -> Self {
         let security = Arc::new(SecurityState::default());
+        let secrets: Arc<dyn SecretStore> = Arc::new(UnconfiguredSecretStore);
+        let providers = Arc::new(ProviderRegistry::new(secrets.clone()));
         Self {
             cluster_id,
             registry,
@@ -128,6 +138,8 @@ impl AppState {
             host_memory: Arc::new(crate::worker_health::SysinfoHostMemory),
             onboarding: None,
             provisioning: Arc::new(provisioning::ProvisioningRegistry::default()),
+            secrets,
+            providers,
         }
     }
 
@@ -186,6 +198,22 @@ impl AppState {
         provisioning: Arc<provisioning::ProvisioningRegistry>,
     ) -> Self {
         self.provisioning = provisioning;
+        self
+    }
+
+    /// Installs a secret store and rebuilds the provider registry so status
+    /// queries always reflect the current credential source. The value itself
+    /// is never copied into app state.
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
+        self.providers = Arc::new(ProviderRegistry::new(secrets.clone()));
+        self.secrets = secrets;
+        self
+    }
+
+    /// Installs a preconfigured provider registry (tests inject a loopback
+    /// base URL). The secret store is intentionally left untouched.
+    pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
+        self.providers = providers;
         self
     }
 
@@ -273,6 +301,7 @@ impl AppState {
         .with_security(security)
         .with_telemetry_cache(telemetry_cache)
         .with_models_dir(models_dir)
+        .with_secrets(Arc::new(KeyringSecretStore))
         .with_onboarding(discover_onboarding())
     }
 }

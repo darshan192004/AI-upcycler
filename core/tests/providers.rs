@@ -80,8 +80,14 @@ async fn send(app: Router, uri: &str) -> (StatusCode, Value) {
 fn route_policy_parses_auto_local_and_known_providers() {
     assert_eq!(RoutePolicy::parse(None).unwrap(), RoutePolicy::Auto);
     assert_eq!(RoutePolicy::parse(Some("")).unwrap(), RoutePolicy::Auto);
-    assert_eq!(RoutePolicy::parse(Some(" auto ")).unwrap(), RoutePolicy::Auto);
-    assert_eq!(RoutePolicy::parse(Some("local")).unwrap(), RoutePolicy::Local);
+    assert_eq!(
+        RoutePolicy::parse(Some(" auto ")).unwrap(),
+        RoutePolicy::Auto
+    );
+    assert_eq!(
+        RoutePolicy::parse(Some("local")).unwrap(),
+        RoutePolicy::Local
+    );
     assert_eq!(
         RoutePolicy::parse(Some("openai")).unwrap(),
         RoutePolicy::Cloud(ProviderId::OpenAI)
@@ -164,7 +170,11 @@ async fn virtual_cloud_models_are_hidden_from_the_model_listing() {
         .collect();
     assert_eq!(ids, vec!["llama-8b"], "virtual rows must not be listed");
     assert!(
-        state.store.get_model("openai:gpt-4o").expect("lookup").is_some(),
+        state
+            .store
+            .get_model("openai:gpt-4o")
+            .expect("lookup")
+            .is_some(),
         "routing must still be able to resolve the virtual row"
     );
 }
@@ -172,21 +182,17 @@ async fn virtual_cloud_models_are_hidden_from_the_model_listing() {
 #[test]
 fn app_state_secret_builder_rebuilds_provider_statuses() {
     let state = state();
-    assert!(
-        state
-            .secrets
-            .get(SecretScope::Provider(ProviderId::OpenAI))
-            .is_none()
-    );
-    assert!(
-        state
-            .providers
-            .statuses()
-            .iter()
-            .all(|status| !status.configured)
-    );
+    assert!(state
+        .secrets
+        .get(SecretScope::Provider(ProviderId::OpenAI))
+        .is_none());
+    assert!(state
+        .providers
+        .statuses()
+        .iter()
+        .all(|status| !status.configured));
 
-    let with_secrets = state.with_secrets(Arc::new(FakeSecrets));
+    let with_secrets = state.clone().with_secrets(Arc::new(FakeSecrets));
     assert_eq!(
         with_secrets
             .secrets
@@ -211,11 +217,14 @@ fn app_state_secret_builder_rebuilds_provider_statuses() {
         "other providers stay unconfigured"
     );
     let wire = serde_json::to_string(&statuses).expect("serialize statuses");
-    assert!(!wire.contains(SYNTHETIC_KEY), "secret leaked into status JSON");
+    assert!(
+        !wire.contains(SYNTHETIC_KEY),
+        "secret leaked into status JSON"
+    );
 
     let explicit = ProviderRegistry::new(Arc::new(FakeSecrets))
         .with_base_url(ProviderId::OpenAI, "http://127.0.0.1:1234/v1");
-    let with_providers = state.with_providers(explicit);
+    let with_providers = state.clone().with_providers(Arc::new(explicit));
     assert_eq!(
         with_providers.providers.base_url(ProviderId::OpenAI),
         "http://127.0.0.1:1234/v1"

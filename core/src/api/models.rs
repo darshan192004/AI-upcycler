@@ -1,7 +1,7 @@
 //! `GET /v1/models` — OpenAI-compatible model listing backed by the store.
 
 use crate::api::{ApiResult, AppState};
-use crate::store::ModelRow;
+use crate::store::{ModelRow, VIRTUAL_MODEL_PATH_PREFIX};
 use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
@@ -33,7 +33,11 @@ pub async fn list_models(State(state): State<AppState>) -> ApiResult<Json<ModelL
     let models = state.store.list_models()?;
     Ok(Json(ModelList {
         object: "list",
-        data: models.into_iter().map(entry_from_row).collect(),
+        data: models
+            .into_iter()
+            .filter(|row| !row.local_file_path.starts_with(VIRTUAL_MODEL_PATH_PREFIX))
+            .map(entry_from_row)
+            .collect(),
     }))
 }
 

@@ -18,7 +18,15 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("store mutex poisoned")]
     Poisoned,
+    /// A cloud model id collides with an existing local GGUF (or vice versa).
+    #[error("{0}")]
+    Conflict(String),
 }
+
+/// Marker prefix for catalog rows that represent cloud-only models. Such rows
+/// keep routing resolvable but are hidden from `/v1/models` because there is
+/// no GGUF to download or serve locally.
+pub const VIRTUAL_MODEL_PATH_PREFIX: &str = "virtual:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRow {
@@ -249,6 +257,30 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Registers a cloud-only model id without a local GGUF. Existing virtual
+    /// rows are refreshed idempotently; a real local model with the same id is
+    /// a conflict, so a cloud route can never shadow a downloaded GGUF.
+    pub fn ensure_virtual_model(&self, model_id: &str, provider: &str) -> Result<(), StoreError> {
+        if let Some(existing) = self.get_model(model_id)? {
+            if !existing
+                .local_file_path
+                .starts_with(VIRTUAL_MODEL_PATH_PREFIX)
+            {
+                return Err(StoreError::Conflict(format!(
+                    "model id '{model_id}' is already a local GGUF"
+                )));
+            }
+        }
+        self.upsert_model(&NewModel {
+            model_id: model_id.to_string(),
+            file_name: model_id.to_string(),
+            quantization_format: "cloud".to_string(),
+            total_layers: 0,
+            weight_size_bytes: 0,
+            local_file_path: format!("{VIRTUAL_MODEL_PATH_PREFIX}{provider}"),
+        })
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelRow>, StoreError> {
