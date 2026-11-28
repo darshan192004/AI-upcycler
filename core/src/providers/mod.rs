@@ -2,6 +2,7 @@
 //! resolves model ids and dispatches to a provider adapter.
 
 use crate::api::backend::{ChatMessage, GenerationChunk, GenerationRequest};
+use crate::media::MediaStore;
 use crate::secrets::{SecretScope, SecretStore};
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -241,6 +242,9 @@ pub struct ProviderRegistry {
     /// behaviour; tests inject a `.no_proxy()` client for loopback mocks.
     client: reqwest::Client,
     adapters: HashMap<ProviderId, Box<dyn CloudProvider>>,
+    /// Shared store used by adapters to resolve image parts into bytes. The
+    /// `Arc` keeps builder-installed and state-installed stores identical.
+    media: Option<Arc<MediaStore>>,
 }
 
 impl fmt::Debug for ProviderRegistry {
@@ -272,6 +276,7 @@ impl ProviderRegistry {
             base_urls,
             client: reqwest::Client::new(),
             adapters: HashMap::new(),
+            media: None,
         };
         registry.rebuild_adapters();
         registry
@@ -294,6 +299,29 @@ impl ProviderRegistry {
         self
     }
 
+    /// Installs the content-addressed image store shared with the API layer.
+    /// Adapters are rebuilt so every provider sees the same store instance.
+    pub fn with_media_store(mut self, media: MediaStore) -> Self {
+        self.media = Some(Arc::new(media));
+        self.rebuild_adapters();
+        self
+    }
+
+    /// Rebuilds a registry around `Arc<Self>` without cloning adapter objects.
+    /// `AppState` builders use this so a media-root override reaches adapters
+    /// even when a custom registry was injected first.
+    pub(crate) fn with_media_store_shared(&self, media: Arc<MediaStore>) -> Arc<Self> {
+        let mut registry = Self {
+            secrets: self.secrets.clone(),
+            base_urls: self.base_urls.clone(),
+            client: self.client.clone(),
+            adapters: HashMap::new(),
+            media: Some(media),
+        };
+        registry.rebuild_adapters();
+        Arc::new(registry)
+    }
+
     /// The effective base URL for a provider, after env/default resolution.
     pub fn base_url(&self, id: ProviderId) -> &str {
         self.base_urls
@@ -306,13 +334,26 @@ impl ProviderRegistry {
         self.adapters.clear();
         for id in ProviderId::ALL {
             let base_url = self.base_urls[&id].clone();
-            let adapter: Box<dyn CloudProvider> = match id {
-                ProviderId::OpenAI => Box::new(openai::provider(self.client.clone(), base_url)),
-                ProviderId::Anthropic => {
-                    Box::new(anthropic::provider(self.client.clone(), base_url))
+            let media = self.media.clone();
+            let adapter: Box<dyn CloudProvider> = match (id, media) {
+                (ProviderId::OpenAI, Some(media)) => {
+                    Box::new(openai::provider(self.client.clone(), base_url, Some(media)))
                 }
-                ProviderId::Gemini => Box::new(gemini::provider(self.client.clone(), base_url)),
-                ProviderId::Kimi => Box::new(kimi::provider(self.client.clone(), base_url)),
+                (ProviderId::OpenAI, None) => {
+                    Box::new(openai::compat_provider(id, self.client.clone(), base_url))
+                }
+                (ProviderId::Anthropic, media) => {
+                    Box::new(anthropic::provider(self.client.clone(), base_url, media))
+                }
+                (ProviderId::Gemini, media) => {
+                    Box::new(gemini::provider(self.client.clone(), base_url, media))
+                }
+                (ProviderId::Kimi, Some(media)) => {
+                    Box::new(kimi::provider(self.client.clone(), base_url, Some(media)))
+                }
+                (ProviderId::Kimi, None) => {
+                    Box::new(openai::compat_provider(id, self.client.clone(), base_url))
+                }
             };
             self.adapters.insert(id, adapter);
         }

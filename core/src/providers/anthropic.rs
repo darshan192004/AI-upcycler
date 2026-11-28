@@ -3,31 +3,51 @@
 //! Anthropic's streaming protocol differs from OpenAI's: the credential goes
 //! in `x-api-key`, system turns live in a top-level `system` string, and SSE
 //! events carry an `event:` line before each `data:` line. The shared SSE line
-//! buffer from `openai_compat` is reused; only the event dispatch is new.
+//! buffer from `openai_compat` is reused; only the event dispatch is new. Image
+//! bytes are resolved only through the shared media store and are passed to the
+//! committed message mapper as raw base64.
 
+use super::messages::to_anthropic_content;
 use super::openai_compat::take_complete_lines;
 use super::{bare_model, descriptor_for, CloudProvider, ProviderDescriptor, ProviderId};
-use crate::api::backend::{GenerationChunk, GenerationRequest, Stop};
+use crate::api::backend::{
+    ChatMessage, ContentPart, GenerationChunk, GenerationRequest, MessageContent, Stop,
+};
+use crate::media::{MediaError, MediaStore};
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Adapter backed by Anthropic's `/v1/messages` streaming endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AnthropicProvider {
     client: reqwest::Client,
     base_url: String,
+    media: Option<Arc<MediaStore>>,
 }
 
 impl AnthropicProvider {
-    pub(crate) fn new(client: reqwest::Client, base_url: String) -> Self {
-        Self { client, base_url }
+    pub(crate) fn new(
+        client: reqwest::Client,
+        base_url: String,
+        media: Option<Arc<MediaStore>>,
+    ) -> Self {
+        Self {
+            client,
+            base_url,
+            media,
+        }
     }
 }
 
-pub(crate) fn provider(client: reqwest::Client, base_url: String) -> AnthropicProvider {
-    AnthropicProvider::new(client, base_url)
+pub(crate) fn provider(
+    client: reqwest::Client,
+    base_url: String,
+    media: Option<Arc<MediaStore>>,
+) -> AnthropicProvider {
+    AnthropicProvider::new(client, base_url, media)
 }
 
 impl CloudProvider for AnthropicProvider {
@@ -44,14 +64,66 @@ impl CloudProvider for AnthropicProvider {
         request: GenerationRequest,
         api_key: &str,
     ) -> BoxStream<'static, Result<GenerationChunk, String>> {
-        anthropic_stream(self.client.clone(), &self.base_url, api_key, request)
+        anthropic_stream(
+            self.client.clone(),
+            &self.base_url,
+            api_key,
+            request,
+            self.media.clone(),
+        )
     }
+}
+
+/// Maps one message to Anthropic content blocks. Each image gets its own
+/// source block so a multi-image turn cannot reuse the first image's payload.
+async fn mapped_content(
+    media: Option<&Arc<MediaStore>>,
+    message: &ChatMessage,
+) -> Result<Vec<Value>, MediaError> {
+    if !message.content.has_images() {
+        return Ok(to_anthropic_content(message, ""));
+    }
+    let MessageContent::Parts(parts) = &message.content else {
+        return Ok(to_anthropic_content(message, ""));
+    };
+
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let base64_data = match part {
+            ContentPart::Text { .. } => String::new(),
+            ContentPart::Image {
+                media_hash,
+                mime_type,
+                ..
+            } => {
+                let store = media.ok_or(MediaError::Io)?;
+                // Read first so a missing or drifting file fails closed before
+                // any provider request is built.
+                store.get(media_hash).await?;
+                let data_url = store.data_url(media_hash, mime_type).await?;
+                data_url
+                    .split_once(',')
+                    .map(|(_, data)| data.to_string())
+                    .unwrap_or_default()
+            }
+        };
+        let single = ChatMessage {
+            role: message.role.clone(),
+            content: MessageContent::Parts(vec![part.clone()]),
+            ..Default::default()
+        };
+        out.extend(to_anthropic_content(&single, &base64_data));
+    }
+    Ok(out)
 }
 
 /// Anthropic accepts only `user` and `assistant` turns. System messages are
 /// joined into the dedicated top-level field, and any other role is treated as
 /// a user turn so a cloud route can never emit an invalid role.
-fn payload(request: &GenerationRequest) -> Value {
+async fn anthropic_payload(
+    media: Option<&Arc<MediaStore>>,
+    request: &GenerationRequest,
+) -> Result<Value, MediaError> {
     let system = request
         .messages
         .iter()
@@ -59,17 +131,18 @@ fn payload(request: &GenerationRequest) -> Value {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let messages: Vec<Value> = request
+
+    let mut messages: Vec<Value> = Vec::new();
+    for message in request
         .messages
         .iter()
         .filter(|message| message.role != "system")
-        .map(|message| {
-            json!({
-                "role": if message.role == "assistant" { "assistant" } else { "user" },
-                "content": message.content,
-            })
-        })
-        .collect();
+    {
+        messages.push(json!({
+            "role": if message.role == "assistant" { "assistant" } else { "user" },
+            "content": mapped_content(media, message).await?,
+        }));
+    }
 
     let mut body = Map::new();
     body.insert("model".to_string(), json!(bare_model(&request.model)));
@@ -85,7 +158,7 @@ fn payload(request: &GenerationRequest) -> Value {
         };
         body.insert("stop_sequences".to_string(), json!(sequences));
     }
-    Value::Object(body)
+    Ok(Value::Object(body))
 }
 
 /// Builds the messages URL. A base url that already ends in `/v1` is
@@ -107,13 +180,21 @@ fn anthropic_stream(
     base_url: &str,
     api_key: &str,
     request: GenerationRequest,
+    media: Option<Arc<MediaStore>>,
 ) -> BoxStream<'static, Result<GenerationChunk, String>> {
     let provider_name = ProviderId::Anthropic.as_str().to_string();
     let api_key = api_key.to_string();
     let url = messages_url(base_url);
-    let body = payload(&request);
 
     Box::pin(async_stream::stream! {
+        let body = match anthropic_payload(media.as_ref(), &request).await {
+            Ok(body) => body,
+            Err(_) => {
+                yield Err("invalid_image_attachment".to_string());
+                return;
+            }
+        };
+
         let response = match client
             .post(&url)
             .header("x-api-key", &api_key)

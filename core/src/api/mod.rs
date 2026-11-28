@@ -28,14 +28,19 @@ use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::{start_master_advert, MasterServiceInfo, NodeRegistry};
+use crate::media::MediaStore;
 use crate::providers::ProviderRegistry;
 use crate::secrets::{KeyringSecretStore, SecretStore, UnconfiguredSecretStore};
 use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
-use axum::http::{header, HeaderValue, Method};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use axum::Router;
+use axum::{Json, Router};
+use serde_json::json;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
@@ -93,6 +98,9 @@ pub struct AppState {
     /// Whether this server accepts image parts in chat requests. Defaults to
     /// `false` so legacy deployments stay text-only until explicitly enabled.
     pub multimodal_enabled: bool,
+    /// Content-addressed image store shared by the upload route and cloud
+    /// adapters. Never serialized into an API response.
+    pub media: Arc<MediaStore>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -149,6 +157,7 @@ impl AppState {
             secrets,
             providers,
             multimodal_enabled: false,
+            media: Arc::new(MediaStore::new(default_media_root())),
         }
     }
 
@@ -214,7 +223,8 @@ impl AppState {
     /// queries always reflect the current credential source. The value itself
     /// is never copied into app state.
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
-        self.providers = Arc::new(ProviderRegistry::new(secrets.clone()));
+        self.providers =
+            ProviderRegistry::new(secrets.clone()).with_media_store_shared(self.media.clone());
         self.secrets = secrets;
         self
     }
@@ -222,7 +232,7 @@ impl AppState {
     /// Installs a preconfigured provider registry (tests inject a loopback
     /// base URL). The secret store is intentionally left untouched.
     pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
-        self.providers = providers;
+        self.providers = providers.with_media_store_shared(self.media.clone());
         self
     }
 
@@ -237,6 +247,20 @@ impl AppState {
     pub fn with_multimodal(mut self, multimodal_enabled: bool) -> Self {
         self.multimodal_enabled = multimodal_enabled;
         self
+    }
+
+    /// Installs the content-addressed image store used by uploads and adapters.
+    pub fn with_media(mut self, media: MediaStore) -> Self {
+        let media = Arc::new(media);
+        self.providers = self.providers.with_media_store_shared(media.clone());
+        self.media = media;
+        self
+    }
+
+    /// Points the image store at a caller-supplied root (the desktop app's
+    /// `media/` directory). The directory is created on the first valid write.
+    pub fn with_media_root(self, root: PathBuf) -> Self {
+        self.with_media(MediaStore::new(root))
     }
 
     /// Overrides the GGUF download directory.
@@ -359,10 +383,146 @@ fn discover_onboarding() -> Option<Arc<crate::onboarding::OnboardingService>> {
 
 /// Download destination when no explicit directory was configured: `models/`
 /// under the current working directory.
+fn default_media_root() -> PathBuf {
+    default_models_dir().join("media")
+}
+
 fn default_models_dir() -> PathBuf {
     std::env::current_dir()
         .map(|dir| dir.join("models"))
         .unwrap_or_else(|_| PathBuf::from("models"))
+}
+
+/// `POST /api/media`: validates one image part and stores it by content hash.
+///
+/// The route is absent when the multimodal gate is off. Body parsing is kept
+/// deliberately small: only the `file` field of a `multipart/form-data` request
+/// is read, and every validation rule (MIME, magic bytes, size limit, hash)
+/// stays in [`MediaStore::put`]. No bytes or file contents are logged.
+async fn upload_media(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !state.multimodal_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return invalid_image_attachment();
+    };
+    let Some(boundary) = multipart_boundary(content_type) else {
+        return invalid_image_attachment();
+    };
+    let Some((mime_type, file_name, bytes)) = multipart_file(&body, &boundary) else {
+        return invalid_image_attachment();
+    };
+
+    match state.media.put(bytes, mime_type, &file_name).await {
+        Ok(reference) => (
+            StatusCode::OK,
+            Json(json!({
+                "media_hash": reference.media_hash,
+                "mime_type": reference.mime_type,
+                "file_name": reference.file_name,
+                "byte_count": reference.byte_count,
+            })),
+        )
+            .into_response(),
+        Err(_) => invalid_image_attachment(),
+    }
+}
+
+fn invalid_image_attachment() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_image_attachment" })),
+    )
+        .into_response()
+}
+
+/// Extracts the boundary parameter without accepting a lookalike parameter
+/// name or an unquoted value with trailing whitespace.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let (_, parameters) = content_type.split_once(';')?;
+    parameters.split(';').find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Finds the `file` part in a multipart body and borrows its MIME type and
+/// bytes. Other parts are ignored, so a stray field cannot smuggle a second
+/// image into the upload.
+fn multipart_file<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a str, String, &'a [u8])> {
+    let delimiter = format!("--{boundary}");
+    let mut cursor = 0usize;
+    while let Some(offset) = find_subslice(&body[cursor..], delimiter.as_bytes()) {
+        let marker_end = cursor + offset + delimiter.len();
+        let part_start = match body.get(marker_end..marker_end + 2) {
+            Some(b"\r\n") => marker_end + 2,
+            Some(b"--") => return None,
+            _ => {
+                cursor = marker_end;
+                continue;
+            }
+        };
+        let header_end = part_start + find_subslice(&body[part_start..], b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&body[part_start..header_end]).ok()?;
+        let mut is_file = false;
+        let mut mime_type = None;
+        let mut file_name = None;
+        for line in headers.split("\r\n") {
+            if line
+                .to_ascii_lowercase()
+                .starts_with("content-disposition:")
+            {
+                is_file = header_parameter(line, "name").as_deref() == Some("file");
+                file_name = header_parameter(line, "filename");
+            } else if line.to_ascii_lowercase().starts_with("content-type:") {
+                mime_type = line
+                    .split_once(':')
+                    .map(|(_, value)| value.trim())
+                    .filter(|value| !value.is_empty());
+            }
+        }
+        let data_start = header_end + 4;
+        let closing = format!("\r\n--{boundary}");
+        let data_end = data_start + find_subslice(&body[data_start..], closing.as_bytes())?;
+        if is_file {
+            return Some((
+                mime_type.unwrap_or("application/octet-stream"),
+                file_name.unwrap_or_else(|| "attachment".to_string()),
+                &body[data_start..data_end],
+            ));
+        }
+        cursor = data_end;
+    }
+    None
+}
+
+fn header_parameter(line: &str, key: &str) -> Option<String> {
+    let (_, parameters) = line.split_once(';')?;
+    parameters.split(';').find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case(key) {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Whether a browser may use the loopback API (spec 2026-10-24, D-G1).
@@ -445,6 +605,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices/:id", delete(devices::revoke))
         .route("/api/providers", get(providers::list))
         .route("/api/providers/:id/test", post(providers::test))
+        .route(
+            "/api/media",
+            post(upload_media).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        )
         .route("/api/sessions", get(sessions::list))
         .route("/api/sessions/:id", get(sessions::get))
         .route("/api/sessions/:id/messages", get(sessions::messages))

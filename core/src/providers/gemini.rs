@@ -3,29 +3,49 @@
 //! Gemini authenticates with an `x-goog-api-key` header, never a query-string
 //! key, so credentials stay out of URLs and logs. System instructions are
 //! folded into the first user part because Gemini's `contents` array accepts
-//! only `user` and `model` roles.
+//! only `user` and `model` roles. Image bytes are resolved only through the
+//! shared media store and are passed to the committed message mapper as raw
+//! base64.
 
+use super::messages::to_gemini_parts;
 use super::openai_compat::take_complete_lines;
 use super::{bare_model, descriptor_for, CloudProvider, ProviderDescriptor, ProviderId};
-use crate::api::backend::{GenerationChunk, GenerationRequest, Stop};
+use crate::api::backend::{
+    ChatMessage, ContentPart, GenerationChunk, GenerationRequest, MessageContent, Stop,
+};
+use crate::media::{MediaError, MediaStore};
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 /// Adapter backed by Gemini's `streamGenerateContent` endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct GeminiProvider {
     client: reqwest::Client,
     base_url: String,
+    media: Option<Arc<MediaStore>>,
 }
 
 impl GeminiProvider {
-    pub(crate) fn new(client: reqwest::Client, base_url: String) -> Self {
-        Self { client, base_url }
+    pub(crate) fn new(
+        client: reqwest::Client,
+        base_url: String,
+        media: Option<Arc<MediaStore>>,
+    ) -> Self {
+        Self {
+            client,
+            base_url,
+            media,
+        }
     }
 }
 
-pub(crate) fn provider(client: reqwest::Client, base_url: String) -> GeminiProvider {
-    GeminiProvider::new(client, base_url)
+pub(crate) fn provider(
+    client: reqwest::Client,
+    base_url: String,
+    media: Option<Arc<MediaStore>>,
+) -> GeminiProvider {
+    GeminiProvider::new(client, base_url, media)
 }
 
 impl CloudProvider for GeminiProvider {
@@ -42,14 +62,66 @@ impl CloudProvider for GeminiProvider {
         request: GenerationRequest,
         api_key: &str,
     ) -> BoxStream<'static, Result<GenerationChunk, String>> {
-        gemini_stream(self.client.clone(), &self.base_url, api_key, request)
+        gemini_stream(
+            self.client.clone(),
+            &self.base_url,
+            api_key,
+            request,
+            self.media.clone(),
+        )
     }
+}
+
+/// Maps one message to Gemini parts. Each image gets its own inline block so a
+/// multi-image turn cannot reuse the first image's payload.
+async fn mapped_parts(
+    media: Option<&Arc<MediaStore>>,
+    message: &ChatMessage,
+) -> Result<Vec<Value>, MediaError> {
+    if !message.content.has_images() {
+        return Ok(to_gemini_parts(message, ""));
+    }
+    let MessageContent::Parts(parts) = &message.content else {
+        return Ok(to_gemini_parts(message, ""));
+    };
+
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let base64_data = match part {
+            ContentPart::Text { .. } => String::new(),
+            ContentPart::Image {
+                media_hash,
+                mime_type,
+                ..
+            } => {
+                let store = media.ok_or(MediaError::Io)?;
+                // Read first so a missing or drifting file fails closed before
+                // any provider request is built.
+                store.get(media_hash).await?;
+                let data_url = store.data_url(media_hash, mime_type).await?;
+                data_url
+                    .split_once(',')
+                    .map(|(_, data)| data.to_string())
+                    .unwrap_or_default()
+            }
+        };
+        let single = ChatMessage {
+            role: message.role.clone(),
+            content: MessageContent::Parts(vec![part.clone()]),
+            ..Default::default()
+        };
+        out.extend(to_gemini_parts(&single, &base64_data));
+    }
+    Ok(out)
 }
 
 /// Builds the request body. Gemini roles are `user` and `model`; system turns
 /// are concatenated and prefixed to the first user part so no instruction is
 /// lost. Tool schemas are deliberately not forwarded (spec D-A2).
-fn payload(request: &GenerationRequest) -> Value {
+async fn gemini_payload(
+    media: Option<&Arc<MediaStore>>,
+    request: &GenerationRequest,
+) -> Result<Value, MediaError> {
     let system = request
         .messages
         .iter()
@@ -70,13 +142,18 @@ fn payload(request: &GenerationRequest) -> Value {
         } else {
             "user"
         };
-        let mut text = message.content.clone();
+        let mut parts = mapped_parts(media, message).await?;
         if index == 0 && role == "user" && !system.is_empty() {
-            text = format!("{system}\n{text}").into();
+            if let Some(text_part) = parts.iter_mut().find(|part| part.get("text").is_some()) {
+                let text = text_part["text"].as_str().unwrap_or_default().to_string();
+                text_part["text"] = json!(format!("{system}\n{text}"));
+            } else {
+                parts.insert(0, json!({ "text": system }));
+            }
         }
         contents.push(json!({
             "role": role,
-            "parts": [{ "text": text }],
+            "parts": parts,
         }));
     }
 
@@ -91,10 +168,10 @@ fn payload(request: &GenerationRequest) -> Value {
         config.insert("stopSequences".to_string(), json!(sequences));
     }
 
-    json!({
+    Ok(json!({
         "contents": contents,
         "generationConfig": Value::Object(config),
-    })
+    }))
 }
 
 fn stream_url(base_url: &str, model: &str) -> String {
@@ -110,13 +187,21 @@ fn gemini_stream(
     base_url: &str,
     api_key: &str,
     request: GenerationRequest,
+    media: Option<Arc<MediaStore>>,
 ) -> BoxStream<'static, Result<GenerationChunk, String>> {
     let provider_name = ProviderId::Gemini.as_str().to_string();
     let api_key = api_key.to_string();
     let url = stream_url(base_url, bare_model(&request.model));
-    let body = payload(&request);
 
     Box::pin(async_stream::stream! {
+        let body = match gemini_payload(media.as_ref(), &request).await {
+            Ok(body) => body,
+            Err(_) => {
+                yield Err("invalid_image_attachment".to_string());
+                return;
+            }
+        };
+
         let response = match client
             .post(&url)
             .header("x-goog-api-key", &api_key)

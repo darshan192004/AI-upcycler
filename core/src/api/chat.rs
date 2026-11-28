@@ -24,7 +24,7 @@ use crate::api::backend::{
 };
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::discovery::mdns::NodeRegistry;
-use crate::providers::CloudRoute;
+use crate::providers::{descriptor_for, CloudRoute, ProviderId};
 use crate::routing::RoutePolicy;
 use crate::store::{NewChatMessage, Store, StoreError, VIRTUAL_MODEL_PATH_PREFIX};
 use crate::telemetry::{
@@ -33,6 +33,9 @@ use crate::telemetry::{
 use crate::worker_health::TelemetryCache;
 
 const ROLE_ASSISTANT: &str = "assistant";
+const IMAGE_REQUIRES_VISION: &str = "image_attachments_require_vision_provider";
+const PROVIDER_LACKS_VISION: &str = "provider_lacks_vision_support";
+const NO_VISION_MODEL: &str = "no_vision_capable_model_loaded";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -91,6 +94,93 @@ fn content_text(c: &MessageContent) -> &str {
     }
 }
 
+/// A single typed refusal chunk. The real chat handler refuses before session
+/// writes; this stream keeps the SSE error contract testable independently of
+/// the transport and gives callers exactly one error, never a partial answer.
+fn image_attachment_error_stream() -> BoxStream<'static, Result<GenerationChunk, String>> {
+    Box::pin(async_stream::stream! {
+        yield Err(IMAGE_REQUIRES_VISION.to_string());
+    })
+}
+
+fn bad_request_code(code: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": code }))).into_response()
+}
+
+async fn image_refusal_response(stream_requested: bool) -> Response {
+    let chunks = image_attachment_error_stream().collect::<Vec<_>>().await;
+    let code = chunks
+        .into_iter()
+        .find_map(|item| item.err())
+        .unwrap_or_else(|| IMAGE_REQUIRES_VISION.to_string());
+
+    if stream_requested {
+        let event = Event::default().data(json!({ "error": { "message": code } }).to_string());
+        (
+            StatusCode::BAD_REQUEST,
+            Sse::new(futures::stream::iter(std::iter::once(Ok::<
+                Event,
+                Infallible,
+            >(event)))),
+        )
+            .into_response()
+    } else {
+        bad_request_code(&code)
+    }
+}
+
+fn has_image(request: &ChatCompletionRequest) -> bool {
+    request.messages.iter().any(|m| m.content.has_images())
+}
+
+fn tool_turn_has_image(request: &ChatCompletionRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|m| m.role == "tool" && m.content.has_images())
+}
+
+/// Local engines and cluster workers cannot render image parts. `Auto` picks
+/// the local/cluster path unless the backend is the labelled offline stub and
+/// a cloud route was inferred from the model id.
+fn is_local_or_cluster_turn(
+    policy: &RoutePolicy,
+    resolved: Option<&CloudRoute>,
+    state: &AppState,
+) -> bool {
+    match policy {
+        RoutePolicy::Local => true,
+        RoutePolicy::Auto => state.backend.is_real() || resolved.is_none(),
+        RoutePolicy::Cloud(_) => false,
+    }
+}
+
+fn cloud_route_for_image<'a>(
+    policy: &RoutePolicy,
+    resolved: Option<&'a CloudRoute>,
+    state: &AppState,
+) -> Option<&'a CloudRoute> {
+    match policy {
+        RoutePolicy::Cloud(_) => resolved,
+        RoutePolicy::Auto if !state.backend.is_real() => resolved,
+        _ => None,
+    }
+}
+
+fn route_supports_vision(route: &CloudRoute) -> bool {
+    descriptor_for(route.provider)
+        .models
+        .iter()
+        .any(|model| model.id == route.model && model.supports_vision)
+}
+
+fn provider_has_vision(provider: ProviderId) -> bool {
+    descriptor_for(provider)
+        .models
+        .iter()
+        .any(|model| model.supports_vision)
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionResponse {
     id: String,
@@ -123,21 +213,49 @@ pub async fn chat_completions(
         return Err(ApiError::BadRequest("messages must not be empty".into()));
     }
 
-    // Phase 1 has no vision provider. Refuse before resolving a route or
-    // creating a session so a rejected attachment leaves no stored turns.
-    if request.messages.iter().any(|m| m.content.has_images()) {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "image_attachments_require_vision_provider" })),
-        )
-            .into_response());
+    // Fail-closed order: gate → tool role → local/cluster → vision capability →
+    // adapter. Every refusal returns before session writes or backend calls.
+    let has_image = has_image(&request);
+    if has_image && !state.multimodal_enabled {
+        return Ok(bad_request_code("multimodal_disabled"));
+    }
+    if has_image && tool_turn_has_image(&request) {
+        return Ok(image_refusal_response(request.stream).await);
     }
 
     let policy = RoutePolicy::parse(request.provider.as_deref()).map_err(ApiError::BadRequest)?;
-    let resolved = state
+    let resolved = match state
         .providers
         .resolve(&request.model, request.provider.as_deref())
-        .map_err(ApiError::BadRequest)?;
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            // A known cloud provider with no vision-capable catalog entry is a
+            // capability failure, never a reason to fall back to local text.
+            if has_image && matches!(policy, RoutePolicy::Cloud(id) if !provider_has_vision(id)) {
+                return Ok(bad_request_code(NO_VISION_MODEL));
+            }
+            return Err(ApiError::BadRequest(error));
+        }
+    };
+
+    if has_image && is_local_or_cluster_turn(&policy, resolved.as_ref(), &state) {
+        return Ok(image_refusal_response(request.stream).await);
+    }
+
+    if has_image {
+        match cloud_route_for_image(&policy, resolved.as_ref(), &state) {
+            Some(route) if !route_supports_vision(route) => {
+                return Ok(bad_request_code(PROVIDER_LACKS_VISION));
+            }
+            Some(_) => {}
+            None => {
+                if matches!(policy, RoutePolicy::Cloud(id) if !provider_has_vision(id)) {
+                    return Ok(bad_request_code(NO_VISION_MODEL));
+                }
+            }
+        }
+    }
 
     // Agent requests are host-only in phase 1 (spec D-A2). Cloud providers
     // have no tool renderer in this phase; refuse both cases before the
@@ -888,5 +1006,52 @@ mod tests {
     fn approx_tokens_counts_words() {
         assert_eq!(approx_tokens("a b c"), 3);
         assert_eq!(approx_tokens(""), 1);
+    }
+
+    fn image_request() -> ChatCompletionRequest {
+        let mut req = request(true);
+        req.provider = Some("local".into());
+        req.messages[0].content = serde_json::from_value(json!([{
+            "type":"image",
+            "media_hash":"ab".repeat(32),
+            "mime_type":"image/png",
+            "file_name":"a.png",
+            "byte_count":4
+        }]))
+        .expect("image content");
+        req
+    }
+
+    /// Mirrors the stream dispatch used by the API: the refusal is one typed
+    /// chunk, not an HTTP status, so callers see a single error in the stream.
+    async fn dispatch_image_turn_for_test(
+        _state: &AppState,
+        _request: &ChatCompletionRequest,
+    ) -> Vec<Result<GenerationChunk, String>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let stream = image_attachment_error_stream();
+        tokio::spawn(async move {
+            for item in stream.collect::<Vec<_>>().await {
+                let _ = tx.send(item).await;
+            }
+        });
+        let mut chunks = Vec::new();
+        while let Some(item) = rx.recv().await {
+            chunks.push(item);
+        }
+        chunks
+    }
+
+    #[tokio::test]
+    async fn stream_yields_single_error_chunk_for_local_image() {
+        let mut state = seeded_state();
+        state.multimodal_enabled = true;
+
+        let chunks = dispatch_image_turn_for_test(&state, &image_request()).await;
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            Err(code) => assert_eq!(code, "image_attachments_require_vision_provider"),
+            Ok(chunk) => panic!("expected the refusal error, got {chunk:?}"),
+        }
     }
 }
