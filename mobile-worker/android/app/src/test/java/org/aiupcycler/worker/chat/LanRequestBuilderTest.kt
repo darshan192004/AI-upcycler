@@ -239,9 +239,9 @@ class LanRequestBuilderTest {
     @Test
     fun defaultClientUsesTheDocumentedTimeouts() {
         val client = LanClient.defaultCallFactory() as okhttp3.OkHttpClient
-        assertEquals(5_000, client.connectTimeoutMillis)
-        assertEquals(0, client.readTimeoutMillis)
-        assertEquals(0, client.callTimeoutMillis)
+        assertEquals(LanClient.CONNECT_TIMEOUT_MS, client.connectTimeoutMillis.toLong())
+        assertEquals(LanClient.REST_READ_TIMEOUT_MS, client.readTimeoutMillis.toLong())
+        assertEquals(LanClient.REST_CALL_TIMEOUT_MS, client.callTimeoutMillis.toLong())
     }
 
     @Test

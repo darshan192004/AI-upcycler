@@ -76,6 +76,7 @@ fn payload(request: &GenerationRequest) -> Value {
 
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug)]
 pub(crate) struct SseLineTooLong;
 
 /// Drains `chunk` into `buffer` and returns every complete SSE line. A line

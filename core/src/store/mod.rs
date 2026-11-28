@@ -218,10 +218,10 @@ impl Store {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        recover_interrupted_workflows(&conn)?;
+        recover_interrupted_workflows(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -890,7 +890,7 @@ fn upsert_model_in(conn: &Connection, model: &NewModel) -> Result<(), StoreError
     Ok(())
 }
 
-fn recover_interrupted_workflows(conn: &Connection) -> Result<(), StoreError> {
+fn recover_interrupted_workflows(conn: &mut Connection) -> Result<(), StoreError> {
     let tx = conn.transaction()?;
     tx.execute(
         "UPDATE workflow_steps SET status = 'failed', \

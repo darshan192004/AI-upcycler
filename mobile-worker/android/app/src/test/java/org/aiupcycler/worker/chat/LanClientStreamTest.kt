@@ -8,6 +8,7 @@ import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.aiupcycler.worker.chat.secrets.MemorySecretStore
+import org.aiupcycler.worker.chat.secrets.SecretStore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -43,7 +44,9 @@ class LanClientStreamTest {
         try {
             val client = LanClient(
                 endpoint = LanEndpoint(server.hostName, server.port),
-                secrets = MemorySecretStore(),
+                secrets = MemorySecretStore().apply {
+                    write(SecretStore.LAN_TOKEN_KEY, "lan-test-token")
+                },
                 callFactory = OkHttpClient(),
             )
             val latch = CountDownLatch(1)
