@@ -1,9 +1,13 @@
+use ai_upcycler_core::api::backend::StubBackend;
+use ai_upcycler_core::providers::ProviderRegistry;
+use ai_upcycler_core::secrets::UnconfiguredSecretStore;
 use ai_upcycler_core::workflows::{
-    execute, validate_steps, EventSink, ExecutionResult, StepFuture, StepOutput, StepRecord,
-    StepRunner, StepStatus, WorkflowEvent, WorkflowStep,
+    execute, validate_steps, EventSink, ExecutionResult, RouterBackend, StepFuture, StepOutput,
+    StepRecord, StepRunner, StepStatus, WorkflowEvent, WorkflowStep,
 };
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 fn step(id: &str, deps: &[&str]) -> WorkflowStep {
@@ -244,4 +248,61 @@ async fn executor_propagates_sink_failures() {
         .await
         .unwrap_err();
     assert_eq!(error, "sink down");
+}
+
+fn router_backend() -> RouterBackend {
+    RouterBackend::new(
+        Arc::new(StubBackend::new()),
+        Arc::new(ProviderRegistry::new(Arc::new(UnconfiguredSecretStore))),
+        "llama-8b".into(),
+        "wf-test".into(),
+    )
+}
+
+#[tokio::test]
+async fn router_backend_runs_an_explicit_local_step_through_the_backend() {
+    let backend = router_backend();
+    let step = WorkflowStep {
+        id: "local".into(),
+        prompt: "Say hello".into(),
+        depends_on: vec![],
+        provider: Some("local".into()),
+    };
+
+    let output = backend.run(&step).await.expect("local step");
+
+    assert!(output.content.contains("[stub:llama-8b]"));
+    assert!(output.content.contains("Say hello"));
+    assert_eq!(output.source, "local");
+}
+
+#[tokio::test]
+async fn router_backend_refuses_an_unconfigured_cloud_step_without_network() {
+    let backend = router_backend();
+    let step = WorkflowStep {
+        id: "cloud".into(),
+        prompt: "Say hello".into(),
+        depends_on: vec![],
+        provider: Some("openai".into()),
+    };
+
+    let error = backend.run(&step).await.unwrap_err();
+
+    assert!(error.contains("openai"), "{error}");
+    assert!(error.contains("not configured"), "{error}");
+}
+
+#[tokio::test]
+async fn router_backend_rejects_an_unknown_provider_before_generating() {
+    let backend = router_backend();
+    let step = WorkflowStep {
+        id: "bad".into(),
+        prompt: "Say hello".into(),
+        depends_on: vec![],
+        provider: Some("ghost".into()),
+    };
+
+    let error = backend.run(&step).await.unwrap_err();
+
+    assert!(error.contains("unknown provider 'ghost'"), "{error}");
 }
