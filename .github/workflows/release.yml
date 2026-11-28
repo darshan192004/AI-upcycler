@@ -116,7 +116,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22.11.0
 
       # The toolchain is pinned in rust-toolchain.toml; only the per-platform
       # cross-compilation targets are added here.

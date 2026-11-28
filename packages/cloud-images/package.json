@@ -1,0 +1,12 @@
+{
+  "name": "@ai-upcycler/cloud-images",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc --noEmit -p ../../tsconfig.cluster.json",
+    "typecheck": "tsc --noEmit -p ../../tsconfig.cluster.json",
+    "test": "vitest run ../../vitest.config.ts packages/cloud-images"
+  }
+}

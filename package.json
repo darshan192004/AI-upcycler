@@ -3,11 +3,27 @@
   "version": "0.2.0",
   "private": true,
   "description": "Local-first distributed AI hardware pooling orchestrator",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22.11.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build && pnpm --filter \"./packages/**\" build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit -p tsconfig.cluster.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "android": "pnpm --filter @ai-upcycler/mobile android",
+    "windows": "pnpm --filter @ai-upcycler/desktop windows",
+    "verify:pairing": "vitest run packages/protocol packages/engine-client",
+    "verify:e2e-manual": "node scripts/verify-e2e-manual.mjs",
+    "verify:env": "node scripts/verify-env.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -28,11 +44,16 @@
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^18.2.19",
+    "@typescript-eslint/eslint-plugin": "8.74.0",
+    "@typescript-eslint/parser": "8.74.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.18",
+    "eslint": "8.57.1",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
-    "typescript": "^7.0.2",
-    "vite": "^5.1.4"
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vite": "^5.1.4",
+    "vitest": "3.2.4"
   }
 }

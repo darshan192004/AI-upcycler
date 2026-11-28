@@ -22,22 +22,42 @@ Reference plan: `tasks/plan.md`. Spec:
     - `docs/superpowers/specs/2026-11-28-replacement-cluster-app.md`
   - **Estimated scope:** S
 
-- [ ] Task 2: Scaffold new workspace and verification scripts
+- [~] Task 2: Scaffold new workspace and verification scripts
   - **Description:** Create the RN Android app, RNW desktop app, shared packages,
     strict TypeScript config, lint/test/build scripts, and D:-only artifact
     defaults.
   - **Acceptance:**
-    - [ ] `npm run typecheck`, `npm run lint`, `npm test`, `npm run build` pass.
-    - [ ] Android and Windows smoke builds launch.
-    - [ ] Lockfiles are committed with pinned versions.
-  - **Verification:** Run all four commands; launch both apps once.
+    - [x] `npm run typecheck`, `npm run lint`, `npm test`, `npm run build` pass.
+    - [ ] Android and Windows smoke builds launch — blocked by this host (see
+      below); native projects are scaffolded but not built.
+    - [x] Lockfile is committed with pinned versions.
+  - **Verification:** `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`,
+    `pnpm verify:env`. No real-device launch evidence yet.
   - **Dependencies:** Task 1
-  - **Files likely touched:**
-    - `package.json`
-    - `tsconfig.base.json`
-    - `apps/mobile/package.json`
-    - `apps/desktop/package.json`
-    - `packages/protocol/package.json`
+  - **Host blockers (recorded, not waived):**
+    - Android: `ANDROID_HOME`/`ANDROID_SDK_ROOT` unset and local Java is 21;
+      RN 0.85 recommends JDK 17. `D:\Android\Sdk` exists but is not wired.
+    - Windows: no `dotnet`, `pwsh`, `msbuild`, or VS 2026. RNW 0.85 requires
+      VS 2026 >= 18.6.1, .NET SDK 10, Windows App SDK 1.8, SDK 22621,
+      Developer Mode and Long Path support. Therefore `react-native
+      init-windows` cannot run normally here: the RNW CLI fails to load while
+      locating `pwsh.exe`. The official RNW 0.85 `cpp-app` template was applied
+      via its generator API with a host-only PowerShell shim; postInstall's
+      `npm install` was deliberately skipped so the pnpm lockfile stays
+      authoritative. MSIX packaging requires VS `Project > Publish > Create
+      App Packages...` on a provisioned host.
+    - Old phone install remained blocked by
+      `INSTALL_FAILED_USER_RESTRICTED`; no paired chat turn has been run.
+  - **Toolchain pins:** RN 0.85.3, RNW 0.85.2 with `@react-native-windows/cli`
+    0.85.1 (0.85.2 is unpublished), React 19.2.3 for the apps, Vitest 3.2.4
+    for Vite 5, and side-by-side TypeScript 7 native / TypeScript 6 API alias
+    so typescript-eslint can load.
+  - **Files touched:** `package.json`, `pnpm-lock.yaml`,
+    `pnpm-workspace.yaml`, `tsconfig.cluster.json`, `.eslintrc.cjs`,
+    `vitest.config.ts`, `.github/workflows/ci.yml`,
+    `.github/workflows/release.yml`, `apps/mobile/`, `apps/desktop/` (including
+    generated `windows/` project), `packages/*`, `scripts/verify-env.mjs`,
+    `scripts/verify-e2e-manual.mjs`.
   - **Estimated scope:** M
 
 - [ ] Task 3: Define shared protocol schemas
@@ -71,8 +91,9 @@ Reference plan: `tasks/plan.md`. Spec:
   - **Estimated scope:** M
 
 ## Checkpoint: Foundation
-- [ ] Spec and decisions are consistent.
-- [ ] All four verification commands pass.
+- [x] Spec and decisions are consistent.
+- [x] All four verification commands pass (native smoke builds remain blocked
+  by the host; see Task 2).
 - [ ] Human reviews foundation before pairing work.
 
 ## Phase 1: Pairing and Control Plane
