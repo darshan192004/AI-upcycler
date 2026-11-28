@@ -254,7 +254,7 @@ fn default_state_uses_the_unconfigured_secret_store() {
             .is_err(),
         "platform secrets are never written from the default state"
     );
-    let _ = UnconfiguredSecretStore::default();
+    let _ = UnconfiguredSecretStore;
 }
 
 // ---------------------------------------------------------------------------

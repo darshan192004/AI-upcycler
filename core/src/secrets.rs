@@ -211,7 +211,7 @@ mod tests {
         let rendered = [
             format!("{:?}", store),
             format!("{:?}", UnconfiguredSecretStore),
-            format!("{:?}", KeyringSecretStore::default()),
+            format!("{:?}", KeyringSecretStore),
         ];
         for output in rendered {
             assert!(!output.contains("sk-"));

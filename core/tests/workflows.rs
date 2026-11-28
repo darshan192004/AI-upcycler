@@ -6,10 +6,8 @@ use ai_upcycler_core::telemetry::{
 };
 use ai_upcycler_core::workflows::{
     execute, validate_steps, EventSink, ExecutionResult, RouterBackend, StepFuture, StepOutput,
-    StepRecord, StepRunner, StepStatus, WorkflowEvent, WorkflowStep,
+    StepRunner, StepStatus, WorkflowEvent, WorkflowStep,
 };
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 

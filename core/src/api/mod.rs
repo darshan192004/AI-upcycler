@@ -145,7 +145,7 @@ impl AppState {
         let secrets: Arc<dyn SecretStore> = Arc::new(UnconfiguredSecretStore);
         let providers = Arc::new(ProviderRegistry::new(secrets.clone()));
         let image_backends = Arc::new(ImageBackendRegistry::new(
-            Arc::new(UnconfiguredSecretStore::default()),
+            Arc::new(UnconfiguredSecretStore),
             DEFAULT_OPENAI_IMAGES_URL,
             DEFAULT_GEMINI_IMAGES_URL,
             false,
