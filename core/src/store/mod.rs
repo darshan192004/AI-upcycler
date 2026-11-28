@@ -119,6 +119,38 @@ pub struct NewChatMessage {
     pub generation_time_sec: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewWorkflowStep {
+    pub step_id: String,
+    pub prompt: String,
+    pub depends_on_json: String,
+    pub provider: Option<String>,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRunRow {
+    pub run_id: String,
+    pub model: String,
+    pub status: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStepRow {
+    pub run_id: String,
+    pub step_id: String,
+    pub prompt: String,
+    pub depends_on: Vec<String>,
+    pub provider: Option<String>,
+    pub status: String,
+    pub output: Option<String>,
+    pub source: Option<String>,
+    pub error: Option<String>,
+    pub position: i64,
+}
+
 /// SQLite-backed store for cluster, model, benchmark and chat persistence.
 pub struct Store {
     conn: Mutex<Connection>,
@@ -373,6 +405,149 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![session_id], map_message)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // --- workflows ----------------------------------------------------------
+
+    pub fn create_workflow_run(
+        &self,
+        run_id: &str,
+        model: &str,
+        steps: &[NewWorkflowStep],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO workflow_runs (run_id, model, status) VALUES (?1, ?2, 'running')",
+            params![run_id, model],
+        )?;
+        for step in steps {
+            tx.execute(
+                "INSERT INTO workflow_steps \
+                 (run_id, step_id, prompt, depends_on, provider, status, position) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    run_id,
+                    step.step_id,
+                    step.prompt,
+                    step.depends_on_json,
+                    step.provider,
+                    step.position,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_workflow_runs(&self) -> Result<Vec<WorkflowRunRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, model, status, created_at, finished_at \
+             FROM workflow_runs ORDER BY created_at, run_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WorkflowRunRow {
+                run_id: row.get(0)?,
+                model: row.get(1)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
+                finished_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_workflow_run(&self, run_id: &str) -> Result<Option<WorkflowRunRow>, StoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT run_id, model, status, created_at, finished_at \
+             FROM workflow_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(WorkflowRunRow {
+                    run_id: row.get(0)?,
+                    model: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_workflow_steps(&self, run_id: &str) -> Result<Vec<WorkflowStepRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, step_id, prompt, depends_on, provider, status, \
+             output, source, error, position FROM workflow_steps \
+             WHERE run_id = ?1 ORDER BY position, step_id",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            let raw: String = row.get(3)?;
+            let depends_on: Vec<String> = serde_json::from_str(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(WorkflowStepRow {
+                run_id: row.get(0)?,
+                step_id: row.get(1)?,
+                prompt: row.get(2)?,
+                depends_on,
+                provider: row.get(4)?,
+                status: row.get(5)?,
+                output: row.get(6)?,
+                source: row.get(7)?,
+                error: row.get(8)?,
+                position: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_workflow_step_status(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        status: &str,
+        output: Option<&str>,
+        source: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE workflow_steps SET status = ?1, output = ?2, source = ?3, error = ?4 \
+             WHERE run_id = ?5 AND step_id = ?6",
+            params![status, output, source, error, run_id, step_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_workflow_run_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        finished: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        if finished {
+            conn.execute(
+                "UPDATE workflow_runs SET status = ?1, finished_at = CURRENT_TIMESTAMP \
+                 WHERE run_id = ?2",
+                params![status, run_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE workflow_runs SET status = ?1 WHERE run_id = ?2",
+                params![status, run_id],
+            )?;
+        }
+        Ok(())
     }
 }
 

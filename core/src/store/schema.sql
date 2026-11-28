@@ -50,3 +50,28 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES chat_sessions(session_id) ON DELETE CASCADE
 );
+
+-- Task workflow runs (spec 2026-11-27, §10). All DDL remains idempotent so
+-- this file can be applied on every open alongside sub-project D's settings.
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    run_id TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL,          -- 'running', 'completed', 'failed'
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    finished_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS workflow_steps (
+    run_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    depends_on TEXT NOT NULL,      -- JSON array of stable step ids
+    provider TEXT,                 -- NULL/'auto'/'local'/provider id
+    status TEXT NOT NULL,          -- pending|running|completed|failed|blocked
+    output TEXT,
+    source TEXT,
+    error TEXT,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (run_id, step_id),
+    FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id) ON DELETE CASCADE
+);

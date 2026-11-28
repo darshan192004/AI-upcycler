@@ -365,3 +365,74 @@ fn workflow_events_broadcast_to_subscribers() {
         TelemetryEvent::WorkflowStepStarted { .. }
     ));
 }
+
+use ai_upcycler_core::store::{NewWorkflowStep, Store};
+
+fn new_step(id: &str, deps: &[&str], position: i64) -> NewWorkflowStep {
+    NewWorkflowStep {
+        step_id: id.into(),
+        prompt: format!("prompt {id}"),
+        depends_on_json: serde_json::to_string(&deps.to_vec()).unwrap(),
+        provider: Some("local".into()),
+        position,
+    }
+}
+
+#[test]
+fn workflow_run_and_steps_round_trip_and_update() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_workflow_run(
+            "wf-1",
+            "llama-8b",
+            &[new_step("a", &[], 0), new_step("b", &["a"], 1)],
+        )
+        .unwrap();
+
+    let runs = store.list_workflow_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "running");
+    assert_eq!(runs[0].model, "llama-8b");
+    assert!(runs[0].finished_at.is_none());
+
+    let steps = store.list_workflow_steps("wf-1").unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[1].depends_on, vec!["a"]);
+    assert_eq!(steps[1].position, 1);
+
+    store
+        .set_workflow_step_status(
+            "wf-1",
+            "a",
+            "completed",
+            Some("answer"),
+            Some("local"),
+            None,
+        )
+        .unwrap();
+    store
+        .set_workflow_run_status("wf-1", "completed", true)
+        .unwrap();
+
+    let step = &store.list_workflow_steps("wf-1").unwrap()[0];
+    assert_eq!(step.status, "completed");
+    assert_eq!(step.output.as_deref(), Some("answer"));
+    let run = store.get_workflow_run("wf-1").unwrap().unwrap();
+    assert_eq!(run.status, "completed");
+    assert!(run.finished_at.is_some());
+}
+
+#[test]
+fn workflow_steps_are_scoped_to_their_run() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_workflow_run("wf-1", "m", &[new_step("a", &[], 0)])
+        .unwrap();
+    store
+        .create_workflow_run("wf-2", "m", &[new_step("a", &[], 0)])
+        .unwrap();
+
+    assert_eq!(store.list_workflow_steps("wf-1").unwrap().len(), 1);
+    assert_eq!(store.list_workflow_steps("wf-2").unwrap().len(), 1);
+    assert!(store.get_workflow_run("missing").unwrap().is_none());
+}
