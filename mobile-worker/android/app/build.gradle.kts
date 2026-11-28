@@ -118,4 +118,9 @@ dependencies {
     // In-process gRPC transport (split out of grpc-core in 1.60) so the service
     // can be exercised on the JVM without a device or a real socket.
     testImplementation("io.grpc:grpc-inprocess:1.63.0")
+
+    // LAN chat transport; org.json is supplied by Android in production and by
+    // this test artifact on the JVM.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("org.json:json:20240303")
 }
