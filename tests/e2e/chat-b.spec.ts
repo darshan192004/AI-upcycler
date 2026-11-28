@@ -9,6 +9,11 @@ const STREAM_BODY =
 
 type ChatBody = Record<string, unknown>;
 
+async function gotoChat(page: Page): Promise<void> {
+  await page.goto(APP_URL);
+  await page.getByRole('tab', { name: 'Chat' }).click();
+}
+
 async function stubChat(
   page: Page,
   onBody: (body: ChatBody) => void = () => undefined,
@@ -24,7 +29,7 @@ async function stubChat(
 }
 
 test('provider switcher has the accessible name Provider', async ({ page }) => {
-  await page.goto(APP_URL);
+  await gotoChat(page);
   await expect(
     page.getByRole('combobox', { name: 'Provider', exact: true }),
   ).toBeVisible();
@@ -35,7 +40,7 @@ test('selecting openai puts provider openai on the next chat request', async ({
 }) => {
   const bodies: ChatBody[] = [];
   await stubChat(page, (body) => bodies.push(body));
-  await page.goto(APP_URL);
+  await gotoChat(page);
 
   await page.getByRole('combobox', { name: 'Provider', exact: true }).selectOption('openai');
   await page.locator('textarea').fill('check provider routing');
@@ -49,7 +54,7 @@ test('source badge reads Local engine for local telemetry', async ({ page }) => 
   await page.routeWebSocket('**/api/telemetry', (socket) => {
     telemetrySocket = socket;
   });
-  await page.goto(APP_URL);
+  await gotoChat(page);
 
   const payload = JSON.stringify({
     event: 'generation_metrics',
@@ -97,12 +102,13 @@ test('a session from a previous turn is in the session select after reload', asy
     });
   });
 
-  await page.goto(APP_URL);
+  await gotoChat(page);
   await page.locator('textarea').fill('create a shared session');
   await page.getByRole('button', { name: 'Send message' }).click();
   await expect.poll(() => createdSessionId).not.toBe('');
 
   await page.reload();
+  await page.getByRole('tab', { name: 'Chat' }).click();
   const sessionSelect = page.getByRole('combobox', { name: 'Chat session' });
   await expect(sessionSelect).toBeVisible();
   await expect(
@@ -113,7 +119,7 @@ test('a session from a previous turn is in the session select after reload', asy
 test('no browser-storage key contains chat message text', async ({ page }) => {
   const marker = 'privatelm-chat-secret-no-storage';
   await stubChat(page);
-  await page.goto(APP_URL);
+  await gotoChat(page);
 
   await page.locator('textarea').fill(marker);
   await page.getByRole('button', { name: 'Send message' }).click();
