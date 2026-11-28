@@ -11,6 +11,7 @@ pub mod devices;
 pub mod distributed;
 pub mod downloads;
 mod error;
+pub mod lan;
 pub mod llama;
 pub mod models;
 pub mod pairing;
@@ -20,6 +21,7 @@ pub mod sessions;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
+pub use lan::{LanApiConfig, DEFAULT_LAN_PORT, LAN_API_ENV, LAN_PORT_ENV};
 
 use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
