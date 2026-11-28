@@ -270,7 +270,7 @@ impl NodeRegistry {
         let aliases = self.aliases.lock().unwrap();
         let canonical = resolve_alias(&aliases, node_id);
         let mut ids = vec![canonical.clone()];
-        for (alias, _) in aliases.iter() {
+        for alias in aliases.keys() {
             if resolve_alias(&aliases, alias) == canonical {
                 ids.push(alias.clone());
             }
