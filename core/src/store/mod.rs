@@ -831,26 +831,6 @@ impl Store {
         .optional()
         .map_err(Into::into)
     }
-
-    fn setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, StoreError> {
-        self.setting_json(key)?
-            .map(|text| serde_json::from_str(&text).map_err(StoreError::SettingsJson))
-            .transpose()
-    }
-
-    fn put_setting_json<T: Serialize>(&self, key: &str, value: &T) -> Result<(), StoreError> {
-        let text = serde_json::to_string(value).map_err(StoreError::SettingsJson)?;
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO settings (key, value_json, updated_at_epoch_ms)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET
-                 value_json = excluded.value_json,
-                 updated_at_epoch_ms = excluded.updated_at_epoch_ms",
-            params![key, text, now_epoch_ms()],
-        )?;
-        Ok(())
-    }
 }
 
 fn encode_message_content(content: &MessageContent) -> Result<String, StoreError> {
