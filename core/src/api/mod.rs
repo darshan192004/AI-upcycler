@@ -392,13 +392,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/pairing/enroll", post(pairing::enroll))
         .route("/api/devices/available", get(devices::available))
         .route("/api/devices/scan", post(devices::scan))
-        .route("/api/devices/:id/connect", post(devices::connect))
-        .route("/api/devices/:id/install", post(devices::install))
+        .route("/api/devices/{id}/connect", post(devices::connect))
+        .route("/api/devices/{id}/install", post(devices::install))
         .route(
-            "/api/devices/:id/provision",
+            "/api/devices/{id}/provision",
             post(provisioning::start).get(provisioning::status),
         )
-        .route("/api/devices/:id", delete(devices::revoke))
+        .route("/api/devices/{id}", delete(devices::revoke))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())

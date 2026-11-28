@@ -16,7 +16,7 @@ mdns-sd = "0.11"
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 tracing = "0.1"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2.0"
