@@ -22,6 +22,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
@@ -313,7 +314,10 @@ fn mock_openai(captured: Arc<Mutex<Option<Value>>>) -> Router {
             let captured = captured.clone();
             async move {
                 *captured.lock().expect("capture lock") = Some(body);
-                ([(CONTENT_TYPE, "text/event-stream")], OPENAI_SSE.to_string())
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    OPENAI_SSE.to_string(),
+                )
             }
         }),
     )
@@ -366,21 +370,17 @@ async fn explicit_local_turn_stays_on_the_stub_and_reports_local_source() {
     let mut rx = state.telemetry.subscribe();
     let store = state.store.clone();
 
-    let (status, body) = post_chat(
-        router(state),
-        chat_body("llama-8b", Some("local")),
-    )
-    .await;
+    let (status, body) = post_chat(router(state), chat_body("llama-8b", Some("local"))).await;
 
     assert_eq!(status, StatusCode::OK);
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("[stub:llama-8b]"));
     assert!(
-        body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[stub:llama-8b]")
-    );
-    assert!(
-        metric_sources(&mut rx).iter().any(|source| source == "local"),
+        metric_sources(&mut rx)
+            .iter()
+            .any(|source| source == "local"),
         "stub turns must be labelled local"
     );
     assert_eq!(store.list_sessions().unwrap().len(), 1);
@@ -394,11 +394,7 @@ async fn explicit_cloud_turn_uses_the_provider_and_registers_a_virtual_model() {
     let mut rx = state.telemetry.subscribe();
     let store = state.store.clone();
 
-    let (status, body) = post_chat(
-        router(state),
-        chat_body("gpt-4o", Some("openai")),
-    )
-    .await;
+    let (status, body) = post_chat(router(state), chat_body("gpt-4o", Some("openai"))).await;
     handle.abort();
 
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -411,7 +407,9 @@ async fn explicit_cloud_turn_uses_the_provider_and_registers_a_virtual_model() {
     assert_eq!(sent["model"].as_str(), Some("gpt-4o"));
     assert!(sent.get("tools").is_none(), "cloud adapters are text-only");
     assert!(
-        metric_sources(&mut rx).iter().any(|source| source == "openai"),
+        metric_sources(&mut rx)
+            .iter()
+            .any(|source| source == "openai"),
         "cloud turns must be labelled with the provider id"
     );
     let virtual_row = store
@@ -507,11 +505,9 @@ async fn cloud_turn_without_a_key_is_refused_before_session_writes() {
             .contains("openai"),
         "the refusal must name the provider without the key: {body}"
     );
-    assert!(
-        !serde_json::to_string(&body)
-            .unwrap()
-            .contains(SYNTHETIC_KEY)
-    );
+    assert!(!serde_json::to_string(&body)
+        .unwrap()
+        .contains(SYNTHETIC_KEY));
 }
 
 #[tokio::test]
@@ -547,7 +543,10 @@ async fn a_local_model_id_colliding_with_a_virtual_model_returns_conflict() {
     handle.abort();
 
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"]["message"].as_str().unwrap().contains("gpt-4o"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("gpt-4o"));
 }
 
 /// A real backend serving a phone worker, used to prove the cluster source is
@@ -589,4 +588,300 @@ async fn a_real_cluster_backend_keeps_auto_local_and_reports_the_worker_source()
             .any(|source| source == "adb:192.168.1.9:5555"),
         "cluster turns must be labelled with the worker serial"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: provider status and secret endpoints. The mutable store is local to
+// this test binary; the production state keeps the OS keychain store.
+// ---------------------------------------------------------------------------
+
+struct MutableSecrets {
+    values: Mutex<HashMap<ProviderId, String>>,
+}
+
+impl Default for MutableSecrets {
+    fn default() -> Self {
+        Self {
+            values: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl SecretStore for MutableSecrets {
+    fn get(&self, scope: SecretScope) -> Option<String> {
+        match scope {
+            SecretScope::Provider(id) => self.values.lock().ok()?.get(&id).cloned(),
+            SecretScope::LanToken => None,
+        }
+    }
+
+    fn set(&self, scope: SecretScope, value: &str) -> Result<(), String> {
+        let SecretScope::Provider(id) = scope else {
+            return Err("only provider credentials are supported here".into());
+        };
+        let mut values = self.values.lock().map_err(|_| "secret lock failed")?;
+        values.insert(id, value.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, scope: SecretScope) -> Result<(), String> {
+        let SecretScope::Provider(id) = scope else {
+            return Err("only provider credentials are supported here".into());
+        };
+        let mut values = self.values.lock().map_err(|_| "secret lock failed")?;
+        values.remove(&id);
+        Ok(())
+    }
+}
+
+fn secret_state(base_url: Option<&str>) -> (AppState, Arc<MutableSecrets>) {
+    let secrets = Arc::new(MutableSecrets::default());
+    let dyn_secrets: Arc<dyn SecretStore> = secrets.clone();
+    let mut built = state().with_secrets(dyn_secrets.clone());
+    if let Some(base_url) = base_url {
+        let registry = ProviderRegistry::new(dyn_secrets)
+            .with_base_url(ProviderId::OpenAI, format!("{base_url}/v1"))
+            .with_http_client(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("no-proxy test client"),
+            );
+        built = built.with_providers(Arc::new(registry));
+    }
+    (built, secrets)
+}
+
+async fn call(app: Router, method: &str, uri: &str, body: Body) -> (StatusCode, String, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, text, value)
+}
+
+fn json_body(value: Value) -> Body {
+    Body::from(serde_json::to_vec(&value).unwrap())
+}
+
+#[tokio::test]
+async fn provider_list_is_credential_free_reports_four_unconfigured_providers() {
+    let (app_state, _) = secret_state(None);
+
+    let (status, text, body) =
+        call(router(app_state), "GET", "/api/providers", Body::empty()).await;
+
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let entries = body.as_array().expect("provider list is an array");
+    assert_eq!(entries.len(), 4);
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["openai", "anthropic", "gemini", "kimi"]);
+    assert!(entries.iter().all(|entry| entry["configured"] == false));
+    assert!(entries.iter().all(|entry| entry["models"].is_array()));
+    assert!(
+        !text.contains("sk-"),
+        "provider list must never carry a key"
+    );
+}
+
+#[tokio::test]
+async fn saving_a_secret_flips_configured_without_exposing_the_value() {
+    let (app_state, _) = secret_state(None);
+    let app = router(app_state);
+
+    let (status, text, body) = call(
+        app.clone(),
+        "PUT",
+        "/api/settings/secrets/openai",
+        json_body(json!({ "value": "sk-super-secret" })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body["id"], "openai");
+    assert_eq!(body["configured"], true);
+    assert!(!text.contains("sk-super-secret"), "{text}");
+
+    let (status, list_text, list) = call(app, "GET", "/api/providers", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["configured"], true);
+    assert_eq!(list[1]["configured"], false);
+    assert!(!list_text.contains("sk-super-secret"));
+}
+
+#[tokio::test]
+async fn deleting_a_secret_is_idempotent_and_flips_configured_back() {
+    let (app_state, _) = secret_state(None);
+    let app = router(app_state);
+
+    let (status, _, _) = call(
+        app.clone(),
+        "PUT",
+        "/api/settings/secrets/kimi",
+        json_body(json!({ "value": "sk-super-secret" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, text, body) = call(
+        app.clone(),
+        "DELETE",
+        "/api/settings/secrets/kimi",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body["configured"], false);
+
+    let (status, text, body) = call(
+        app.clone(),
+        "DELETE",
+        "/api/settings/secrets/kimi",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body["configured"], false);
+
+    let (_, _, list) = call(app, "GET", "/api/providers", Body::empty()).await;
+    assert!(list
+        .as_array()
+        .expect("provider list")
+        .iter()
+        .all(|entry| entry["configured"] == false));
+}
+
+#[tokio::test]
+async fn unknown_provider_paths_and_bad_secret_bodies_are_rejected() {
+    let (app_state, _) = secret_state(None);
+    let app = router(app_state);
+
+    let (status, _, _) = call(
+        app.clone(),
+        "PUT",
+        "/api/settings/secrets/bogus",
+        json_body(json!({ "value": "sk-super-secret" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = call(
+        app.clone(),
+        "POST",
+        "/api/providers/bogus/test",
+        json_body(json!({ "model": "gpt-4o" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = call(
+        app.clone(),
+        "PUT",
+        "/api/settings/secrets/openai",
+        json_body(json!({ "value": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, _) = call(
+        app,
+        "PUT",
+        "/api/settings/secrets/openai",
+        Body::from("{\"value\":"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn provider_test_streams_one_turn_and_returns_only_a_preview() {
+    let captured = Arc::new(Mutex::new(None));
+    let (base_url, handle) = common::spawn_mock_provider(mock_openai(captured.clone())).await;
+    let (app_state, _) = secret_state(Some(&base_url));
+    let app = router(app_state);
+
+    let (status, _, _) = call(
+        app.clone(),
+        "PUT",
+        "/api/settings/secrets/openai",
+        json_body(json!({ "value": "sk-super-secret" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, text, body) = call(
+        app,
+        "POST",
+        "/api/providers/openai/test",
+        json_body(json!({ "model": "gpt-4o" })),
+    )
+    .await;
+    handle.abort();
+
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(body["provider"], "openai");
+    assert_eq!(body["model"], "gpt-4o");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["preview"], "Hello from OpenAI");
+    assert!(!text.contains("sk-super-secret"), "{text}");
+    assert!(!text.contains("Authorization"), "{text}");
+}
+
+#[tokio::test]
+async fn provider_test_without_a_key_refuses_before_dialing() {
+    let (app_state, _) = secret_state(Some("http://127.0.0.1:1"));
+
+    let (status, text, _) = call(
+        router(app_state),
+        "POST",
+        "/api/providers/openai/test",
+        json_body(json!({ "model": "gpt-4o" })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("openai"), "{text}");
+    assert!(!text.contains("sk-"), "{text}");
+}
+
+#[tokio::test]
+async fn the_dashboard_can_preflight_a_secret_put() {
+    let (app_state, _) = secret_state(None);
+    let response = router(app_state)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/settings/secrets/openai")
+                .header("origin", "http://localhost:1420")
+                .header("access-control-request-method", "PUT")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let allowed = response
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("CORS preflight grant")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(allowed.contains("PUT"), "allowed methods: {allowed}");
 }
