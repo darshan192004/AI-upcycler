@@ -93,6 +93,8 @@ export interface WorkerTelemetry {
 export interface GenerationMetrics {
   tokens_per_second: number;
   current_token: number;
+  /** Where the turn ran: `local`, `adb:<serial>`, or a provider id. */
+  source: string;
   /** The master's own RAM utilization; `null` when it could not be read. */
   master_ram_utilization_pct: number | null;
   worker_nodes: WorkerTelemetry[];
@@ -152,6 +154,44 @@ export interface ChatRequest {
   temperature?: number;
   max_tokens?: number;
   session_id?: string;
+  /** Omit for `auto`; otherwise `local` or a configured provider id. */
+  provider?: string;
+}
+
+export interface ProviderModelWire {
+  id: string;
+  label: string;
+  supports_vision: boolean;
+}
+
+export interface ProviderStatus {
+  id: 'openai' | 'anthropic' | 'gemini' | 'kimi';
+  name: string;
+  configured: boolean;
+  models: ProviderModelWire[];
+  supports_vision: boolean;
+  supports_tools: boolean;
+}
+
+/**
+ * `GET /api/providers` returns a bare array: the server's `ProviderList`
+ * newtype is `#[serde(transparent)]`, so it serializes as its inner vector.
+ */
+export type ProviderList = ProviderStatus[];
+
+export interface ChatSession {
+  session_id: string;
+  title: string;
+  model_id: string;
+  created_at: string;
+}
+
+export interface SessionList {
+  sessions: ChatSession[];
+}
+
+export interface SessionMessages {
+  messages: Array<ChatMessage & { message_id: number; created_at: string }>;
 }
 
 export interface DownloadRequest {

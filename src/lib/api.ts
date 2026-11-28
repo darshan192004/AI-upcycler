@@ -5,8 +5,12 @@ import type {
   DownloadRequest,
   ModelList,
   ProvisionState,
+  ProviderList,
+  ProviderStatus,
   RevokeResponse,
   ScanResponse,
+  SessionList,
+  SessionMessages,
   Topology,
 } from './types';
 
@@ -162,4 +166,38 @@ export function startProvision(id: string, modelId: string): Promise<ProvisionSt
 
 export function getProvisionState(id: string): Promise<ProvisionState> {
   return request<ProvisionState>(`/api/devices/${encodeURIComponent(id)}/provision`);
+}
+
+// ---- cloud providers and shared chat sessions (sub-project B) --------------
+
+/** A bare array, not an object with a `providers` field (serde transparent). */
+export function listProviders(): Promise<ProviderList> {
+  return request<ProviderList>('/api/providers');
+}
+
+export function putProviderSecret(
+  id: string,
+  value: string,
+): Promise<ProviderStatus> {
+  return request<ProviderStatus>(
+    `/api/settings/secrets/${encodeURIComponent(id)}`,
+    { method: 'PUT', body: JSON.stringify({ value }) },
+  );
+}
+
+export function deleteProviderSecret(id: string): Promise<ProviderStatus> {
+  return request<ProviderStatus>(
+    `/api/settings/secrets/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function listSessions(): Promise<SessionList> {
+  return request<SessionList>('/api/sessions');
+}
+
+export function listSessionMessages(sessionId: string): Promise<SessionMessages> {
+  return request<SessionMessages>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+  );
 }
