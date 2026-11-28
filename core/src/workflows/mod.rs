@@ -4,11 +4,13 @@
 //! That keeps ordering, failure propagation and event emission testable without
 //! SQLite, HTTP, or a provider key.
 
+pub mod backend_runner;
 pub mod executor;
 pub mod validation;
 
 use serde::{Deserialize, Serialize};
 
+pub use backend_runner::RouterBackend;
 pub use executor::{
     execute, EventSink, ExecutionResult, StepFuture, StepRecord, StepRunner, WorkflowEvent,
 };
