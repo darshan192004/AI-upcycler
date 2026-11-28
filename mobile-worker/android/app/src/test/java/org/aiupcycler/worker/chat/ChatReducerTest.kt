@@ -190,4 +190,68 @@ class ChatReducerTest {
             assertFalse("$label invented compact", fromOff.compact)
         }
     }
+
+    // Task 10 stable-id contract. Rendered rows are keyed by stableId, so every
+    // synthetic message below must carry one and deltas must never rekey a row.
+    @Test
+    fun everyRenderedMessageHasNonEmptyStableId() {
+        val messages = listOf(
+            ChatMessage(role = "user", content = "question"),
+            ChatMessage(role = "assistant", content = "", messageId = 42L),
+            ChatMessage(role = "system", content = "synthetic note", messageId = 7L),
+        )
+
+        val next = reduce(baseState.copy(messages = messages), ChatEvent.Delta("x"))
+
+        assertEquals(3, next.messages.size)
+        next.messages.forEach { message ->
+            assertTrue("blank stable id for ${message.role}", message.stableId.isNotBlank())
+        }
+    }
+
+    @Test
+    fun optimisticUserMessagesKeepDistinctUuidStableIds() {
+        val first = ChatMessage(role = "user", content = "first")
+        val second = ChatMessage(role = "user", content = "second")
+        val uuidShape = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+        val next = reduce(
+            baseState.copy(messages = listOf(first, second)),
+            ChatEvent.ProvisioningUpdated(ProvisionState.Idle),
+        )
+        val ids = next.messages.map { it.stableId }
+
+        assertEquals(2, ids.size)
+        assertEquals(2, ids.toSet().size)
+        ids.forEach { assertTrue("not a UUID client key: $it", it.matches(uuidShape)) }
+        assertNotSame(first.stableId, second.stableId)
+    }
+
+    @Test
+    fun assistantPlaceholderStableIdSurvivesDeltasAndStreamDone() {
+        val user = ChatMessage(role = "user", content = "question")
+        val placeholder = ChatMessage(role = "assistant", content = "", messageId = 99L)
+        val state = baseState.copy(messages = listOf(user, placeholder), busy = true)
+
+        val afterFirst = reduce(state, ChatEvent.Delta("He"))
+        val afterSecond = reduce(afterFirst, ChatEvent.Delta("llo"))
+        val done = reduce(afterSecond, ChatEvent.StreamDone(Source.Local))
+
+        assertEquals(placeholder.stableId, afterFirst.messages[1].stableId)
+        assertEquals(placeholder.stableId, afterSecond.messages[1].stableId)
+        assertEquals(placeholder.stableId, done.messages[1].stableId)
+        assertEquals("Hello", done.messages[1].content)
+        assertEquals(2, done.messages.map { it.stableId }.toSet().size)
+        assertEquals(user.stableId, done.messages[0].stableId)
+    }
+
+    @Test
+    fun serverMessageIdMapsToServerStableId() {
+        val server = ChatMessage(role = "assistant", content = "answer", messageId = 42L)
+
+        val next = reduce(baseState.copy(messages = listOf(server)), ChatEvent.Delta("!"))
+
+        assertEquals("server-42", next.messages.single().stableId)
+        assertEquals("answer!", next.messages.single().content)
+    }
 }
