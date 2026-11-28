@@ -14,3 +14,4 @@ pub mod store;
 pub mod telemetry;
 pub mod trust;
 pub mod worker_health;
+pub mod workflows;
