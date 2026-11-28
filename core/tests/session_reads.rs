@@ -287,7 +287,8 @@ async fn messages_for_a_missing_session_return_the_same_not_found_envelope() {
 }
 
 #[tokio::test]
-async fn the_session_surface_has_no_write_routes() {
+async fn the_session_surface_allows_only_documented_writes() {
+    // Sub-project D adds PUT/DELETE for rename and delete; POST remains absent.
     let store = Arc::new(Store::open_in_memory().expect("store"));
     seed_model(&store);
     store.create_session("s1", "Hello", "m1").unwrap();
@@ -295,8 +296,6 @@ async fn the_session_surface_has_no_write_routes() {
 
     for (method, uri) in [
         ("POST", "/api/sessions"),
-        ("PUT", "/api/sessions/s1"),
-        ("DELETE", "/api/sessions/s1"),
         ("POST", "/api/sessions/s1/messages"),
     ] {
         let (status, text, _) = send(app.clone(), method, uri).await;
@@ -306,18 +305,18 @@ async fn the_session_surface_has_no_write_routes() {
             "{method} {uri}: {text}"
         );
     }
+    // An empty PUT is rejected by the strict JSON body (400, not 405), and
+    // DELETE is the documented 204. Happy paths live in settings_sessions.rs.
+    let (status, text, _) = send(app.clone(), "PUT", "/api/sessions/s1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let (status, text, _) = send(app.clone(), "DELETE", "/api/sessions/s1").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let (status, text, listed) = send(app, "GET", "/api/sessions").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
     assert_eq!(
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/sessions")
-                    .body(Body::empty())
-                    .unwrap()
-            )
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
+        listed["sessions"].as_array().unwrap().len(),
+        0,
+        "deleted session still listed: {text}"
     );
 }

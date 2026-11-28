@@ -1,15 +1,17 @@
-//! Read-only shared session surface for remote chat clients.
+//! Shared session surface for remote chat clients.
 //!
-//! Chat completions create sessions through `session_id`; these endpoints only
-//! let a phone or desktop client rediscover them and replay their messages.
-//! Write routes are deliberately absent so this module can later gain `PUT`
-//! and `DELETE` without renaming its response types.
+//! Chat completions create sessions through `session_id`; these endpoints let
+//! a phone or desktop client rediscover them, replay their messages, rename
+//! them and delete them. Response types stay limited to the store's session
+//! and message rows, so no secrets or file paths are added to the surface.
 
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::store::{ChatMessageRow, ChatSessionRow};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
 pub struct SessionList {
@@ -53,4 +55,43 @@ pub async fn messages(
         .ok_or_else(|| ApiError::NotFound(format!("session {id} not found")))?;
     let messages = state.store.list_messages(&id)?;
     Ok(Json(SessionMessages { messages }))
+}
+
+/// The only writable field. Unknown fields are rejected so a credential can
+/// never be smuggled into a session title.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameRequest {
+    pub title: String,
+}
+
+/// `PUT /api/sessions/:id`: renames a session and returns the updated row.
+pub async fn rename(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    body: Result<Json<RenameRequest>, JsonRejection>,
+) -> ApiResult<Json<ChatSessionRow>> {
+    let Json(request) = body.map_err(crate::api::settings::bad_request_from_rejection)?;
+    let length = request.title.chars().count();
+    if length == 0 || length > 120 || request.title.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "title must be 1..=120 characters".into(),
+        ));
+    }
+    state
+        .store
+        .rename_session(&id, request.title.trim())?
+        .ok_or_else(|| ApiError::NotFound(format!("session {id} not found")))
+        .map(Json)
+}
+
+/// `DELETE /api/sessions/:id`: removes the session and its messages.
+pub async fn delete(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<StatusCode> {
+    if !state.store.delete_session(&id)? {
+        return Err(ApiError::NotFound(format!("session {id} not found")));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -18,6 +18,7 @@ pub mod pairing;
 pub mod providers;
 pub mod provisioning;
 pub mod sessions;
+pub mod settings;
 pub mod workflows;
 pub mod ws;
 
@@ -610,11 +611,22 @@ pub fn router(state: AppState) -> Router {
             post(upload_media).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
         )
         .route("/api/sessions", get(sessions::list))
-        .route("/api/sessions/:id", get(sessions::get))
+        .route(
+            "/api/sessions/:id",
+            get(sessions::get)
+                .put(sessions::rename)
+                .delete(sessions::delete),
+        )
         .route("/api/sessions/:id/messages", get(sessions::messages))
         .route(
             "/api/settings/secrets/:provider",
             put(providers::put_secret).delete(providers::delete_secret),
+        )
+        .route("/api/config", get(settings::config))
+        .route("/api/settings", get(settings::get).put(settings::put))
+        .route(
+            "/api/settings/recommendations",
+            get(settings::recommendations),
         )
         .route(
             "/api/workflows",
