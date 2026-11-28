@@ -9,6 +9,9 @@ pub mod validation;
 
 use serde::{Deserialize, Serialize};
 
+pub use executor::{
+    execute, EventSink, ExecutionResult, StepFuture, StepRecord, StepRunner, WorkflowEvent,
+};
 pub use validation::validate_steps;
 
 /// One editable step of a workflow. `id` is the stable business key used by
