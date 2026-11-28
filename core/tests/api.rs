@@ -113,6 +113,7 @@ async fn completes_chat_without_streaming() {
         "/v1/chat/completions",
         Some(json!({
             "model": "llama-8b",
+            "provider": "local",
             "messages": [{ "role": "user", "content": "hello cluster" }]
         })),
     )
@@ -137,6 +138,7 @@ async fn streams_chat_as_sse() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "model": "llama-8b",
+                "provider": "local",
                 "stream": true,
                 "messages": [{ "role": "user", "content": "stream this" }]
             }))
@@ -214,6 +216,7 @@ impl GenerationBackend for ToolBackend {
 fn tool_request(stream: bool) -> serde_json::Value {
     json!({
         "model": "llama-8b",
+        "provider": "local",
         "stream": stream,
         "messages": [{ "role": "user", "content": "read a.txt" }],
         "tools": [{
@@ -367,6 +370,7 @@ async fn stream_failures_surface_as_sse_error_events() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "model": "llama-8b",
+                "provider": "local",
                 "stream": true,
                 "messages": [{ "role": "user", "content": "stream this" }]
             }))
@@ -399,6 +403,7 @@ async fn rejects_unknown_model() {
         "/v1/chat/completions",
         Some(json!({
             "model": "ghost",
+            "provider": "local",
             "messages": [{ "role": "user", "content": "hi" }]
         })),
     )
