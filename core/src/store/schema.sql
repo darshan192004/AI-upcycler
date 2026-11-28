@@ -93,3 +93,21 @@ CREATE TABLE IF NOT EXISTS settings (
     value_json TEXT NOT NULL,
     updated_at_epoch_ms INTEGER NOT NULL
 );
+
+-- Sub-project F Task 4: content-addressed generated-image metadata only;
+-- image bytes live on disk, never in SQLite.
+CREATE TABLE IF NOT EXISTS images (
+    image_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    media_sha256 TEXT NOT NULL,
+    media_path TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    byte_len INTEGER NOT NULL,
+    size TEXT NOT NULL,
+    created_at_epoch_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_images_created_at
+    ON images(created_at_epoch_ms DESC);

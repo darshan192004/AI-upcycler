@@ -171,6 +171,33 @@ pub struct AttachmentRow {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewImage {
+    pub image_id: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub media_sha256: String,
+    pub media_path: String,
+    pub mime_type: String,
+    pub byte_len: i64,
+    pub size: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRow {
+    pub image_id: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub media_sha256: String,
+    pub media_path: String,
+    pub mime_type: String,
+    pub byte_len: i64,
+    pub size: String,
+    pub created_at_epoch_ms: i64,
+}
+
 /// SQLite-backed store for cluster, model, benchmark and chat persistence.
 pub struct Store {
     conn: Mutex<Connection>,
@@ -680,6 +707,70 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    // --- images -------------------------------------------------------------
+
+    pub fn insert_image(&self, image: &NewImage) -> Result<ImageRow, StoreError> {
+        let conn = self.lock()?;
+        let created_at_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| StoreError::Poisoned)?
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT INTO images (image_id, provider, model, prompt, media_sha256, media_path,
+                                 mime_type, byte_len, size, created_at_epoch_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                image.image_id,
+                image.provider,
+                image.model,
+                image.prompt,
+                image.media_sha256,
+                image.media_path,
+                image.mime_type,
+                image.byte_len,
+                image.size,
+                created_at_epoch_ms,
+            ],
+        )?;
+        Ok(ImageRow {
+            image_id: image.image_id.clone(),
+            provider: image.provider.clone(),
+            model: image.model.clone(),
+            prompt: image.prompt.clone(),
+            media_sha256: image.media_sha256.clone(),
+            media_path: image.media_path.clone(),
+            mime_type: image.mime_type.clone(),
+            byte_len: image.byte_len,
+            size: image.size.clone(),
+            created_at_epoch_ms,
+        })
+    }
+
+    pub fn get_image(&self, image_id: &str) -> Result<Option<ImageRow>, StoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT image_id, provider, model, prompt, media_sha256, media_path,
+                    mime_type, byte_len, size, created_at_epoch_ms
+             FROM images WHERE image_id = ?1",
+            params![image_id],
+            map_image,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_images(&self, limit: i64, offset: i64) -> Result<Vec<ImageRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT image_id, provider, model, prompt, media_sha256, media_path,
+                    mime_type, byte_len, size, created_at_epoch_ms
+             FROM images ORDER BY created_at_epoch_ms DESC, image_id DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], map_image)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // --- settings -----------------------------------------------------------
 
     pub fn get_settings(&self) -> Result<AppSettings, StoreError> {
@@ -809,6 +900,21 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessageRow> {
         token_count: row.get(4)?,
         generation_time_sec: row.get(5)?,
         created_at: row.get(6)?,
+    })
+}
+
+fn map_image(row: &rusqlite::Row<'_>) -> Result<ImageRow, rusqlite::Error> {
+    Ok(ImageRow {
+        image_id: row.get(0)?,
+        provider: row.get(1)?,
+        model: row.get(2)?,
+        prompt: row.get(3)?,
+        media_sha256: row.get(4)?,
+        media_path: row.get(5)?,
+        mime_type: row.get(6)?,
+        byte_len: row.get(7)?,
+        size: row.get(8)?,
+        created_at_epoch_ms: row.get(9)?,
     })
 }
 
@@ -1140,5 +1246,61 @@ mod tests {
         assert!(store.get_session("s1").unwrap().is_none());
         assert!(store.list_messages("s1").unwrap().is_empty());
         assert!(!store.delete_session("s1").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    fn sample(image_id: &str) -> NewImage {
+        NewImage {
+            image_id: image_id.into(),
+            provider: "openai".into(),
+            model: "gpt-image-2.6-flare".into(),
+            prompt: "a red bicycle".into(),
+            media_sha256: "0123456789abcdef".repeat(4),
+            media_path: "images/01/0123456789abcdef.png".into(),
+            mime_type: "image/png".into(),
+            byte_len: 68,
+            size: "1024x1024".into(),
+        }
+    }
+
+    #[test]
+    fn insert_get_and_list_images() {
+        let store = Store::open_in_memory().unwrap();
+        let row = store.insert_image(&sample("img-1")).unwrap();
+        assert_eq!(row.image_id, "img-1");
+        assert_eq!(row.provider, "openai");
+        assert_eq!(row.media_path, "images/01/0123456789abcdef.png");
+
+        assert_eq!(
+            store.get_image("img-1").unwrap().unwrap().prompt,
+            "a red bicycle"
+        );
+        assert!(store.get_image("missing").unwrap().is_none());
+
+        store.insert_image(&sample("img-2")).unwrap();
+        let listed = store.list_images(1, 1).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].image_id, "img-1");
+    }
+
+    #[test]
+    fn schema_is_idempotent_and_stores_metadata_only() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'images'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("BLOB"));
+        assert!(sql.contains("media_sha256"));
+        assert!(sql.contains("media_path"));
+        assert!(sql.contains("created_at_epoch_ms"));
     }
 }
