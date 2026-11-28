@@ -48,6 +48,8 @@ class LanClient(
     fun listProviders(): List<ProviderStatus> =
         executeJsonArray("GET", "/api/providers").toProviders()
 
+    fun getJson(path: String): JSONObject = executeJson("GET", path)
+
     /** Writes the value to the host's secret store; it is never echoed back. */
     fun putProviderKey(id: String, value: String) {
         val body = JSONObject().put("value", value).toString()
