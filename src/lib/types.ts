@@ -141,7 +141,16 @@ export type TelemetryEvent =
   | { event: 'node_disconnected'; timestamp: number; data: NodeEventData }
   | { event: 'generation_metrics'; timestamp: number; data: GenerationMetrics }
   | { event: 'worker_health'; timestamp: number; data: WorkerHealthEventData }
-  | { event: 'model_download_progress'; timestamp: number; data: DownloadProgressData };
+  | { event: 'model_download_progress'; timestamp: number; data: DownloadProgressData }
+  | { event: 'workflow_step_started'; timestamp: number; data: { run_id: string; step_id: string } }
+  | { event: 'workflow_step_completed'; timestamp: number; data: {
+      run_id: string;
+      step_id: string;
+      status: WorkflowStepStatus;
+      output: string | null;
+      source: string | null;
+      error: string | null;
+    } };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -255,3 +264,56 @@ export type ProvisionState =
   | { state: 'running'; bytes_done: number; total_bytes: number }
   | { state: 'done'; bytes: number }
   | { state: 'failed'; message: string };
+
+// ---- task workflows (spec 2026-11-27, §10/§11) ------------------------------
+
+export type WorkflowRunStatus = 'running' | 'completed' | 'failed';
+export type WorkflowStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'blocked';
+export type WorkflowProvider = 'auto' | 'local' | 'openai' | 'anthropic' | 'gemini' | 'kimi';
+
+export interface WorkflowStepDraft {
+  id: string;
+  prompt: string;
+  depends_on: string[];
+  provider: WorkflowProvider;
+}
+
+export interface WorkflowRequest {
+  model: string;
+  steps: WorkflowStepDraft[];
+}
+
+export interface WorkflowRunRow {
+  run_id: string;
+  model: string;
+  status: WorkflowRunStatus;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface WorkflowStepRow {
+  run_id: string;
+  step_id: string;
+  prompt: string;
+  depends_on: string[];
+  provider: string | null;
+  status: WorkflowStepStatus;
+  output: string | null;
+  source: string | null;
+  error: string | null;
+  position: number;
+}
+
+export interface WorkflowRunDetail {
+  run: WorkflowRunRow;
+  steps: WorkflowStepRow[];
+}
+
+export interface CreateWorkflowResponse {
+  run_id: string;
+  status: WorkflowRunStatus;
+}
+
+export interface WorkflowListResponse {
+  runs: WorkflowRunRow[];
+}

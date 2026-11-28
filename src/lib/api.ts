@@ -2,6 +2,7 @@ import type {
   AvailableDevice,
   AvailableDevicesResponse,
   ChatRequest,
+  CreateWorkflowResponse,
   DownloadRequest,
   ModelList,
   ProvisionState,
@@ -12,6 +13,9 @@ import type {
   SessionList,
   SessionMessages,
   Topology,
+  WorkflowListResponse,
+  WorkflowRequest,
+  WorkflowRunDetail,
 } from './types';
 
 export const API_BASE = 'http://127.0.0.1:8080';
@@ -200,4 +204,21 @@ export function listSessionMessages(sessionId: string): Promise<SessionMessages>
   return request<SessionMessages>(
     `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
   );
+}
+
+// ---- task workflows (spec 2026-11-27, §10) --------------------------------
+
+export function createWorkflow(req: WorkflowRequest): Promise<CreateWorkflowResponse> {
+  return request<CreateWorkflowResponse>('/api/workflows', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
+export function listWorkflows(): Promise<WorkflowListResponse> {
+  return request<WorkflowListResponse>('/api/workflows');
+}
+
+export function getWorkflow(runId: string): Promise<WorkflowRunDetail> {
+  return request<WorkflowRunDetail>(`/api/workflows/${encodeURIComponent(runId)}`);
 }
