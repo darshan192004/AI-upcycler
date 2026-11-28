@@ -14,6 +14,7 @@ mod error;
 pub mod llama;
 pub mod models;
 pub mod pairing;
+pub mod providers;
 pub mod provisioning;
 pub mod ws;
 
@@ -29,7 +30,7 @@ use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
 use axum::http::{header, HeaderValue, Method};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -402,7 +403,7 @@ fn cors_layer() -> CorsLayer {
                 .map(browser_origin_is_allowed)
                 .unwrap_or(false)
         }))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE])
         // Some Chromium builds send a Private Network Access preflight when a
         // page asks for a loopback address; grant it only to allowed origins.
@@ -428,6 +429,12 @@ pub fn router(state: AppState) -> Router {
             post(provisioning::start).get(provisioning::status),
         )
         .route("/api/devices/:id", delete(devices::revoke))
+        .route("/api/providers", get(providers::list))
+        .route("/api/providers/:id/test", post(providers::test))
+        .route(
+            "/api/settings/secrets/:provider",
+            put(providers::put_secret).delete(providers::delete_secret),
+        )
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())
