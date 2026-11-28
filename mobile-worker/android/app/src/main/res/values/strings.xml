@@ -38,4 +38,16 @@
     <string name="model_loading">Loading %1$s...</string>
     <string name="model_load_failed">Load failed: %1$s</string>
     <string name="model_unload_failed">Unload failed: %1$s</string>
+
+    <!-- Chat (spec 2026-11-27 B mobile chat, Task 10). -->
+    <string name="chat_new_session">New session</string>
+    <string name="chat_no_sessions">No sessions yet. Start a chat.</string>
+    <string name="chat_provider_local">Local engine</string>
+    <string name="chat_role_you">You</string>
+    <string name="chat_role_assistant">Assistant</string>
+    <string name="chat_generating">Generating</string>
+    <string name="chat_draft_hint">Message</string>
+    <string name="chat_send">Send</string>
+    <string name="chat_stop_generation">Stop generation</string>
+    <string name="chat_open_session">Open session</string>
 </resources>

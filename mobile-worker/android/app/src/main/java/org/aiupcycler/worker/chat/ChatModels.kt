@@ -1,6 +1,7 @@
 package org.aiupcycler.worker.chat
 
 import java.io.IOException
+import java.util.UUID
 
 /**
  * Wire shapes shared by the LAN client and the later chat UI/reducer tasks.
@@ -25,7 +26,16 @@ data class ChatMessage(
     val tokenCount: Long? = null,
     val generationTimeSec: Double? = null,
     val createdAt: String? = null,
-)
+    /** Identity for optimistic rows, which have no server [messageId] yet. */
+    val clientKey: String = UUID.randomUUID().toString(),
+) {
+    /**
+     * Stable LazyColumn key. Server rows are deterministic; optimistic rows
+     * keep their UUID through every `reduce` copy/delta.
+     */
+    val stableId: String
+        get() = messageId?.let { "server-$it" } ?: clientKey
+}
 
 /** A row from `GET /api/sessions`; message bodies are never attached here. */
 data class ChatSession(

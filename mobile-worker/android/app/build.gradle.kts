@@ -37,6 +37,19 @@ android {
         jvmTarget = "17"
     }
 
+    buildFeatures {
+        compose = true
+    }
+
+    // Task 10/12 Compose toolchain. Kotlin 1.9.24 pairs with compiler 1.5.14.
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.14"
+    }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
     // grpc-netty pulls extra META-INF metadata that collides when packaged into
     // a single APK; keep the first copy of the netty version manifest and drop
     // the human-readable licence/notice files.
@@ -83,6 +96,20 @@ protobuf {
 }
 
 dependencies {
+    // Compose (Task 12 block, installed here because Task 10 ships the UI).
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.02")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+
     implementation("io.grpc:grpc-netty:1.63.0")
 
     // The control/pairing screen uses a Material3 theme; without this the
