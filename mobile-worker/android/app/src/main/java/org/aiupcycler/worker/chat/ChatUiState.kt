@@ -41,6 +41,12 @@ sealed interface ChatEvent {
         val models: List<ModelEntry>,
         val providers: List<ProviderStatus>,
     ) : ChatEvent
+
+    /** A provider switch; the selected model is revalidated against its catalog. */
+    data class ProviderSelected(val choice: ProviderChoice) : ChatEvent
+
+    /** A model chosen from the merged local/virtual id list. */
+    data class ModelSelected(val modelId: String) : ChatEvent
 }
 
 /** User-facing notices; [blocking] marks a notice that must stop interaction. */
@@ -91,6 +97,13 @@ fun reduce(state: ChatUiState, event: ChatEvent): ChatUiState = when (event) {
     ChatEvent.Unauthorized -> state.copy(banner = Banner.Unauthorized())
 
     is ChatEvent.ModelCatalogLoaded -> mergeCatalog(state, event.models, event.providers)
+
+    is ChatEvent.ProviderSelected -> selectProvider(state, event.choice)
+
+    is ChatEvent.ModelSelected -> when (event.modelId) {
+        in state.models.map { it.id } -> state.copy(selectedModel = event.modelId)
+        else -> state
+    }
 }
 
 /** Appends to the latest assistant message with an id, not to the last row. */
@@ -129,4 +142,75 @@ private fun mergeCatalog(
         models = models.toList() + advertised,
         providers = providers.toList(),
     )
+}
+
+/**
+ * The exact `provider` field value for a chat request. `null` means the key is
+ * omitted, which keeps `Auto` routing (and host-only tool behaviour) intact.
+ */
+fun providerRequestValue(choice: ProviderChoice): String? = when (choice) {
+    ProviderChoice.Auto -> null
+    ProviderChoice.Local -> "local"
+    is ProviderChoice.Cloud -> choice.providerId
+}
+
+private val DEFAULT_PROVIDER_NAMES = mapOf(
+    "openai" to "OpenAI",
+    "anthropic" to "Anthropic",
+    "gemini" to "Gemini",
+    "kimi" to "Kimi",
+)
+
+/**
+ * User-facing execution-source label. A provider configured on the host wins
+ * over the built-in display name; an id that is neither configured nor known
+ * stays unknown rather than guessing a cloud name.
+ */
+fun sourceBadgeText(
+    source: Source?,
+    providers: List<ProviderStatus> = emptyList(),
+): String = when (source) {
+    null -> "Source unknown"
+    Source.Local -> "Local engine"
+    is Source.Worker -> "Worker ${source.displaySerial}"
+    is Source.Provider -> {
+        val configured = providers.firstOrNull { it.id.equals(source.id, ignoreCase = true) }?.name
+        val name = configured?.takeIf { it.isNotBlank() }
+            ?: DEFAULT_PROVIDER_NAMES[source.id.lowercase()]
+        if (name.isNullOrBlank()) "Source unknown" else "Cloud $name"
+    }
+}
+
+/** Exact text rendered for each provisioning state; no index-derived percentage. */
+fun provisioningText(state: ProvisionState): String = when (state) {
+    ProvisionState.Idle -> ""
+    is ProvisionState.Running -> "${state.bytesDone}/${state.totalBytes}"
+    is ProvisionState.Done -> "Model ready"
+    is ProvisionState.Failed -> state.message
+}
+
+/** The progress screen polls only while the host reports a running push. */
+fun shouldPollProvisioning(state: ProvisionState): Boolean = state is ProvisionState.Running
+
+/**
+ * Model ids that belong to [choice]. Local catalog rows keep their exact ids
+ * even when one already contains a colon; virtual cloud rows carry [ModelEntry.ownedBy].
+ */
+fun availableModelIds(state: ChatUiState, choice: ProviderChoice): List<String> = when (choice) {
+    ProviderChoice.Auto -> state.models.map { it.id }
+    ProviderChoice.Local -> state.models.filter { it.ownedBy.isBlank() }.map { it.id }
+    is ProviderChoice.Cloud -> state.models
+        .filter { it.ownedBy.equals(choice.providerId, ignoreCase = true) }
+        .map { it.id }
+}
+
+/** Keeps a still-valid selection, otherwise moves to the first id in the new catalog. */
+private fun selectProvider(state: ChatUiState, choice: ProviderChoice): ChatUiState {
+    val available = availableModelIds(state, choice)
+    val nextModel = if (state.selectedModel in available) {
+        state.selectedModel
+    } else {
+        available.firstOrNull().orEmpty()
+    }
+    return state.copy(selectedProvider = choice, selectedModel = nextModel)
 }
