@@ -204,6 +204,11 @@ behind.
 Plain chat requests still use the cluster when one is available; the built-in
 chat UI is unchanged.
 
+Agent requests should omit `provider`: omission means `auto`, which keeps the
+host/tool behaviour described above. The loopback API remains unauthenticated
+in sub-project A. A LAN listener is still out of scope; it belongs to
+sub-project B.
+
 ## 7. Troubleshooting
 
 | Symptom | Check |

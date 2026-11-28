@@ -47,6 +47,9 @@
 }
 ```
 
+Only local models appear here; virtual cloud catalog ids are excluded (see
+§2.4).
+
 ### 2.2 Chat Completions (Streaming & Non-Streaming)
 - **Endpoint**: `POST /v1/chat/completions`
 - **Headers**: `Content-Type: application/json`
@@ -96,6 +99,106 @@ ends so the server can decide; requests without tools and
 The supported request/response subset and the exact streaming shape are
 specified in
 `docs/superpowers/specs/2026-10-24-agent-api-compatibility-design.md`.
+
+### 2.4 Provider routing on `POST /v1/chat/completions`
+
+The request body accepts one optional field, `provider`. Its values are `auto`,
+`local`, or a configured provider id: `openai`, `anthropic`, `gemini`, or
+`kimi`. Omitting `provider` means `auto` (an empty string has the same effect),
+so existing agent requests keep their behaviour.
+
+- `auto`: a turn with tools goes to the host engine. Every other turn uses a
+  real local backend (a ready cluster worker or the host `llama-server`), then
+  a configured cloud provider. When none is available, the API returns `400`
+  naming what is missing. The labelled offline stub is not a real backend, so
+  `auto` never falls back to it silently; send `provider: "local"` to get that
+  reply.
+- `local`: explicit local routing with today's behaviour, including the
+  labelled stub when no engine is loaded. This is the deterministic offline
+  mode.
+- A provider id: explicit cloud routing for that provider. The model may be a
+  bare catalog id (`gpt-4o`) or a virtual `provider:model` id (`openai:gpt-4o`);
+  the prefix must match the named provider. A tool turn is rejected with `400`
+  before any session or user turn is persisted. A missing key or a model
+  outside that provider's catalog is a `400` naming the problem; neither case
+  writes a session.
+
+```json
+{
+  "model": "openai:gpt-4o",
+  "messages": [{"role": "user", "content": "Summarize AI Upcycler"}],
+  "provider": "auto"
+}
+```
+
+Cloud ids are virtual catalog ids: they are stored in sessions through reserved
+`models` rows whose `local_file_path` starts with `virtual:`, and they are
+filtered out of `GET /v1/models`. Local GGUF ids keep their existing lookup and
+`404` message; a local id colliding with a required virtual id returns `409`.
+
+### 2.5 Provider and secret endpoints
+
+Base URL: `http://localhost:8080/api`. These endpoints are loopback-only and
+unauthenticated in this phase. Every example below uses the placeholder
+`sk-...`; no real key is shown or returned.
+
+#### `GET /api/providers`
+
+- **Response**: `200 OK` with a bare array, one entry per provider, each with
+  `id`, `name`, `configured`, `models` (each with `id`, `label`,
+  `supports_vision`), `supports_vision`, and `supports_tools`.
+  `configured: true` means a key is available from the OS secret store; `false`
+  covers both an unset key and no native store. The body never contains key
+  material.
+
+```json
+[
+  {
+    "id": "openai",
+    "name": "OpenAI",
+    "configured": true,
+    "models": [
+      {"id": "gpt-4o", "label": "GPT-4o", "supports_vision": true}
+    ],
+    "supports_vision": true,
+    "supports_tools": false
+  },
+  {
+    "id": "kimi",
+    "name": "Kimi (Moonshot)",
+    "configured": false,
+    "models": [
+      {"id": "moonshot-v1-8k", "label": "Moonshot v1 8K", "supports_vision": false}
+    ],
+    "supports_vision": false,
+    "supports_tools": false
+  }
+]
+```
+
+#### `POST /api/providers/{id}/test`
+
+- **Request**: a model id from that provider's catalog, for example
+  `{"model": "gpt-4o"}`.
+- **Response**: `200 OK` with a result-only body — the provider, the model
+  used, and a short truncated preview of one completion. It carries no headers,
+  upstream URL, or key material. Without a key, `400` names the provider; an
+  unknown `:id` is `404`.
+
+#### `PUT /api/settings/secrets/{provider}`
+
+- **Request**: `{"value": "sk-..."}`. Key material is write-only.
+- **Response**: `200 OK` with the provider status object only (the shape shown
+  under `GET /api/providers`); the submitted `value` is never echoed. An empty
+  value or malformed body is `400`, and an unknown provider path is `404`.
+  Keys go to the OS keychain, never SQLite or logs; there is no plaintext
+  fallback.
+
+#### `DELETE /api/settings/secrets/{provider}`
+
+- **Response**: `200 OK` with the same status-only object, now
+  `configured: false`. Repeated deletion is idempotent; an unknown provider
+  path is `404`.
 
 ---
 
@@ -350,7 +453,7 @@ rather than a stale transfer.
 - **Events Emitted**:
   - `node_connected`: Broadcast when a new mobile device connects.
   - `node_disconnected`: Broadcast when a device loses connection.
-  - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference.
+  - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference. `data.source` is `local`, `adb:<serial>`, or a provider id.
   - `worker_health`: Emits the freshest measured health of every worker (battery, CPU temperature, free RAM) plus the master's own RAM utilization. Published after each poll cycle (every 5 s).
   - `model_download_progress`: Emits GGUF download progress (`running` / `complete` / `error`) with received and total bytes.
 
@@ -359,6 +462,7 @@ rather than a stale transfer.
   "event": "generation_metrics",
   "timestamp": 1743457100,
   "data": {
+    "source": "local",
     "tokens_per_second": 8.4,
     "current_token": 142,
     "master_ram_utilization_pct": 68.2,
@@ -369,6 +473,11 @@ rather than a stale transfer.
   }
 }
 ```
+
+For `generation_metrics`, `data.source` is the backend that produced the
+tokens: `local`, `adb:<serial>` (a real cluster worker), or a provider id
+(`openai`, `anthropic`, `gemini`, `kimi`). Agent requests that omit `provider`
+keep their existing event shape and source.
 
 ```json
 {
