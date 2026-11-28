@@ -124,6 +124,9 @@ dependencies {
     // Keystore-backed storage for the LAN bearer token and provider keys.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // Task 9: on-device UI preferences (non-secret flags only).
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+
     // Not optional: gRPC over TLS on Android cannot work without this.
     //
     // grpc-netty needs an ALPN provider to negotiate HTTP/2, and on Android it
@@ -147,6 +150,10 @@ dependencies {
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
 
     testImplementation("junit:junit:4.13.2")
+    // Task 9: Robolectric-backed DataStore preference tests.
+    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("org.robolectric:robolectric:4.12.2")
     // In-process gRPC transport (split out of grpc-core in 1.60) so the service
     // can be exercised on the JVM without a device or a real socket.
     testImplementation("io.grpc:grpc-inprocess:1.63.0")
