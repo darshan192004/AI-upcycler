@@ -8,8 +8,13 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.ConscryptMode
 
+// The app ships org.conscrypt:conscrypt-android for gRPC ALPN on device. On the
+// JVM Robolectric would try to load its native library during application setup
+// and fail with UnsatisfiedLinkError. BouncyCastle covers these preference tests.
 @RunWith(RobolectricTestRunner::class)
+@ConscryptMode(ConscryptMode.Mode.OFF)
 class UiPreferencesStoreTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
 

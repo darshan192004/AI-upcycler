@@ -14,6 +14,14 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
+      # core enables keyring's linux-native-sync-persistent backend, whose
+      # dbus-secret-service -> libdbus-sys build needs the DBus headers. The
+      # ubuntu-latest image no longer ships them (ubuntu-22.04 still does).
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev
+
       # The toolchain is pinned in rust-toolchain.toml, not in this workflow:
       # CI formats, lints and tests with exactly the compiler a checkout uses.
       - name: Setup Rust Toolchain
@@ -45,6 +53,13 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
+
+      # The worker links core, which enables keyring's
+      # linux-native-sync-persistent backend; libdbus-sys needs DBus headers.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev
 
       # The toolchain is pinned in rust-toolchain.toml, not in this workflow:
       # CI formats, lints and tests with exactly the compiler a checkout uses.
