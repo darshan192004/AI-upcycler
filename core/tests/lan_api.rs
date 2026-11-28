@@ -620,3 +620,246 @@ async fn allowlist_loopback_router_still_serves_pairing_session_without_token() 
         .as_str()
         .is_some_and(|pin| pin.len() == 6 && pin.bytes().all(|b| b.is_ascii_digit())));
 }
+
+// ---- Task 5: LAN listener config and master mDNS advert ------------------
+
+use ai_upcycler_core::api::{LanApiConfig, DEFAULT_LAN_PORT, LAN_API_ENV, LAN_PORT_ENV};
+use ai_upcycler_core::discovery::mdns::{
+    resolve_lan_bind_addr, MasterServiceInfo, MASTER_SERVICE_TYPE,
+};
+use std::fmt;
+use std::net::Ipv4Addr;
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Metadata, Subscriber};
+
+/// Serializes the two env-mutating tests in this file.
+static LAN_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+struct RestoreLanEnv {
+    enabled: Option<std::ffi::OsString>,
+    port: Option<std::ffi::OsString>,
+}
+
+impl Drop for RestoreLanEnv {
+    fn drop(&mut self) {
+        match self.enabled.take() {
+            Some(value) => std::env::set_var(LAN_API_ENV, value),
+            None => std::env::remove_var(LAN_API_ENV),
+        }
+        match self.port.take() {
+            Some(value) => std::env::set_var(LAN_PORT_ENV, value),
+            None => std::env::remove_var(LAN_PORT_ENV),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MessageVisitor {
+    messages: Arc<StdMutex<Vec<String>>>,
+}
+
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.messages
+                .lock()
+                .expect("message collector")
+                .push(format!("{value:?}"));
+        }
+    }
+}
+
+struct CapturingSubscriber {
+    messages: Arc<StdMutex<Vec<String>>>,
+}
+
+impl Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        event.record(&mut MessageVisitor {
+            messages: self.messages.clone(),
+        });
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+fn capture_warnings<F: FnOnce()>(run: F) -> Vec<String> {
+    let messages = Arc::new(StdMutex::new(Vec::new()));
+    let subscriber = CapturingSubscriber {
+        messages: messages.clone(),
+    };
+    tracing::subscriber::with_default(subscriber, run);
+    let mut collected = messages.lock().expect("message collector");
+    std::mem::take(&mut *collected)
+}
+
+#[test]
+fn config_env_gate_and_port_warnings_are_exact() {
+    let _lock = LAN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _restore = RestoreLanEnv {
+        enabled: std::env::var_os(LAN_API_ENV),
+        port: std::env::var_os(LAN_PORT_ENV),
+    };
+
+    for value in [None, Some("0"), Some("true")] {
+        match value {
+            Some(value) => std::env::set_var(LAN_API_ENV, value),
+            None => std::env::remove_var(LAN_API_ENV),
+        }
+        std::env::remove_var(LAN_PORT_ENV);
+        let config = LanApiConfig::from_env();
+        assert!(
+            !config.enabled,
+            "{value:?} must not enable the LAN listener"
+        );
+        assert_eq!(config.port, DEFAULT_LAN_PORT);
+    }
+
+    std::env::set_var(LAN_API_ENV, "1");
+    std::env::set_var(LAN_PORT_ENV, "8099");
+    let config = LanApiConfig::from_env();
+    assert!(config.enabled);
+    assert_eq!(config.port, 8099);
+
+    for invalid in ["70000", "0"] {
+        std::env::set_var(LAN_PORT_ENV, invalid);
+        let warnings = capture_warnings(|| {
+            let config = LanApiConfig::from_env();
+            assert!(config.enabled);
+            assert_eq!(config.port, DEFAULT_LAN_PORT, "{invalid}");
+        });
+        let expected =
+            format!("ignoring invalid {LAN_PORT_ENV}={invalid}; using {DEFAULT_LAN_PORT}");
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.trim_matches('"') == expected),
+            "expected exact warning {expected:?}, got {warnings:?}"
+        );
+    }
+}
+
+fn synthetic_master_info() -> MasterServiceInfo {
+    MasterServiceInfo {
+        instance_name: "master-host-pc".into(),
+        node_id: "node-synthetic-01".into(),
+        fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        port: 8099,
+    }
+}
+
+#[test]
+fn advert_txt_records_carry_public_metadata_without_token() {
+    let records = synthetic_master_info().txt_records();
+
+    assert!(
+        records
+            .iter()
+            .any(|(key, value)| key == "version" && value == "1"),
+        "records: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|(key, value)| key == "node_id" && value == "node-synthetic-01"),
+        "records: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|(key, value)| key == "api_port" && value == "8099"),
+        "records: {records:?}"
+    );
+    assert!(
+        records.iter().any(|(key, value)| key == "fingerprint"
+            && value == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        "records: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|(key, _)| !key.eq_ignore_ascii_case("token") && !key.contains("token")),
+        "a TXT key leaked a token: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|(_, value)| !value.contains("synthetic-token-must-never-appear")),
+        "a TXT value leaked a token: {records:?}"
+    );
+}
+
+#[test]
+fn advert_service_type_is_exact() {
+    assert_eq!(MASTER_SERVICE_TYPE, "_aiupcycler-master._tcp.local.");
+
+    let service = synthetic_master_info().service_info("192.168.1.20".parse().expect("valid IPv4"));
+    assert_eq!(service.get_type(), "_aiupcycler-master._tcp.local.");
+    assert_eq!(service.get_port(), 8099);
+    assert_eq!(
+        service.get_fullname(),
+        "master-host-pc._aiupcycler-master._tcp.local."
+    );
+    assert!(
+        service
+            .get_addresses()
+            .contains(&"192.168.1.20".parse::<std::net::IpAddr>().expect("ip")),
+        "advertised addresses: {:?}",
+        service.get_addresses()
+    );
+    assert!(service.get_property_val_str("token").is_none());
+}
+
+#[test]
+#[should_panic(expected = "concrete LAN IPv4")]
+fn advert_refuses_to_advertise_an_unspecified_address() {
+    let _ = synthetic_master_info().service_info(Ipv4Addr::UNSPECIFIED);
+}
+
+#[test]
+fn advert_resolve_lan_bind_addr_prefers_first_private_ipv4() {
+    let candidates: Vec<Ipv4Addr> = [
+        "127.0.0.1",
+        "169.254.9.9",
+        "0.0.0.0",
+        "172.16.4.5",
+        "192.168.1.2",
+    ]
+    .iter()
+    .map(|text| text.parse().expect("valid IPv4"))
+    .collect();
+
+    assert_eq!(
+        resolve_lan_bind_addr(&candidates),
+        Some("172.16.4.5".parse().expect("valid IPv4"))
+    );
+
+    let loopback_only: Vec<Ipv4Addr> = vec![
+        "127.0.0.1".parse().expect("valid IPv4"),
+        "127.0.0.2".parse().expect("valid IPv4"),
+    ];
+    assert_eq!(resolve_lan_bind_addr(&loopback_only), None);
+
+    let link_local_only: Vec<Ipv4Addr> = vec!["169.254.1.1".parse().expect("valid IPv4")];
+    assert_eq!(resolve_lan_bind_addr(&link_local_only), None);
+
+    let public_only: Vec<Ipv4Addr> = vec!["8.8.8.8".parse().expect("valid IPv4")];
+    assert_eq!(resolve_lan_bind_addr(&public_only), None);
+}
