@@ -75,3 +75,14 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
     PRIMARY KEY (run_id, step_id),
     FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS attachments (
+  message_id INTEGER NOT NULL REFERENCES chat_messages(message_id) ON DELETE CASCADE,
+  media_hash TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  byte_count INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (message_id, media_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(media_hash);

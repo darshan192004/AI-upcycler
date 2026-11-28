@@ -22,6 +22,9 @@ pub enum StoreError {
     /// A cloud model id collides with an existing local GGUF (or vice versa).
     #[error("{0}")]
     Conflict(String),
+    /// Image attachment metadata is malformed; the message was rolled back.
+    #[error("invalid attachment")]
+    InvalidAttachment,
 }
 
 /// Marker prefix for catalog rows that represent cloud-only models. Such rows
@@ -149,6 +152,17 @@ pub struct WorkflowStepRow {
     pub source: Option<String>,
     pub error: Option<String>,
     pub position: i64,
+}
+
+/// Content-addressed image metadata attached to a chat message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentRow {
+    pub message_id: i64,
+    pub media_hash: String,
+    pub mime_type: String,
+    pub file_name: String,
+    pub byte_count: i64,
+    pub created_at: String,
 }
 
 /// SQLite-backed store for cluster, model, benchmark and chat persistence.
@@ -549,6 +563,89 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Inserts a chat message and its attachment metadata in one transaction.
+    /// Invalid attachment metadata aborts the whole message.
+    pub async fn insert_message_with_attachments(
+        &self,
+        msg: &NewChatMessage,
+        attachments: &[(String, String, String, u64)],
+    ) -> Result<i64, StoreError> {
+        let content = serde_json::to_string(&msg.content).map_err(|error| {
+            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let result = (|| -> Result<i64, StoreError> {
+            tx.execute(
+                "INSERT INTO chat_messages (session_id, role, content, token_count, generation_time_sec)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    msg.session_id,
+                    msg.role,
+                    content,
+                    msg.token_count,
+                    msg.generation_time_sec,
+                ],
+            )?;
+            let message_id = tx.last_insert_rowid();
+            let created_at: String =
+                tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                    row.get(0)
+                })?;
+            for (media_hash, mime_type, file_name, byte_count) in attachments {
+                let valid_hash = media_hash.len() == 64
+                    && media_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+                let byte_count =
+                    i64::try_from(*byte_count).map_err(|_| StoreError::InvalidAttachment)?;
+                if !valid_hash || byte_count == 0 {
+                    return Err(StoreError::InvalidAttachment);
+                }
+                tx.execute(
+                    "INSERT INTO attachments \
+                     (message_id, media_hash, mime_type, file_name, byte_count, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![message_id, media_hash, mime_type, file_name, byte_count, created_at,],
+                )?;
+            }
+            Ok(message_id)
+        })();
+        match result {
+            Ok(message_id) => {
+                tx.commit()?;
+                Ok(message_id)
+            }
+            Err(error) => {
+                let _ = tx.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    /// Stored attachment metadata for one message.
+    pub async fn attachments_for_message(
+        &self,
+        message_id: i64,
+    ) -> Result<Vec<AttachmentRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, media_hash, mime_type, file_name, byte_count, created_at \
+             FROM attachments WHERE message_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![message_id], |row| {
+            Ok(AttachmentRow {
+                message_id: row.get(0)?,
+                media_hash: row.get(1)?,
+                mime_type: row.get(2)?,
+                file_name: row.get(3)?,
+                byte_count: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -750,5 +847,78 @@ mod tests {
         assert_eq!(messages[1].content, MessageContent::Text("hello!".into()));
         assert_eq!(messages[1].generation_time_sec, 0.25);
         assert_eq!(store.list_sessions().unwrap().len(), 1);
+    }
+
+    use crate::api::backend::ContentPart;
+
+    #[tokio::test]
+    async fn insert_message_with_attachments_is_atomic() {
+        let db = store();
+        db.upsert_model(&NewModel {
+            model_id: "m1".into(),
+            file_name: "m1.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 32,
+            weight_size_bytes: 1,
+            local_file_path: "/m1.gguf".into(),
+        })
+        .unwrap();
+        db.create_session("1", "s1", "m1").unwrap();
+        let msg = NewChatMessage {
+            session_id: "1".into(),
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "look".into(),
+                },
+                ContentPart::Image {
+                    media_hash: "cd".repeat(32),
+                    mime_type: "image/png".into(),
+                    file_name: "a.png".into(),
+                    byte_count: 4,
+                },
+            ]),
+            token_count: 0,
+            generation_time_sec: 0.0,
+        };
+        db.insert_message_with_attachments(
+            &msg,
+            &[("cd".repeat(32), "image/png".into(), "a.png".into(), 4)],
+        )
+        .await
+        .unwrap();
+        let rows = db.attachments_for_message(1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mime_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_rolls_back_message() {
+        let db = store();
+        db.upsert_model(&NewModel {
+            model_id: "m1".into(),
+            file_name: "m1.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 32,
+            weight_size_bytes: 1,
+            local_file_path: "/m1.gguf".into(),
+        })
+        .unwrap();
+        db.create_session("2", "s2", "m1").unwrap();
+        let msg = NewChatMessage {
+            session_id: "2".into(),
+            role: "user".into(),
+            content: MessageContent::Text("x".into()),
+            token_count: 0,
+            generation_time_sec: 0.0,
+        };
+        let res = db
+            .insert_message_with_attachments(
+                &msg,
+                &[("bad-hash".into(), "image/png".into(), "a.png".into(), 4)],
+            )
+            .await;
+        assert!(res.is_err());
+        assert!(db.list_messages("2").unwrap().is_empty());
     }
 }
