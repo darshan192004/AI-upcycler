@@ -5,7 +5,9 @@
 //! `docs/database.md` and is applied idempotently on open.
 
 use crate::api::backend::MessageContent;
+use crate::settings::AppSettings;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -25,6 +27,10 @@ pub enum StoreError {
     /// Image attachment metadata is malformed; the message was rolled back.
     #[error("invalid attachment")]
     InvalidAttachment,
+    #[error("invalid settings json: {0}")]
+    SettingsJson(#[from] serde_json::Error),
+    #[error("invalid setting: {0}")]
+    InvalidSettings(String),
 }
 
 /// Marker prefix for catalog rows that represent cloud-only models. Such rows
@@ -374,6 +380,33 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn rename_session(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<Option<ChatSessionRow>, StoreError> {
+        let changed = {
+            let conn = self.lock()?;
+            conn.execute(
+                "UPDATE chat_sessions SET title = ?1 WHERE session_id = ?2",
+                params![title, session_id],
+            )?
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_session(session_id)
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM chat_sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<ChatSessionRow>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -646,6 +679,82 @@ impl Store {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // --- settings -----------------------------------------------------------
+
+    pub fn get_settings(&self) -> Result<AppSettings, StoreError> {
+        // Missing rows fall back to the application defaults, not to the
+        // primitive `Default` values (0/false).
+        let defaults = AppSettings::default();
+        Ok(AppSettings {
+            provider: self.setting("provider")?.unwrap_or(defaults.provider),
+            model: self.setting("model")?.unwrap_or(defaults.model),
+            context_tokens: self
+                .setting("context_tokens")?
+                .unwrap_or(defaults.context_tokens),
+            max_tokens: self.setting("max_tokens")?.unwrap_or(defaults.max_tokens),
+            show_source_badges: self
+                .setting("show_source_badges")?
+                .unwrap_or(defaults.show_source_badges),
+            compact_mode: self
+                .setting("compact_mode")?
+                .unwrap_or(defaults.compact_mode),
+        })
+    }
+
+    pub fn put_settings(&self, settings: &AppSettings) -> Result<(), StoreError> {
+        settings
+            .validate()
+            .map_err(|message| StoreError::InvalidSettings(message.into()))?;
+        self.put_setting_json("provider", &settings.provider)?;
+        self.put_setting_json("model", &settings.model)?;
+        self.put_setting_json("context_tokens", &settings.context_tokens)?;
+        self.put_setting_json("max_tokens", &settings.max_tokens)?;
+        self.put_setting_json("show_source_badges", &settings.show_source_badges)?;
+        self.put_setting_json("compact_mode", &settings.compact_mode)?;
+        Ok(())
+    }
+
+    pub fn setting_json(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT value_json FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, StoreError> {
+        self.setting_json(key)?
+            .map(|text| serde_json::from_str(&text).map_err(StoreError::SettingsJson))
+            .transpose()
+    }
+
+    fn put_setting_json<T: Serialize>(&self, key: &str, value: &T) -> Result<(), StoreError> {
+        let text = serde_json::to_string(value).map_err(StoreError::SettingsJson)?;
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO settings (key, value_json, updated_at_epoch_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                 value_json = excluded.value_json,
+                 updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            params![key, text, now_epoch_ms()],
+        )?;
+        Ok(())
+    }
+}
+
+fn now_epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(0)
 }
 
 fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -920,5 +1029,116 @@ mod tests {
             .await;
         assert!(res.is_err());
         assert!(db.list_messages("2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_round_trip_uses_json_values() {
+        let store = store();
+        let settings = crate::settings::AppSettings {
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            context_tokens: 16_384,
+            max_tokens: 2_048,
+            show_source_badges: false,
+            compact_mode: true,
+        };
+
+        store.put_settings(&settings).unwrap();
+
+        assert_eq!(store.get_settings().unwrap(), settings);
+        assert_eq!(
+            store.setting_json("context_tokens").unwrap().unwrap(),
+            "16384"
+        );
+        assert_eq!(
+            store.setting_json("provider").unwrap().unwrap(),
+            "\"openai\""
+        );
+    }
+
+    #[test]
+    fn settings_default_when_table_is_empty() {
+        let store = store();
+        assert_eq!(
+            store.get_settings().unwrap(),
+            crate::settings::AppSettings::default()
+        );
+    }
+
+    #[test]
+    fn put_settings_rejects_invalid_values_before_writing() {
+        let store = store();
+        let invalid = crate::settings::AppSettings {
+            context_tokens: 512,
+            ..crate::settings::AppSettings::default()
+        };
+
+        let error = store.put_settings(&invalid).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid setting: context_tokens must be between 1024 and 65536"
+        );
+        assert_eq!(
+            store.get_settings().unwrap(),
+            crate::settings::AppSettings::default()
+        );
+    }
+
+    #[test]
+    fn session_rename_updates_title_and_returns_row() {
+        let store = store();
+        store
+            .upsert_model(&NewModel {
+                model_id: "llama-8b".into(),
+                file_name: "llama.gguf".into(),
+                quantization_format: "Q4_K_M".into(),
+                total_layers: 32,
+                weight_size_bytes: 1_024,
+                local_file_path: "D:\\ai-upcycler-target\\models\\llama.gguf".into(),
+            })
+            .unwrap();
+        store.create_session("s1", "Old title", "llama-8b").unwrap();
+
+        let renamed = store.rename_session("s1", "New title").unwrap().unwrap();
+
+        assert_eq!(renamed.title, "New title");
+        assert_eq!(store.get_session("s1").unwrap().unwrap().title, "New title");
+    }
+
+    #[test]
+    fn session_rename_missing_returns_none() {
+        let store = store();
+        assert!(store.rename_session("missing", "Title").unwrap().is_none());
+    }
+
+    #[test]
+    fn session_delete_cascades_messages() {
+        let store = store();
+        store
+            .upsert_model(&NewModel {
+                model_id: "llama-8b".into(),
+                file_name: "llama.gguf".into(),
+                quantization_format: "Q4_K_M".into(),
+                total_layers: 32,
+                weight_size_bytes: 1_024,
+                local_file_path: "D:\\ai-upcycler-target\\models\\llama.gguf".into(),
+            })
+            .unwrap();
+        store.create_session("s1", "Title", "llama-8b").unwrap();
+        store
+            .append_message(&NewChatMessage {
+                session_id: "s1".into(),
+                role: "user".into(),
+                content: MessageContent::Text("keep me out after delete".into()),
+                token_count: 3,
+                generation_time_sec: 0.1,
+            })
+            .unwrap();
+
+        assert!(store.delete_session("s1").unwrap());
+        assert!(store.get_session("s1").unwrap().is_none());
+        assert!(store.list_messages("s1").unwrap().is_empty());
+        assert!(!store.delete_session("s1").unwrap());
     }
 }

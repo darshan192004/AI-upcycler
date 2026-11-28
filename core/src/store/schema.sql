@@ -86,3 +86,10 @@ CREATE TABLE IF NOT EXISTS attachments (
   PRIMARY KEY (message_id, media_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(media_hash);
+
+-- Task 4 (sub-project D): persistent non-secret application settings.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY NOT NULL,
+    value_json TEXT NOT NULL,
+    updated_at_epoch_ms INTEGER NOT NULL
+);
