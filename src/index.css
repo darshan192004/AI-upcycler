@@ -331,3 +331,116 @@ body {
     transition: none !important;
   }
 }
+
+/* Task workflow surface — spec 2026-11-27 §12. Scoped so existing shells keep
+   their tokens; values are copied verbatim from the design system. */
+.workflow-view {
+  --wf-bg: #0F172A;
+  --wf-card: #1B2336;
+  --wf-border: #475569;
+  --wf-muted: #94A3B8;
+  --wf-accent: #22C55E;
+  --wf-danger: #EF4444;
+  --wf-danger-text: #FCA5A5;
+  background: var(--wf-bg);
+  color: #F8FAFC;
+  border-radius: 0.75rem;
+  padding: 1rem;
+}
+
+.wf-header,
+.wf-actions,
+.wf-step-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+
+.wf-header {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.wf-grow { flex: 1 1 16rem; }
+
+.wf-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+  color: var(--wf-muted);
+}
+
+.wf-field input,
+.wf-field select {
+  background: var(--wf-card);
+  color: #F8FAFC;
+  border: 1px solid var(--wf-border);
+  border-radius: 0.375rem;
+  min-height: 2.75rem;
+  padding: 0.4rem 0.6rem;
+  font: inherit;
+}
+
+.wf-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.75rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--wf-border);
+  border-radius: 0.375rem;
+  background: var(--wf-card);
+  color: #F8FAFC;
+  cursor: pointer;
+  transition: background-color 200ms ease, border-color 200ms ease;
+}
+
+.wf-button:hover { border-color: var(--wf-accent); }
+.wf-button:active { background: #24304A; }
+.wf-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.wf-primary { border-color: var(--wf-accent); }
+.wf-danger { color: var(--wf-danger-text); border-color: var(--wf-danger); }
+
+.wf-step-list,
+.wf-run-list,
+.wf-timeline-list {
+  list-style: none;
+  margin: 0.75rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.wf-step-editor,
+.wf-timeline-step {
+  background: var(--wf-card);
+  border: 1px solid var(--wf-border);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+}
+
+.wf-step-id { font-family: var(--font-mono); color: var(--wf-muted); }
+
+.wf-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 600;
+}
+
+.wf-status-icon { width: 1rem; height: 1rem; }
+.wf-status-running { color: var(--wf-accent); }
+.wf-status-failed,
+.wf-status-blocked { color: var(--wf-danger-text); }
+.wf-muted { color: var(--wf-muted); }
+.wf-hint { color: var(--wf-muted); font-size: 0.875rem; }
+.wf-output { white-space: pre-wrap; overflow-wrap: anywhere; }
+.wf-error { color: var(--wf-danger-text); }
+
+.wf-run[aria-current='true'] { border-color: var(--wf-accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-button { transition: none; }
+}
