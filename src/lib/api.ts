@@ -6,6 +6,9 @@ import type {
   ChatSession,
   CreateWorkflowResponse,
   DownloadRequest,
+  GenerateImageRequest,
+  ImageListResponse,
+  ImageMetadata,
   MediaRef,
   ModelList,
   ProvisionState,
@@ -295,4 +298,24 @@ export function listWorkflows(): Promise<WorkflowListResponse> {
 
 export function getWorkflow(runId: string): Promise<WorkflowRunDetail> {
   return request<WorkflowRunDetail>(`/api/workflows/${encodeURIComponent(runId)}`);
+}
+
+export function generateImage(req: GenerateImageRequest): Promise<ImageMetadata> {
+  return request<ImageMetadata>('/api/images/generate', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
+export function listImages(limit = 60, offset = 0): Promise<ImageListResponse> {
+  const query = `limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`;
+  return request<ImageListResponse>(`/api/images?${query}`);
+}
+
+export function getImageMetadata(id: string): Promise<ImageMetadata> {
+  return request<ImageMetadata>(`/api/images/${encodeURIComponent(id)}/metadata`);
+}
+
+export function imageUrl(id: string): string {
+  return `${API_BASE}/api/images/${encodeURIComponent(id)}`;
 }

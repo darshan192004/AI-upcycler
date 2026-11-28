@@ -371,3 +371,29 @@ export interface CreateWorkflowResponse {
 export interface WorkflowListResponse {
   runs: WorkflowRunRow[];
 }
+
+export type ImageProvider = 'openai' | 'gemini' | 'local';
+export type ImageSize = 'square1024' | 'portrait1024x1536' | 'landscape1536x1024';
+
+export interface GenerateImageRequest {
+  prompt: string;
+  provider: ImageProvider;
+  size: ImageSize;
+}
+
+export interface ImageMetadata {
+  image_id: string;
+  provider: string;
+  model: string;
+  prompt: string;
+  media_sha256: string;
+  media_path: string;
+  mime_type: string;
+  byte_len: number;
+  size: string;
+  created_at_epoch_ms: number;
+}
+
+export interface ImageListResponse {
+  images: ImageMetadata[];
+}
