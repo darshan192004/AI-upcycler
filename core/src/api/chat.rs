@@ -11,17 +11,21 @@ use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::backend::{
-    ChatMessage, FunctionCall, GenerationRequest, Stop, ToolCall, ToolCallDelta, ToolDef,
+    ChatMessage, FunctionCall, GenerationChunk, GenerationRequest, Stop, ToolCall, ToolCallDelta,
+    ToolDef,
 };
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::discovery::mdns::NodeRegistry;
-use crate::store::{NewChatMessage, Store};
+use crate::providers::CloudRoute;
+use crate::routing::RoutePolicy;
+use crate::store::{NewChatMessage, Store, StoreError, VIRTUAL_MODEL_PATH_PREFIX};
 use crate::telemetry::{
     now_epoch_secs, GenerationMetrics, TelemetryBus, TelemetryEvent, WorkerTelemetry,
 };
@@ -51,6 +55,16 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Where to run the turn: `auto` (default), `local`, or a cloud provider
+    /// id. A `provider:model` id is inferred only when this field is absent.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl ChatCompletionRequest {
+    fn wants_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+    }
 }
 
 fn default_temperature() -> f32 {
@@ -92,26 +106,94 @@ pub async fn chat_completions(
     if request.messages.is_empty() {
         return Err(ApiError::BadRequest("messages must not be empty".into()));
     }
-    let model = state
-        .store
-        .get_model(&request.model)?
-        .ok_or_else(|| ApiError::NotFound(format!("model '{}'", request.model)))?;
 
-    // Agent requests are host-only in phase 1 (spec D-A2). Refuse before the
+    let policy = RoutePolicy::parse(request.provider.as_deref()).map_err(ApiError::BadRequest)?;
+    let resolved = state
+        .providers
+        .resolve(&request.model, request.provider.as_deref())
+        .map_err(ApiError::BadRequest)?;
+
+    // Agent requests are host-only in phase 1 (spec D-A2). Cloud providers
+    // have no tool renderer in this phase; refuse both cases before the
     // session or user turn is persisted, so a rejected request leaves no
     // half-written conversation behind.
-    if request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        && !state.backend.tool_calling_available()
-    {
-        return Err(ApiError::BadRequest(
-            "tool calls require a local host engine (llama-server); \
-             the distributed route cannot call tools"
-                .into(),
-        ));
+    if request.wants_tools() {
+        if matches!(policy, RoutePolicy::Cloud(_)) {
+            return Err(ApiError::BadRequest(
+                "tool calls require a local host engine (llama-server); \
+                 cloud providers cannot call tools in this phase"
+                    .into(),
+            ));
+        }
+        if !state.backend.tool_calling_available() {
+            return Err(ApiError::BadRequest(
+                "tool calls require a local host engine (llama-server); \
+                 the distributed route cannot call tools"
+                    .into(),
+            ));
+        }
     }
+
+    let cloud = match (policy, resolved) {
+        (RoutePolicy::Cloud(id), Some(route)) if route.provider == id => {
+            require_cloud_credentials(&state, &route)?;
+            Some(route)
+        }
+        (RoutePolicy::Cloud(id), None) => {
+            return Err(ApiError::BadRequest(format!(
+                "model '{}' is not available for provider '{}'",
+                request.model,
+                id.as_str()
+            )));
+        }
+        (RoutePolicy::Cloud(id), Some(_)) => {
+            return Err(ApiError::BadRequest(format!(
+                "model '{}' does not belong to provider '{}'",
+                request.model,
+                id.as_str()
+            )));
+        }
+        (RoutePolicy::Local, _) => None,
+        (RoutePolicy::Auto, Some(route)) if !state.backend.is_real() => {
+            require_cloud_credentials(&state, &route)?;
+            Some(route)
+        }
+        (RoutePolicy::Auto, None) if !state.backend.is_real() => {
+            return Err(ApiError::BadRequest(format!(
+                "no local engine is loaded and no cloud route is configured for model '{}'; \
+                 set provider to 'local' to use the offline stub, or configure a cloud provider",
+                request.model
+            )));
+        }
+        (RoutePolicy::Auto, _) => None,
+    };
+
+    // The session keeps the caller's id so history shows what they asked for.
+    // The envelope and adapter use a canonical `provider:model` id for cloud
+    // turns; adapters strip that prefix themselves before contacting the API.
+    let model_id = match &cloud {
+        Some(route) => {
+            reject_local_model_collision(&state, &request, route)?;
+            let canonical = format!("{}:{}", route.provider.as_str(), route.model);
+            for id in [request.model.as_str(), canonical.as_str()] {
+                state
+                    .store
+                    .ensure_virtual_model(id, route.provider.as_str())
+                    .map_err(|error| match error {
+                        StoreError::Conflict(message) => ApiError::Conflict(message),
+                        other => other.into(),
+                    })?;
+            }
+            canonical
+        }
+        None => {
+            state
+                .store
+                .get_model(&request.model)?
+                .ok_or_else(|| ApiError::NotFound(format!("model '{}'", request.model)))?
+                .model_id
+        }
+    };
 
     let session_id = resolve_session(&state, &request)?;
     if let Some(user) = request.messages.iter().rev().find(|m| m.role == "user") {
@@ -125,7 +207,7 @@ pub async fn chat_completions(
     }
 
     let generation = GenerationRequest {
-        model: model.model_id.clone(),
+        model: model_id,
         messages: request.messages.clone(),
         temperature: request.temperature,
         max_tokens: request.max_tokens,
@@ -136,23 +218,65 @@ pub async fn chat_completions(
         top_p: request.top_p,
         seed: request.seed,
     };
+    let stream: BoxStream<'static, Result<GenerationChunk, String>> = match &cloud {
+        Some(route) => state.providers.stream(route, generation.clone()),
+        None => state.backend.generate(generation.clone()),
+    };
 
     if request.stream {
-        Ok(stream_response(state, session_id, generation).into_response())
+        Ok(stream_response(state, session_id, generation.model.clone(), stream).into_response())
     } else {
-        Ok(buffered_response(state, session_id, generation)
+        Ok(buffered_response(state, session_id, generation, stream)
             .await?
             .into_response())
     }
+}
+
+fn require_cloud_credentials(state: &AppState, route: &CloudRoute) -> ApiResult<()> {
+    let configured = state
+        .providers
+        .statuses()
+        .iter()
+        .any(|status| status.id == route.provider && status.configured);
+    if configured {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "{} is not configured; save its API key in Settings before using it",
+            route.provider.as_str()
+        )))
+    }
+}
+
+/// A caller that explicitly asks a cloud provider for an existing local model
+/// id would otherwise silently replay a fake "cloud" turn over that GGUF.
+fn reject_local_model_collision(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    route: &CloudRoute,
+) -> ApiResult<()> {
+    if let Some(existing) = state.store.get_model(&request.model)? {
+        if !existing
+            .local_file_path
+            .starts_with(VIRTUAL_MODEL_PATH_PREFIX)
+        {
+            return Err(ApiError::Conflict(format!(
+                "model '{}' is a local model for provider '{}'",
+                request.model,
+                route.provider.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn buffered_response(
     state: AppState,
     session_id: String,
     generation: GenerationRequest,
+    mut stream: BoxStream<'static, Result<GenerationChunk, String>>,
 ) -> ApiResult<Json<ChatCompletionResponse>> {
     let started = Instant::now();
-    let mut stream = state.backend.generate(generation.clone());
 
     let mut content = String::new();
     let mut completion_tokens: u64 = 0;
@@ -243,10 +367,10 @@ async fn buffered_response(
 fn stream_response(
     state: AppState,
     session_id: String,
-    generation: GenerationRequest,
+    model: String,
+    mut backend: BoxStream<'static, Result<GenerationChunk, String>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let id = chatcmpl_id();
-    let model = generation.model.clone();
     let store = state.store.clone();
     let telemetry = state.telemetry.clone();
     let registry = state.registry.clone();
@@ -262,7 +386,6 @@ fn stream_response(
         let mut saw_tool_calls = false;
         let mut tool_indices: HashSet<u32> = HashSet::new();
         let mut source: Option<String> = None;
-        let mut backend = state.backend.generate(generation.clone());
         while let Some(item) = backend.next().await {
             match item {
                 Ok(chunk) => {
@@ -485,7 +608,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::backend::FunctionCallDelta;
+    use crate::api::backend::{FunctionCallDelta, GenerationBackend};
     use crate::discovery::mdns::DiscoveredNode;
     use crate::store::{NewModel, Store};
     use std::sync::Arc;
@@ -524,6 +647,7 @@ mod tests {
             max_tokens: 64,
             stream,
             session_id: Some("s1".into()),
+            provider: Some("local".into()),
             tools: None,
             tool_choice: None,
             stop: None,
@@ -714,9 +838,11 @@ mod tests {
             session_id: session_id.clone(),
             ..Default::default()
         };
-        let Json(response) = buffered_response(state.clone(), session_id.clone(), generation)
-            .await
-            .unwrap();
+        let stream = state.backend.generate(generation.clone());
+        let Json(response) =
+            buffered_response(state.clone(), session_id.clone(), generation, stream)
+                .await
+                .unwrap();
 
         assert_eq!(response.choices[0].finish_reason, "stop");
         assert!(response.choices[0]
