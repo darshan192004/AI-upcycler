@@ -36,9 +36,8 @@ const OPENAI_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-const OPENAI_UNTERMINATED_SSE: &str = concat!(
-    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
-);
+const OPENAI_UNTERMINATED_SSE: &str =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n";
 
 const KIMI_SSE: &str = concat!(
     "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
