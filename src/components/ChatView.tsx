@@ -10,8 +10,20 @@ import {
   Smartphone,
   Square,
 } from 'lucide-react';
-import { listSessionMessages, listSessions, streamChat } from '../lib/api';
-import type { ChatMessage, ChatSession, ProviderStatus } from '../lib/types';
+import {
+  getMultimodalEnabled,
+  listSessionMessages,
+  listSessions,
+  streamChat,
+  uploadImage,
+} from '../lib/api';
+import type {
+  ChatContent,
+  ChatMessage,
+  ChatSession,
+  MediaRef,
+  ProviderStatus,
+} from '../lib/types';
 import { useClusterStore } from '../store/cluster';
 
 type ProviderChoice = '' | 'local' | ProviderStatus['id'];
@@ -43,6 +55,14 @@ function describeSource(
     : { label: 'Source unknown', kind: 'unknown' };
 }
 
+/** Older session rows hold plain text; image parts get a readable label. */
+function contentToText(content: ChatContent): string {
+  if (typeof content === 'string') return content;
+  return content
+    .map((part) => (part.type === 'text' ? part.text : `[image: ${part.file_name}]`))
+    .join('\n');
+}
+
 export function ChatView() {
   const models = useClusterStore((s) => s.models);
   const providers = useClusterStore((s) => s.providers);
@@ -59,11 +79,15 @@ export function ChatView() {
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<MediaRef[]>([]);
+  const [multimodalEnabled, setMultimodalEnabled] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
 
   const localSeqRef = useRef(0);
   const firstTurnRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const reduceMotion = useReducedMotion();
 
   const loadSessions = useCallback(async () => {
@@ -83,6 +107,16 @@ export function ChatView() {
     void refreshProviders();
     void loadSessions();
   }, [refreshProviders, loadSessions]);
+
+  useEffect(() => {
+    let live = true;
+    void getMultimodalEnabled().then((enabled) => {
+      if (live) setMultimodalEnabled(enabled);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const modelOptions = useMemo(() => {
     const options: { id: string }[] = models.map((m) => ({ id: m.id }));
@@ -131,8 +165,11 @@ export function ChatView() {
   }, [messages, reduceMotion]);
 
   const canSend = useMemo(
-    () => draft.trim().length > 0 && !busy && selectedModel.length > 0,
-    [draft, busy, selectedModel],
+    () =>
+      (draft.trim().length > 0 || attachments.length > 0) &&
+      !busy &&
+      selectedModel.length > 0,
+    [draft, attachments.length, busy, selectedModel],
   );
 
   function nextLocalId(): string {
@@ -175,12 +212,35 @@ export function ChatView() {
     }
   }
 
+  async function attachFile(file: File | undefined) {
+    if (!file) return;
+    setAttachmentError(null);
+    try {
+      const ref = await uploadImage(file);
+      setAttachments((xs) => [...xs, ref]);
+    } catch {
+      setAttachmentError('Invalid image attachment');
+    }
+  }
+
   async function send(text: string) {
     const prompt = text.trim();
-    if (!prompt || busy || !selectedModel) return;
+    if ((!prompt && attachments.length === 0) || busy || !selectedModel) return;
+
+    // Zero attachments keeps the historical string payload; otherwise the
+    // message becomes a part array matching the host's MessageContent union.
+    const outgoing: ChatContent =
+      attachments.length === 0
+        ? prompt
+        : [
+            { type: 'text', text: prompt },
+            ...attachments.map((a) => ({ type: 'image' as const, ...a })),
+          ];
 
     setError(null);
     setDraft('');
+    setAttachments([]);
+    setAttachmentError(null);
     const userMsg: DisplayMessage = { id: nextLocalId(), role: 'user', content: prompt };
     const assistantId = nextLocalId();
     setMessages((prev) => [
@@ -190,10 +250,11 @@ export function ChatView() {
     ]);
     setBusy(true);
 
-    const history: ChatMessage[] = [...messages, userMsg].map(({ role, content }) => ({
-      role,
-      content,
-    }));
+    const userWire: ChatMessage = { role: 'user', content: outgoing };
+    const history: ChatMessage[] = [
+      ...messages.map(({ role, content }) => ({ role, content })),
+      userWire,
+    ];
     const request = {
       model: selectedModel,
       messages: history,
@@ -395,7 +456,7 @@ export function ChatView() {
               >
                 {m.role === 'assistant' ? (
                   <div className="markdown-body">
-                    <ReactMarkdown>{m.content}</ReactMarkdown>
+                    <ReactMarkdown>{contentToText(m.content)}</ReactMarkdown>
                     {busy && m === messages[messages.length - 1] && (
                       <span
                         className="ml-0.5 inline-block h-4 w-2 translate-y-0.5 animate-blink-caret bg-emerald-400"
@@ -404,7 +465,7 @@ export function ChatView() {
                     )}
                   </div>
                 ) : (
-                  <div className="whitespace-pre-wrap">{m.content}</div>
+                  <div className="whitespace-pre-wrap">{contentToText(m.content)}</div>
                 )}
               </div>
             </motion.div>
@@ -414,6 +475,89 @@ export function ChatView() {
       </div>
 
       <div className="border-t border-white/8 px-5 py-4">
+        <style>{`
+          .attachment-chip-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            list-style: none;
+            margin: 0 0 0.75rem;
+            padding: 0;
+          }
+          .attachment-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            border-radius: 0.5rem;
+            padding: 0.35rem 0.6rem;
+            font-size: 0.75rem;
+            transition: background 200ms ease;
+          }
+          .attachment-chip button {
+            border: 1px solid #475569;
+            border-radius: 0.375rem;
+            background: transparent;
+            color: #94A3B8;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0 0.35rem;
+            transition: background 200ms ease, color 200ms ease;
+          }
+          .attachment-chip button:hover {
+            background: #EF4444;
+            color: #F8FAFC;
+          }
+          @media (prefers-reduced-motion: reduce) {
+            .attachment-chip,
+            .attachment-chip button { transition: none; }
+          }
+        `}</style>
+        {multimodalEnabled && (
+          <label className="chat-field mb-3">
+            <span>Attach image</span>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              aria-label="Attach image"
+              onChange={(e) => {
+                void attachFile(e.target.files?.[0]);
+                e.target.value = '';
+              }}
+            />
+          </label>
+        )}
+        {attachmentError && (
+          <p role="alert" className="mb-2 text-xs text-red-300">
+            {attachmentError}
+          </p>
+        )}
+        {attachments.length > 0 && (
+          <ul aria-label="Image attachments" className="attachment-chip-list">
+            {attachments.map((a) => (
+              <li
+                key={a.media_hash}
+                className="attachment-chip"
+                style={{
+                  background: '#1B2336',
+                  border: '1px solid #475569',
+                  color: '#94A3B8',
+                }}
+              >
+                <span>{a.file_name} · {a.mime_type} · {a.byte_count} B</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${a.file_name}`}
+                  onClick={() =>
+                    setAttachments((xs) => xs.filter((x) => x.media_hash !== a.media_hash))
+                  }
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="flex items-end gap-2.5">
           <textarea
             value={draft}

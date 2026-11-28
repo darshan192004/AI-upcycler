@@ -152,9 +152,31 @@ export type TelemetryEvent =
       error: string | null;
     } };
 
+/** One part of a multimodal chat message (sub-project C). */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image';
+      media_hash: string;
+      mime_type: string;
+      file_name: string;
+      byte_count: number;
+    };
+
+/** Wire content: a plain string for text-only turns, parts otherwise. */
+export type ChatContent = string | ContentPart[];
+
+/** The reference returned by `POST /api/media` for one stored image. */
+export interface MediaRef {
+  media_hash: string;
+  mime_type: string;
+  file_name: string;
+  byte_count: number;
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: ChatContent;
 }
 
 export interface ChatRequest {

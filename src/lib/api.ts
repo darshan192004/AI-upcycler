@@ -4,6 +4,7 @@ import type {
   ChatRequest,
   CreateWorkflowResponse,
   DownloadRequest,
+  MediaRef,
   ModelList,
   ProvisionState,
   ProviderList,
@@ -108,6 +109,43 @@ export async function streamChat(
     }
   }
   onDone();
+}
+
+// ---- multimodal chat gate and media uploads (sub-project C) ---------------
+
+/**
+ * The gate lives on the host; the client must fail closed when it cannot be
+ * read. An optional config endpoint supplies it; Tauri may instead inject the
+ * same flag into the page before React mounts.
+ */
+export async function getMultimodalEnabled(): Promise<boolean> {
+  const injected = (window as Window & { __AI_UPCYCLER_MULTIMODAL__?: boolean })
+    .__AI_UPCYCLER_MULTIMODAL__;
+  if (typeof injected === 'boolean') return injected;
+  try {
+    const config = await request<{
+      multimodal_enabled?: boolean;
+      multimodal?: boolean;
+    }>('/api/config');
+    return config.multimodal_enabled === true || config.multimodal === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Uploads one image and returns the media reference used in chat parts. */
+export async function uploadImage(file: File): Promise<MediaRef> {
+  const form = new FormData();
+  form.append('file', file);
+  const resp = await fetch(`${API_BASE}/api/media`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!resp.ok) {
+    const body = (await resp.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? 'invalid_image_attachment');
+  }
+  return (await resp.json()) as MediaRef;
 }
 
 // ---- device onboarding (spec 2026-11-03, slice A) --------------------------
