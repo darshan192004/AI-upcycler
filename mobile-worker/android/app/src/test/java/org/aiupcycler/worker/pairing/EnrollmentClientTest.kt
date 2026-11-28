@@ -1,6 +1,7 @@
 package org.aiupcycler.worker.pairing
 
 import java.io.File
+import org.aiupcycler.worker.chat.secrets.MemorySecretStore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -19,20 +20,19 @@ import org.junit.rules.TemporaryFolder
  * transport rule this client enforces itself - a mocked connection would not
  * exercise it.
  *
- * The success body is the committed golden `enroll_response.json`, which the
- * Rust `pairing_fixtures` example serialized from the endpoint's own
- * `EnrollResponse` type, so this suite fails if the parser and the master's
- * real JSON encoding ever disagree. Error replies use the API's own envelope
- * shape (`api/error.rs`).
+ * The success body starts from the committed golden `enroll_response.json`
+ * serialized by the Rust `pairing_fixtures` example. Task 3 extends that
+ * response with the LAN fields, so the helper here appends synthetic values
+ * (the host fixture is owned by another task); the parser and the master's
+ * real JSON encoding must still agree. Error replies use the API's own
+ * envelope shape (`api/error.rs`).
  */
 class EnrollmentClientTest {
 
     @get:Rule
     val temporary = TemporaryFolder()
 
-    private val golden: String by lazy {
-        File(FIXTURE_DIR, "enroll_response.json").readText()
-    }
+    private val golden: String by lazy { goldenWithTask3Fields() }
 
     /** The fingerprint the golden response was issued with. */
     private val goldenFingerprint: String
@@ -105,6 +105,58 @@ class EnrollmentClientTest {
             assertEquals(1, capturedRequests.size)
             assertEquals("POST", capturedRequests.single().method)
             assertEquals("/api/pairing/enroll", capturedRequests.single().path)
+        }
+    }
+
+    @Test
+    fun parsesTheLanTokenPortAndNodeId() {
+        val server = server(200, golden)
+        server.use {
+            val credentials = (EnrollmentClient().enroll(request(server, goldenFingerprint))
+                as EnrollmentResult.Enrolled).credentials
+
+            assertEquals(TASK3_TOKEN, credentials.lanToken)
+            assertEquals(TASK3_PORT, credentials.lanPort)
+            assertEquals(TASK3_NODE_ID, credentials.nodeId)
+        }
+    }
+
+    @Test
+    fun rejectsAResponseMissingLanToken() {
+        val server = server(200, goldenWithTask3Fields(setOf("lan_token")), errorEnvelope = false)
+        server.use {
+            val result = EnrollmentClient().enroll(request(server, goldenFingerprint))
+
+            assertEquals(
+                EnrollmentResult.Failed("Master response is missing lan_token"),
+                result,
+            )
+        }
+    }
+
+    @Test
+    fun rejectsAResponseMissingLanPort() {
+        val server = server(200, goldenWithTask3Fields(setOf("lan_port")), errorEnvelope = false)
+        server.use {
+            val result = EnrollmentClient().enroll(request(server, goldenFingerprint))
+
+            assertEquals(
+                EnrollmentResult.Failed("Master response is missing lan_port"),
+                result,
+            )
+        }
+    }
+
+    @Test
+    fun rejectsAResponseMissingNodeId() {
+        val server = server(200, goldenWithTask3Fields(setOf("node_id")), errorEnvelope = false)
+        server.use {
+            val result = EnrollmentClient().enroll(request(server, goldenFingerprint))
+
+            assertEquals(
+                EnrollmentResult.Failed("Master response is missing node_id"),
+                result,
+            )
         }
     }
 
@@ -186,7 +238,7 @@ class EnrollmentClientTest {
     }
 
     @Test
-    fun refusesPlainHttpToALanAddress() {
+    fun refusesPlainHttpToALanAddressWithTheExactTransportMessage() {
         // The enroll response carries fresh private keys; over plaintext to a
         // LAN host they would cross the network in the clear.
         val result = EnrollmentClient().enroll(
@@ -198,7 +250,11 @@ class EnrollmentClientTest {
                 nodeId = "Pixel 8._aiupcycler-worker._tcp.local.",
             ),
         )
-        assertTrue((result as EnrollmentResult.Failed).reason.contains("Plain HTTP is only allowed"))
+        assertEquals(
+            "Plain HTTP is only allowed over the ADB loopback tunnel; " +
+                "use the master's https address",
+            (result as EnrollmentResult.Failed).reason,
+        )
     }
 
     @Test
@@ -331,7 +387,7 @@ class EnrollmentClientTest {
         // The store is only ever written on `Enrolled` (spec D-B3); a failed
         // attempt must leave it untouched, including after a *successful* HTTP
         // round trip whose fingerprint did not match the user's code.
-        val store = CredentialStore(temporary.newFolder("pairing"))
+        val store = CredentialStore(temporary.newFolder("pairing"), MemorySecretStore())
 
         val mismatched = server(200, golden)
         mismatched.use {
@@ -369,7 +425,29 @@ class EnrollmentClientTest {
         )
     }
 
+    /**
+     * The committed fixture predates task 3, so add the fields the master's
+     * `EnrollResponse` now serializes. `lan_port` stays numeric, matching the
+     * Rust `u16` field rather than a quoted string.
+     */
+    private fun goldenWithTask3Fields(excluded: Set<String> = emptySet()): String {
+        val raw = File(FIXTURE_DIR, "enroll_response.json").readText()
+        val close = raw.lastIndexOf('}')
+        check(close >= 0) { "golden fixture is not a JSON object" }
+        val prefix = raw.substring(0, close).trimEnd().trimEnd(',')
+        val appended = listOfNotNull(
+            if ("lan_token" !in excluded) "\"lan_token\": \"$TASK3_TOKEN\"" else null,
+            if ("lan_port" !in excluded) "\"lan_port\": $TASK3_PORT" else null,
+            if ("node_id" !in excluded) "\"node_id\": \"$TASK3_NODE_ID\"" else null,
+        )
+        return "$prefix${if (appended.isEmpty()) "" else ","}\n  " +
+            appended.joinToString(",\n  ") + "\n}"
+    }
+
     private companion object {
         val FIXTURE_DIR = File("src/test/resources/pairing")
+        const val TASK3_TOKEN = "token-test-lan"
+        const val TASK3_PORT = 8090
+        const val TASK3_NODE_ID = "node-test-1"
     }
 }

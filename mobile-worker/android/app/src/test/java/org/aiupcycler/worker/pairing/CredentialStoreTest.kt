@@ -1,7 +1,8 @@
 package org.aiupcycler.worker.pairing
 
 import java.io.File
-import java.nio.file.Files
+import org.aiupcycler.worker.chat.secrets.MemorySecretStore
+import org.aiupcycler.worker.chat.secrets.SecretStore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -15,13 +16,18 @@ import org.junit.rules.TemporaryFolder
  * Credential persistence (spec D-B4): a complete set lands only when every file
  * is written, a failure leaves no partial pairing behind, and forgetting
  * returns the worker to plaintext-ADB-only service.
+ *
+ * The LAN bearer token is *not* a credential file: it goes to the injected
+ * [SecretStore], while only the non-secret node id and port are persisted as
+ * files (plan task 7).
  */
 class CredentialStoreTest {
 
     @get:Rule
     val temporary = TemporaryFolder()
 
-    private fun store(): CredentialStore = CredentialStore(temporary.newFolder("pairing"))
+    private fun store(secrets: SecretStore = MemorySecretStore()): CredentialStore =
+        CredentialStore(temporary.newFolder("pairing"), secrets)
 
     private fun credentials(fingerprint: String = "ab".repeat(32)) = WorkerCredentials(
         caPem = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n",
@@ -30,6 +36,9 @@ class CredentialStoreTest {
         clientCertPem = "-----BEGIN CERTIFICATE-----\nCLIENT\n-----END CERTIFICATE-----\n",
         clientKeyPem = "-----BEGIN PRIVATE KEY-----\nCLIENTKEY\n-----END PRIVATE KEY-----\n",
         fingerprint = fingerprint,
+        nodeId = NODE_ID,
+        lanToken = LAN_TOKEN,
+        lanPort = LAN_PORT,
     )
 
     @Test
@@ -51,6 +60,36 @@ class CredentialStoreTest {
     }
 
     @Test
+    fun roundTripsNodeIdAndLanPortButKeepsTheTokenOutOfFiles() {
+        val secrets = MemorySecretStore()
+        val directory = temporary.newFolder("pairing")
+        val store = CredentialStore(directory, secrets)
+        val written = credentials()
+
+        store.save(written)
+
+        val loaded = store.load()!!
+        assertEquals(NODE_ID, loaded.nodeId)
+        assertEquals(LAN_PORT, loaded.lanPort)
+        assertEquals(written.lanToken, loaded.lanToken)
+        assertEquals(LAN_TOKEN, secrets.read(SecretStore.LAN_TOKEN_KEY))
+        assertFalse(File(directory, "lan_token.txt").exists())
+        directory.walkTopDown().filter { it.isFile }.forEach { file ->
+            assertFalse(
+                "no plaintext file may hold the LAN token: ${file.name}",
+                file.readText().contains(LAN_TOKEN),
+            )
+        }
+    }
+
+    @Test
+    fun fileSetHasTwoMoreEntriesButNoTokenFile() {
+        assertTrue("node_id.txt" in CredentialStore.FILES)
+        assertTrue("lan_port.txt" in CredentialStore.FILES)
+        assertFalse(CredentialStore.FILES.any { it.contains("token") })
+    }
+
+    @Test
     fun rePairingReplacesThePreviousSet() {
         val store = store()
         store.save(credentials("11".repeat(32)))
@@ -61,23 +100,36 @@ class CredentialStoreTest {
         assertEquals(replacement.fingerprint, store.load()!!.fingerprint)
         // No stale file survives the replacement.
         assertEquals(
-            6,
-            store.load()!!.let { listOf(it.caPem, it.serverCertPem, it.serverKeyPem, it.clientCertPem, it.clientKeyPem, it.fingerprint) }
-                .count { it.isNotBlank() },
+            8,
+            store.load()!!.let {
+                listOf(
+                    it.caPem, it.serverCertPem, it.serverKeyPem,
+                    it.clientCertPem, it.clientKeyPem, it.fingerprint,
+                    it.nodeId, it.lanPort.toString(),
+                )
+            }.count { it.isNotBlank() },
         )
     }
 
     @Test
-    fun forgettingRemovesEveryFile() {
+    fun forgettingRemovesEveryFileAndEverySecret() {
         val directory = temporary.newFolder("pairing")
-        val store = CredentialStore(directory)
+        val secrets = MemorySecretStore()
+        val store = CredentialStore(directory, secrets)
         store.save(credentials())
+        SecretStore.PROVIDERS.forEach { provider ->
+            secrets.write(SecretStore.keyFor(provider), "sk-test-$provider")
+        }
 
         store.clear()
 
         assertFalse(store.hasCredentials())
         assertNull(store.load())
         assertFalse(directory.exists())
+        assertNull(secrets.read(SecretStore.LAN_TOKEN_KEY))
+        SecretStore.PROVIDERS.forEach { provider ->
+            assertNull(secrets.read(SecretStore.keyFor(provider)))
+        }
     }
 
     @Test
@@ -107,6 +159,8 @@ class CredentialStoreTest {
                 "client-cert.pem",
                 "client-key.pem",
                 "fingerprint.txt",
+                "node_id.txt",
+                "lan_port.txt",
             ),
             directory.list()!!.toSet(),
         )
@@ -122,7 +176,7 @@ class CredentialStoreTest {
         store.save(credentials("33".repeat(32)))
 
         assertNotNull(CredentialStore(File(root, "pairing")).load())
-        assertTrue(Files.isDirectory(File(root, "pairing").toPath()))
+        assertTrue(File(root, "pairing").isDirectory)
     }
 
     @Test
@@ -140,23 +194,25 @@ class CredentialStoreTest {
         // and copyTo fails too (it refuses a directory target).
         val blocked = File(directory, "ca.pem")
         assertTrue(blocked.delete())
-        assertTrue(File(blocked, "child").apply { parentFile.mkdirs() }.writeText("x") == Unit)
+        assertTrue(blocked.mkdirs())
+        assertTrue(File(blocked, "child").writeText("x") == Unit)
 
         val failure = runCatching { store.save(credentials("55".repeat(32))) }
         assertTrue("save must fail rather than silently succeed", failure.isFailure)
 
-        // Crucially, the other five files were not deleted first: the old
+        // Crucially, the other files were not deleted first: the old
         // pairing's material is still on disk, so a re-parse of the CA would
         // not find an empty directory. Before this fix the loop deleted all
-        // six files up front and this state was impossible to reach.
+        // files up front and this state was impossible to reach.
         assertTrue(File(directory, "client-cert.pem").isFile)
         assertTrue(File(directory, "server-key.pem").isFile)
         assertTrue(File(directory, "fingerprint.txt").isFile)
+        assertTrue(File(directory, "node_id.txt").isFile)
     }
 
     @Test
     fun publicationOverwritesRatherThanDeletingFirst() {
-        // Regression: the previous implementation deleted all six files before
+        // Regression: the previous implementation deleted all files before
         // moving the new ones in, so a failure in between left the worker with
         // no credentials at all. Renaming onto an existing file must replace
         // it, and the old pairing must survive until each file is replaced.
@@ -174,8 +230,15 @@ class CredentialStoreTest {
             setOf(
                 "ca.pem", "server-cert.pem", "server-key.pem",
                 "client-cert.pem", "client-key.pem", "fingerprint.txt",
+                "node_id.txt", "lan_port.txt",
             ),
             directory.list()!!.toSet(),
         )
+    }
+
+    private companion object {
+        const val NODE_ID = "node-test-1"
+        const val LAN_TOKEN = "token-test-lan"
+        const val LAN_PORT = 8090
     }
 }
