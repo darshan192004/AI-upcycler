@@ -1,6 +1,9 @@
 use ai_upcycler_core::api::backend::StubBackend;
 use ai_upcycler_core::providers::ProviderRegistry;
 use ai_upcycler_core::secrets::UnconfiguredSecretStore;
+use ai_upcycler_core::telemetry::{
+    TelemetryBus, TelemetryEvent, WorkflowStepCompletedData, WorkflowStepStartedData,
+};
 use ai_upcycler_core::workflows::{
     execute, validate_steps, EventSink, ExecutionResult, RouterBackend, StepFuture, StepOutput,
     StepRecord, StepRunner, StepStatus, WorkflowEvent, WorkflowStep,
@@ -305,4 +308,60 @@ async fn router_backend_rejects_an_unknown_provider_before_generating() {
     let error = backend.run(&step).await.unwrap_err();
 
     assert!(error.contains("unknown provider 'ghost'"), "{error}");
+}
+
+#[test]
+fn workflow_step_events_use_the_tagged_wire_format() {
+    let started = TelemetryEvent::workflow_step_started(WorkflowStepStartedData {
+        run_id: "wf-1".into(),
+        step_id: "a".into(),
+    });
+    let value = serde_json::to_value(&started).unwrap();
+    assert_eq!(value["event"], "workflow_step_started");
+    assert_eq!(value["data"]["run_id"], "wf-1");
+    assert_eq!(value["data"]["step_id"], "a");
+    assert!(value["timestamp"].as_u64().is_some());
+
+    let completed = TelemetryEvent::workflow_step_completed(WorkflowStepCompletedData {
+        run_id: "wf-1".into(),
+        step_id: "a".into(),
+        status: StepStatus::Completed,
+        output: Some("answer".into()),
+        source: Some("local".into()),
+        error: None,
+    });
+    let value = serde_json::to_value(&completed).unwrap();
+    assert_eq!(value["event"], "workflow_step_completed");
+    assert_eq!(value["data"]["status"], "completed");
+    assert_eq!(value["data"]["output"], "answer");
+    assert_eq!(value["data"]["source"], "local");
+
+    let blocked = TelemetryEvent::workflow_step_completed(WorkflowStepCompletedData {
+        run_id: "wf-1".into(),
+        step_id: "b".into(),
+        status: StepStatus::Blocked,
+        output: None,
+        source: None,
+        error: Some("blocked by failed step 'a'".into()),
+    });
+    let value = serde_json::to_value(&blocked).unwrap();
+    assert_eq!(value["data"]["status"], "blocked");
+    assert_eq!(value["data"]["error"], "blocked by failed step 'a'");
+}
+
+#[test]
+fn workflow_events_broadcast_to_subscribers() {
+    let bus = TelemetryBus::new(8);
+    let mut receiver = bus.subscribe();
+    let sent = bus.publish(TelemetryEvent::workflow_step_started(
+        WorkflowStepStartedData {
+            run_id: "wf-1".into(),
+            step_id: "a".into(),
+        },
+    ));
+    assert_eq!(sent, 1);
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        TelemetryEvent::WorkflowStepStarted { .. }
+    ));
 }

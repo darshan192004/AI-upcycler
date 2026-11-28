@@ -90,6 +90,25 @@ pub struct DownloadProgressData {
     pub status: DownloadStatus,
 }
 
+/// Payload of `workflow_step_started` (spec 2026-11-27, §10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowStepStartedData {
+    pub run_id: String,
+    pub step_id: String,
+}
+
+/// Payload of `workflow_step_completed`, including failure and blocked
+/// outcomes. Clients must read `status`, not infer it from an error string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowStepCompletedData {
+    pub run_id: String,
+    pub step_id: String,
+    pub status: crate::workflows::StepStatus,
+    pub output: Option<String>,
+    pub source: Option<String>,
+    pub error: Option<String>,
+}
+
 /// A telemetry message, serialised for the wire as
 /// `{"event": "...", "timestamp": <secs>, "data": { ... }}` (see `docs/api.md`).
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +133,14 @@ pub enum TelemetryEvent {
     ModelDownloadProgress {
         timestamp: u64,
         data: DownloadProgressData,
+    },
+    WorkflowStepStarted {
+        timestamp: u64,
+        data: WorkflowStepStartedData,
+    },
+    WorkflowStepCompleted {
+        timestamp: u64,
+        data: WorkflowStepCompletedData,
     },
 }
 
@@ -149,6 +176,20 @@ impl TelemetryEvent {
 
     pub fn model_download_progress(data: DownloadProgressData) -> Self {
         Self::ModelDownloadProgress {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn workflow_step_started(data: WorkflowStepStartedData) -> Self {
+        Self::WorkflowStepStarted {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn workflow_step_completed(data: WorkflowStepCompletedData) -> Self {
+        Self::WorkflowStepCompleted {
             timestamp: now_epoch_secs(),
             data,
         }
