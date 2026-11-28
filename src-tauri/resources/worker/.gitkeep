@@ -1,0 +1,3 @@
+# Placeholder so the Tauri bundler always finds resources/worker/.
+# The worker APK is fetched at release time from the `worker-apk` workflow
+# artifact (see .github/workflows/release.yml) and is not committed.
