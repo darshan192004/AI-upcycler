@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { AppShell, type AppTab } from './components/AppShell';
 import { ChatView } from './components/ChatView';
 import { DashboardView } from './components/DashboardView';
+import { ImagesView } from './components/ImagesView';
 import { ModelsView } from './components/ModelsView';
 import { WorkflowView } from './components/WorkflowView';
 import { connectTelemetry } from './lib/telemetry';
@@ -40,6 +41,7 @@ export const App: React.FC = () => {
       {activeTab === 'models' && <ModelsView />}
       {activeTab === 'chat' && <ChatView />}
       {activeTab === 'workflows' && <WorkflowView />}
+      {activeTab === 'images' && <ImagesView />}
     </AppShell>
   );
 };

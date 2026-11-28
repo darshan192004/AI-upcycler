@@ -444,3 +444,54 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .wf-button { transition: none; }
 }
+
+/* Image gallery and generator (sub-project F, task 9). */
+:root {
+  --image-bg: #0F172A;
+  --image-card: #1B2336;
+  --image-border: #475569;
+  --image-muted: #94A3B8;
+  --image-accent: #22C55E;
+  --image-danger: #EF4444;
+}
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.image-card {
+  background: var(--image-card);
+  border: 1px solid var(--image-border);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.image-card img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+.image-skeleton {
+  background: var(--image-card);
+  border: 1px solid var(--image-border);
+  border-radius: 12px;
+  height: 220px;
+}
+
+.image-error-summary {
+  border: 1px solid var(--image-danger);
+  color: #FCA5A5;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .image-card img,
+  .image-skeleton {
+    transition: none !important;
+  }
+}

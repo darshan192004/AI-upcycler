@@ -4,6 +4,7 @@ import Lenis from 'lenis';
 import {
   Activity,
   HardDrive,
+  ImageIcon,
   LayoutDashboard,
   MessageSquare,
   Recycle,
@@ -15,13 +16,14 @@ import { AuroraBackground } from './ui/AuroraBackground';
 import { SegmentedTabs, type TabItem } from './ui/SegmentedTabs';
 import { StatusDot } from './ui/StatusDot';
 
-export type AppTab = 'dashboard' | 'models' | 'chat' | 'workflows';
+export type AppTab = 'dashboard' | 'models' | 'chat' | 'workflows' | 'images';
 
 const NAV: TabItem<AppTab>[] = [
   { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard className="h-4 w-4" /> },
   { id: 'models', label: 'Models', icon: <HardDrive className="h-4 w-4" /> },
   { id: 'chat', label: 'Chat', icon: <MessageSquare className="h-4 w-4" /> },
   { id: 'workflows', label: 'Tasks', icon: <Workflow className="h-4 w-4" /> },
+  { id: 'images', label: 'Images', icon: <ImageIcon className="h-4 w-4" aria-hidden="true" /> },
 ];
 
 interface AppShellProps {
