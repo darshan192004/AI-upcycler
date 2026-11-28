@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="aiu_background">#0F172A</color>
+    <color name="aiu_card">#1B2336</color>
+    <color name="aiu_border">#475569</color>
+    <color name="aiu_text_muted">#94A3B8</color>
+    <color name="aiu_accent">#22C55E</color>
+    <color name="aiu_destructive">#EF4444</color>
+</resources>
