@@ -85,6 +85,13 @@ protobuf {
 dependencies {
     implementation("io.grpc:grpc-netty:1.63.0")
 
+    // The control/pairing screen uses a Material3 theme; without this the
+    // resource linker cannot resolve Theme.Material3.* parents.
+    implementation("com.google.android.material:material:1.12.0")
+
+    // Keystore-backed storage for the LAN bearer token and provider keys.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // Not optional: gRPC over TLS on Android cannot work without this.
     //
     // grpc-netty needs an ALPN provider to negotiate HTTP/2, and on Android it
