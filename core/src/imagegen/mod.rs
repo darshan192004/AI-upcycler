@@ -5,6 +5,7 @@ use std::pin::Pin;
 
 pub mod format;
 pub mod media;
+pub mod openai_compat;
 
 pub const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-2.6-flare";
 pub const DEFAULT_GEMINI_IMAGE_MODEL: &str = "gemini-2.5-flash-image";
