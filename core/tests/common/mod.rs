@@ -241,7 +241,10 @@ impl WorkerService for MockWorker {
     ) -> Result<tonic::Response<FinishModelPushResponse>, tonic::Status> {
         let request = request.into_inner();
         let mut log = self.push.lock().expect("push lock");
-        let digest = format!("{:x}", Sha256::digest(&log.bytes));
+        let digest = Sha256::digest(&log.bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         if !request.sha256_hex.is_empty() && digest != request.sha256_hex {
             log.finished = None;
             return Ok(tonic::Response::new(FinishModelPushResponse {

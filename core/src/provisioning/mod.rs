@@ -86,7 +86,8 @@ impl ModelSource {
             }
             hasher.update(&buffer[..read]);
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        let digest = hasher.finalize();
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Reads exactly `len` bytes starting at `offset`.
