@@ -2,6 +2,7 @@ use crate::telemetry::{NodeEventData, TelemetryBus, TelemetryEvent};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,6 +10,10 @@ use tracing::{info, warn};
 
 /// Service type advertised by AI Upcycler worker nodes over mDNS-SD.
 pub const SERVICE_TYPE: &str = "_aiupcycler-worker._tcp.local.";
+
+/// Service type advertised by a master running the opt-in LAN API.
+/// Paired phones browse this exact type; it is a cross-language contract.
+pub const MASTER_SERVICE_TYPE: &str = "_aiupcycler-master._tcp.local.";
 
 /// The `node_id` the master assigns to a worker advertising `instance_name`
 /// over DNS-SD: the instance fullname, matching
@@ -21,6 +26,137 @@ pub const SERVICE_TYPE: &str = "_aiupcycler-worker._tcp.local.";
 /// contract, not an implementation detail.
 pub fn worker_node_id(instance_name: &str) -> String {
     format!("{instance_name}.{SERVICE_TYPE}")
+}
+
+const TXT_VERSION: &str = "version";
+const TXT_NODE_ID: &str = "node_id";
+const TXT_API_PORT: &str = "api_port";
+const TXT_FINGERPRINT: &str = "fingerprint";
+
+/// Public metadata published for a paired phone over mDNS-SD.
+///
+/// No token, credential, or secret belongs here: discovery happens before the
+/// phone has proved it holds the bearer token minted at pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasterServiceInfo {
+    pub instance_name: String,
+    pub node_id: String,
+    pub fingerprint: String,
+    pub port: u16,
+}
+
+impl MasterServiceInfo {
+    /// TXT records in the order they are advertised.
+    pub fn txt_records(&self) -> Vec<(String, String)> {
+        vec![
+            (TXT_VERSION.to_string(), "1".to_string()),
+            (TXT_NODE_ID.to_string(), self.node_id.clone()),
+            (TXT_API_PORT.to_string(), self.port.to_string()),
+            (TXT_FINGERPRINT.to_string(), self.fingerprint.clone()),
+        ]
+    }
+
+    /// Builds the mDNS-SD record advertised on a concrete LAN address.
+    ///
+    /// The caller must pass a resolved private IPv4, never `0.0.0.0` or a
+    /// loopback address: advertising a wildcard would point phones at a
+    /// machine that is not the master.
+    pub fn service_info(&self, host: Ipv4Addr) -> ServiceInfo {
+        assert!(
+            host.is_private(),
+            "master advert requires a concrete LAN IPv4"
+        );
+        let instance = dns_label(&self.instance_name);
+        let hostname = format!("{instance}.local.");
+        let records = self.txt_records();
+        ServiceInfo::new(
+            MASTER_SERVICE_TYPE,
+            &instance,
+            &hostname,
+            IpAddr::V4(host),
+            self.port,
+            records.as_slice(),
+        )
+        .expect("master service info has valid labels")
+    }
+}
+
+/// Keeps every character DNS-SD accepts in an instance label, so a host id
+/// with spaces or dots can never produce a malformed fullname.
+fn dns_label(value: &str) -> String {
+    let mut label: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(63)
+        .collect();
+    while label.starts_with('-') {
+        label.remove(0);
+    }
+    while label.ends_with('-') {
+        label.pop();
+    }
+    if label.is_empty() {
+        "aiupcycler-master".to_string()
+    } else {
+        label
+    }
+}
+
+/// First RFC1918 IPv4 in the supplied order. Loopback, link-local, wildcard,
+/// and public addresses are never suitable for the LAN listener.
+pub fn resolve_lan_bind_addr(candidates: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    candidates.iter().copied().find(|addr| addr.is_private())
+}
+
+/// Enumerates the local interfaces and resolves a stable LAN bind address.
+/// Sorted so a machine with several NICs always chooses the same one.
+pub fn resolve_lan_bind_addr_from_interfaces() -> Option<Ipv4Addr> {
+    let networks = sysinfo::Networks::new_with_refreshed_list();
+    let mut candidates: Vec<Ipv4Addr> = networks
+        .values()
+        .flat_map(|network| network.ip_networks())
+        .filter_map(|network| match network.addr {
+            IpAddr::V4(addr) => Some(addr),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    candidates.sort_unstable();
+    resolve_lan_bind_addr(&candidates)
+}
+
+/// Owns the mDNS responder. Dropping it shuts the daemon down, so the advert
+/// lives exactly as long as the `serve_lan` future that created it.
+pub struct MasterAdvertGuard {
+    daemon: ServiceDaemon,
+}
+
+impl Drop for MasterAdvertGuard {
+    fn drop(&mut self) {
+        let _ = self.daemon.shutdown();
+    }
+}
+
+/// Registers the master advert. Errors contain mDNS reason text only, never a
+/// token or any other credential.
+pub fn start_master_advert(
+    info: &MasterServiceInfo,
+    host: Ipv4Addr,
+) -> Result<MasterAdvertGuard, String> {
+    let guard = MasterAdvertGuard {
+        daemon: ServiceDaemon::new()
+            .map_err(|error| format!("failed to start mDNS daemon: {error}"))?,
+    };
+    guard
+        .daemon
+        .register(info.service_info(host))
+        .map_err(|error| format!("failed to register {MASTER_SERVICE_TYPE}: {error}"))?;
+    Ok(guard)
 }
 
 #[allow(dead_code)]
@@ -124,6 +260,24 @@ impl NodeRegistry {
     pub fn canonical_id(&self, node_id: &str) -> String {
         let aliases = self.aliases.lock().unwrap();
         resolve_alias(&aliases, node_id)
+    }
+
+    /// Every id known to belong to the same physical worker as `node_id`.
+    ///
+    /// Revocation uses this to remove credentials learned under an alias even
+    /// when that alias later received a different token hash.
+    pub fn aliases_for(&self, node_id: &str) -> Vec<String> {
+        let aliases = self.aliases.lock().unwrap();
+        let canonical = resolve_alias(&aliases, node_id);
+        let mut ids = vec![canonical.clone()];
+        for alias in aliases.keys() {
+            if resolve_alias(&aliases, alias) == canonical {
+                ids.push(alias.clone());
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// Marks the mDNS browser as running (`true`) or stopped (`false`).
@@ -538,6 +692,10 @@ mod tests {
             wifi,
             "the canonical id resolves to itself"
         );
+        let mut linked = vec![wifi.to_string(), "adb:16284c49".to_string()];
+        linked.sort();
+        assert_eq!(registry.aliases_for("adb:16284c49"), linked);
+        assert_eq!(registry.aliases_for(wifi), linked);
     }
 
     #[test]

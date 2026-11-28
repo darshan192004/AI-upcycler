@@ -206,6 +206,20 @@ class EnrollmentClient(
             }
         }
 
+        // Task 3 extends the enrollment response with everything the chat
+        // path needs. Treat all three as required: a partially enrolled worker
+        // would pair for mTLS but be unable to reach the master's LAN API.
+        val lanToken = fields["lan_token"]
+        if (lanToken.isNullOrEmpty()) {
+            return EnrollmentResult.Failed("Master response is missing lan_token")
+        }
+        val lanPort = fields["lan_port"]?.toIntOrNull()
+            ?: return EnrollmentResult.Failed("Master response is missing lan_port")
+        val nodeId = fields["node_id"]
+        if (nodeId.isNullOrEmpty()) {
+            return EnrollmentResult.Failed("Master response is missing node_id")
+        }
+
         when (val authority = request.authority) {
             is FingerprintAuthority.Full ->
                 // Deliberately not echoing either value: the user compares
@@ -233,6 +247,9 @@ class EnrollmentClient(
                 clientCertPem = fields.getValue("client_cert_pem"),
                 clientKeyPem = fields.getValue("client_key_pem"),
                 fingerprint = fingerprint,
+                nodeId = nodeId,
+                lanToken = lanToken,
+                lanPort = lanPort,
             ),
         )
     }
@@ -343,9 +360,13 @@ class EnrollmentClient(
                 val value = readString() ?: return null
                 fields[key] = value
             } else {
-                // Only string fields are consumed; anything else is skipped by
-                // scanning to the next delimiter.
+                // Numbers matter: the master serializes `lan_port` as a u16,
+                // not a quoted string. Keep the raw primitive as text and let
+                // the caller parse it; `null` is treated as absent.
+                val start = index
                 while (index < json.length && json[index] != ',' && json[index] != '}') index++
+                val raw = json.substring(start, index).trim()
+                if (raw.isNotEmpty() && raw != "null") fields[key] = raw
             }
             skipWhitespace()
             when {

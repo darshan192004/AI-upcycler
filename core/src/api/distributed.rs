@@ -307,6 +307,9 @@ struct Inner {
     engine_model_id: String,
     tokenizer: Tokenizer,
     driver: Arc<dyn PipelineDriver>,
+    /// The execution source this backend serves: the planned worker id
+    /// (`adb:<serial>`) for cluster chunks, `local` for host-backed ones.
+    source: String,
     /// Requests served since construction; salts fresh worker session ids.
     counter: AtomicUsize,
 }
@@ -316,12 +319,14 @@ impl DistributedBackend {
         engine_model_id: impl Into<String>,
         tokenizer: Tokenizer,
         driver: Arc<dyn PipelineDriver>,
+        source: impl Into<String>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 engine_model_id: engine_model_id.into(),
                 tokenizer,
                 driver,
+                source: source.into(),
                 counter: AtomicUsize::new(0),
             }),
         }
@@ -340,11 +345,23 @@ impl DistributedBackend {
         &self,
         messages: &[crate::api::backend::ChatMessage],
     ) -> Result<Vec<u32>, String> {
+        // Cluster workers have no vision path; refuse before rendering ChatML
+        // so an image part can never reach a worker as a text prompt.
+        if messages.iter().any(|m| m.content.has_images()) {
+            return Err("image_attachments_require_vision_provider".into());
+        }
+        // `content_text` concatenates every text part into an owned string, so
+        // render from that buffer instead of borrowing only the first part.
+        let rendered = messages
+            .iter()
+            .map(|m| m.content.content_text())
+            .collect::<Vec<_>>();
         let template: Vec<TemplateMessage> = messages
             .iter()
-            .map(|m| TemplateMessage {
+            .zip(rendered.iter())
+            .map(|(m, content)| TemplateMessage {
                 role: &m.role,
-                content: &m.content,
+                content,
             })
             .collect();
         let prompt = self
@@ -515,6 +532,7 @@ impl GenerationBackend for DistributedBackend {
                                     content: tail,
                                     tokens_emitted: 1,
                                     prompt_tokens: Some(prefill_len),
+                                    source: Some(backend.inner.source.clone()),
                                     ..Default::default()
                                 });
                             }
@@ -535,6 +553,7 @@ impl GenerationBackend for DistributedBackend {
                                     content: suffix,
                                     tokens_emitted: 1,
                                     prompt_tokens: Some(prefill_len),
+                                    source: Some(backend.inner.source.clone()),
                                     ..Default::default()
                                 });
                             }
@@ -748,7 +767,15 @@ impl AdaptiveBackend {
             warn!("cluster pipeline load failed; staying on the fallback backend");
             return None;
         }
-        let backend = Arc::new(DistributedBackend::new(engine_model_id, tokenizer, driver));
+        let backend = Arc::new(DistributedBackend::new(
+            engine_model_id,
+            tokenizer,
+            driver,
+            nodes
+                .first()
+                .map(|node| node.node_id.clone())
+                .unwrap_or_default(),
+        ));
         self.cluster
             .lock()
             .await
@@ -812,6 +839,14 @@ impl GenerationBackend for AdaptiveBackend {
     fn tool_calling_available(&self) -> bool {
         self.fallback.tool_calling_available()
     }
+
+    /// True when the cluster has a planned worker or the fallback backend is
+    /// itself real. The labelled stub is not real, so `Auto` must not silently
+    /// fall through to it.
+    fn is_real(&self) -> bool {
+        !serving_plan_nodes(&self.registry, &self.security.enrollments, &self.thermal).is_empty()
+            || self.fallback.is_real()
+    }
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -836,7 +871,7 @@ fn withheld_tail(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::backend::{ChatMessage, FunctionDef, ToolDef};
+    use crate::api::backend::{ChatMessage, FunctionDef, MessageContent, ToolDef};
     use ai_upcycler_model_io::fixture::{
         default_merges, write_tiny_model, TinyModelConfig, TokenizerFixture,
     };
@@ -1221,7 +1256,7 @@ mod tests {
         row[87] = 9.0;
         let driver = FakeDriver::new(vec![FakeDriver::logits(&row)]);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone(), "local");
         let (content, tokens, error) = drained(backend.generate(request("s1", 1))).await;
         assert!(error.is_none(), "{error:?}");
         assert_eq!(content, "W");
@@ -1248,7 +1283,7 @@ mod tests {
         }
         let driver = FakeDriver::new(schedule);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver);
+        let backend = DistributedBackend::new("tiny", tokenizer, driver, "local");
         let (content, tokens, error) = drained(backend.generate(request("s1", 64))).await;
         assert!(error.is_none(), "{error:?}");
         assert!(
@@ -1283,7 +1318,7 @@ mod tests {
         let refusal = Err("worker rejected forward step".into());
         let driver = FakeDriver::new(vec![refusal, ok.clone(), ok]);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone(), "local");
         let (_, _, error) = drained(backend.generate(request("s1", 2))).await;
         assert!(error.is_none(), "{error:?}");
         assert!(driver.resets() > 0, "attempt 1 must follow a reset");
@@ -1310,7 +1345,8 @@ mod tests {
     #[tokio::test]
     async fn second_refusal_fails_the_request_honestly() {
         let (tokenizer, _dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, Arc::new(FailingAfterReset));
+        let backend =
+            DistributedBackend::new("tiny", tokenizer, Arc::new(FailingAfterReset), "local");
         let (_, _, error) = drained(backend.generate(request("s1", 2))).await;
         assert!(error.unwrap().contains("after retry"));
     }
@@ -1335,7 +1371,7 @@ mod tests {
             FakeDriver::logits(&visible), // decode step (attempt 1)
         ]);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone(), "local");
         // max_tokens 2: attempt 0 samples the hidden id, the first decode
         // forward is refused, the retry re-prefills and emits two 'A's.
         let (content, tokens, error) = drained(backend.generate(request("s1", 2))).await;
@@ -1354,7 +1390,7 @@ mod tests {
         row[87] = 9.0; // 'W'
         let driver = FakeDriver::new(vec![FakeDriver::logits(&row)]);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone(), "local");
         let request = request("s1", 1);
         let expected_prefill =
             DistributedBackend::prompt_ids(&backend, &request.messages).expect("prompt ids");
@@ -1372,6 +1408,37 @@ mod tests {
         drop(dir);
     }
 
+    #[test]
+    fn prompt_ids_render_every_text_part() {
+        use crate::api::backend::ContentPart;
+
+        let driver = FakeDriver::new(vec![]);
+        let (tokenizer, dir) = tiny_tokenizer();
+        let backend = DistributedBackend::new("tiny", tokenizer, driver, "local");
+        let mut parts = request("s1", 1);
+        parts.messages[0].content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Summarize ".into(),
+            },
+            ContentPart::Text {
+                text: "this report".into(),
+            },
+        ]);
+        let mut plain = request("s1", 1);
+        plain.messages[0].content = MessageContent::Text("Summarize this report".into());
+
+        assert_eq!(
+            backend
+                .prompt_ids(&parts.messages)
+                .expect("parts prompt ids"),
+            backend
+                .prompt_ids(&plain.messages)
+                .expect("plain prompt ids"),
+            "every text part must reach the ChatML renderer"
+        );
+        drop(dir);
+    }
+
     /// The whole reason for the contract: a prompt whose whole-logits answer
     /// would not fit the activation cap must prefill when the head advertises
     /// last-row logits (spec 2026-10-21-last-row-logits, L3/L4).
@@ -1381,7 +1448,7 @@ mod tests {
         row[87] = 9.0; // 'W'
         let driver = FakeDriver::capable(vec![FakeDriver::logits(&row)]);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone(), "local");
         let request = long_request("capable", 1);
 
         let ids = backend.prompt_ids(&request.messages).expect("prompt ids");
@@ -1416,7 +1483,7 @@ mod tests {
         row[87] = 9.0; // 'W'
         let driver = FakeDriver::new(vec![FakeDriver::logits(&row)]);
         let (tokenizer, dir) = tiny_tokenizer();
-        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone());
+        let backend = DistributedBackend::new("tiny", tokenizer, driver.clone(), "local");
         let request = long_request("old-head", 1);
 
         let ids = backend.prompt_ids(&request.messages).expect("prompt ids");
@@ -1458,7 +1525,7 @@ mod tests {
             model: "tiny".into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
-                content,
+                content: MessageContent::Text(content),
                 ..Default::default()
             }],
             temperature: 0.0,

@@ -26,7 +26,8 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use super::backend::{
-    FunctionCallDelta, GenerationBackend, GenerationChunk, GenerationRequest, ToolCallDelta,
+    ContentPart, FunctionCallDelta, GenerationBackend, GenerationChunk, GenerationRequest,
+    MessageContent, ToolCallDelta,
 };
 
 /// Default GGUF used when no `AI_UPCYCLER_MODEL` override is set. Matches the
@@ -199,31 +200,7 @@ impl LlamaCppBackend {
     ) -> Result<impl futures::Stream<Item = Result<GenerationChunk, String>> + 'static, String>
     {
         let base_url = self.ensure_base_url().await?;
-        let mut body = json!({
-            "model": request.model,
-            "messages": request.messages,
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "stream": true,
-        });
-        // Pass the agent fields through unchanged: the model's chat template,
-        // not this proxy, decides how a tool definition is rendered.
-        let fields = body.as_object_mut().expect("chat body is an object");
-        if let Some(tools) = &request.tools {
-            fields.insert("tools".into(), json!(tools));
-        }
-        if let Some(tool_choice) = &request.tool_choice {
-            fields.insert("tool_choice".into(), tool_choice.clone());
-        }
-        if let Some(stop) = &request.stop {
-            fields.insert("stop".into(), json!(stop));
-        }
-        if let Some(top_p) = request.top_p {
-            fields.insert("top_p".into(), json!(top_p));
-        }
-        if let Some(seed) = request.seed {
-            fields.insert("seed".into(), json!(seed));
-        }
+        let body = build_host_body(request);
         let resp = self
             .client
             .post(format!("{base_url}/v1/chat/completions"))
@@ -237,6 +214,64 @@ impl LlamaCppBackend {
         let allowed_tools = requested_tool_names(request);
         Ok(sse_chunks(resp.bytes_stream(), allowed_tools))
     }
+}
+
+/// Builds the JSON body sent to llama-server. Image parts are reduced to their
+/// content hash: raw bytes never enter an HTTP request body.
+fn build_host_body(request: &GenerationRequest) -> Value {
+    let messages = request
+        .messages
+        .iter()
+        .map(|message| {
+            // Serialize the whole message so agent fields survive, then replace
+            // only `content` with the sanitized payload. Raw image bytes never
+            // enter the body; only their hashes are forwarded.
+            let mut value = serde_json::to_value(message).expect("chat message serializes");
+            let content = match &message.content {
+                MessageContent::Text(text) => json!(text),
+                MessageContent::Parts(parts) => json!(parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text { text } => {
+                            json!({ "type": "text", "text": text })
+                        }
+                        ContentPart::Image { media_hash, .. } => {
+                            json!({ "type": "image", "media_hash": media_hash })
+                        }
+                    })
+                    .collect::<Vec<_>>()),
+            };
+            value["content"] = content;
+            value
+        })
+        .collect::<Vec<_>>();
+
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+        "stream": true,
+    });
+    // Pass the agent fields through unchanged: the model's chat template,
+    // not this proxy, decides how a tool definition is rendered.
+    let fields = body.as_object_mut().expect("chat body is an object");
+    if let Some(tools) = &request.tools {
+        fields.insert("tools".into(), json!(tools));
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        fields.insert("tool_choice".into(), tool_choice.clone());
+    }
+    if let Some(stop) = &request.stop {
+        fields.insert("stop".into(), json!(stop));
+    }
+    if let Some(top_p) = request.top_p {
+        fields.insert("top_p".into(), json!(top_p));
+    }
+    if let Some(seed) = request.seed {
+        fields.insert("seed".into(), json!(seed));
+    }
+    body
 }
 
 impl GenerationBackend for LlamaCppBackend {
@@ -478,6 +513,7 @@ fn finalize_buffered_turn(
         if !content.is_empty() {
             chunks.push(GenerationChunk {
                 content,
+                source: Some("local".into()),
                 ..Default::default()
             });
         }
@@ -485,11 +521,13 @@ fn finalize_buffered_turn(
             chunks.push(GenerationChunk {
                 tool_calls: Some(vec![call]),
                 tokens_emitted: call_tokens,
+                source: Some("local".into()),
                 ..Default::default()
             });
         }
         chunks.push(GenerationChunk {
             finish_reason: Some("tool_calls".into()),
+            source: Some("local".into()),
             ..Default::default()
         });
         return chunks;
@@ -508,6 +546,7 @@ fn finalize_buffered_turn(
             }]),
             tokens_emitted: tokens,
             finish_reason: Some("tool_calls".into()),
+            source: Some("local".into()),
             ..Default::default()
         }];
     }
@@ -516,6 +555,7 @@ fn finalize_buffered_turn(
         return vec![GenerationChunk {
             finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".into())),
             tokens_emitted: tokens,
+            source: Some("local".into()),
             ..Default::default()
         }];
     }
@@ -524,6 +564,7 @@ fn finalize_buffered_turn(
         content,
         tokens_emitted: tokens,
         finish_reason: finish_reason.or_else(|| Some("stop".into())),
+        source: Some("local".into()),
         ..Default::default()
     }]
 }
@@ -595,6 +636,7 @@ where
                                 tokens_emitted: chunk_tokens,
                                 tool_calls: delta.tool_calls,
                                 finish_reason: delta.finish_reason,
+                                source: Some("local".into()),
                                 ..Default::default()
                             });
                         }
@@ -651,7 +693,7 @@ mod tests {
             model: "qwen".into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
-                content: "hi".into(),
+                content: MessageContent::Text("hi".into()),
                 ..Default::default()
             }],
             temperature: 0.7,
@@ -659,6 +701,61 @@ mod tests {
             session_id: "s-test".into(),
             ..Default::default()
         }
+    }
+
+    fn req_from_content(content: serde_json::Value) -> GenerationRequest {
+        serde_json::from_value(serde_json::json!({
+            "messages":[{"role":"user","content":content}],
+            "max_tokens":64
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn host_engine_body_serializes_parts_without_raw_bytes() {
+        let body = build_host_body(&req_from_content(serde_json::json!([{
+            "type":"image",
+            "media_hash":"ab".repeat(32),
+            "mime_type":"image/png",
+            "file_name":"a.png",
+            "byte_count":4
+        }])));
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(s.contains("\"type\":\"image\""));
+        assert!(!s.contains("base64"));
+    }
+
+    #[test]
+    fn host_engine_body_preserves_agent_message_fields() {
+        let request: GenerationRequest = serde_json::from_value(json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": "file body",
+                    "tool_call_id": "call_1",
+                    "name": "read"
+                }
+            ],
+            "max_tokens": 64
+        }))
+        .unwrap();
+        let body = build_host_body(&request);
+        let messages = body["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["name"], "read");
+        assert_eq!(messages[1]["content"], "file body");
     }
 
     fn tool_request() -> GenerationRequest {

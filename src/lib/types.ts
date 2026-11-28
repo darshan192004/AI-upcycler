@@ -93,6 +93,8 @@ export interface WorkerTelemetry {
 export interface GenerationMetrics {
   tokens_per_second: number;
   current_token: number;
+  /** Where the turn ran: `local`, `adb:<serial>`, or a provider id. */
+  source: string;
   /** The master's own RAM utilization; `null` when it could not be read. */
   master_ram_utilization_pct: number | null;
   worker_nodes: WorkerTelemetry[];
@@ -139,11 +141,42 @@ export type TelemetryEvent =
   | { event: 'node_disconnected'; timestamp: number; data: NodeEventData }
   | { event: 'generation_metrics'; timestamp: number; data: GenerationMetrics }
   | { event: 'worker_health'; timestamp: number; data: WorkerHealthEventData }
-  | { event: 'model_download_progress'; timestamp: number; data: DownloadProgressData };
+  | { event: 'model_download_progress'; timestamp: number; data: DownloadProgressData }
+  | { event: 'workflow_step_started'; timestamp: number; data: { run_id: string; step_id: string } }
+  | { event: 'workflow_step_completed'; timestamp: number; data: {
+      run_id: string;
+      step_id: string;
+      status: WorkflowStepStatus;
+      output: string | null;
+      source: string | null;
+      error: string | null;
+    } };
+
+/** One part of a multimodal chat message (sub-project C). */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image';
+      media_hash: string;
+      mime_type: string;
+      file_name: string;
+      byte_count: number;
+    };
+
+/** Wire content: a plain string for text-only turns, parts otherwise. */
+export type ChatContent = string | ContentPart[];
+
+/** The reference returned by `POST /api/media` for one stored image. */
+export interface MediaRef {
+  media_hash: string;
+  mime_type: string;
+  file_name: string;
+  byte_count: number;
+}
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: ChatContent;
 }
 
 export interface ChatRequest {
@@ -152,6 +185,76 @@ export interface ChatRequest {
   temperature?: number;
   max_tokens?: number;
   session_id?: string;
+  /** Omit for `auto`; otherwise `local` or a configured provider id. */
+  provider?: string;
+}
+
+export interface ProviderModelWire {
+  id: string;
+  label: string;
+  supports_vision: boolean;
+}
+
+export interface ProviderStatus {
+  id: 'openai' | 'anthropic' | 'gemini' | 'kimi';
+  name: string;
+  configured: boolean;
+  models: ProviderModelWire[];
+  supports_vision: boolean;
+  supports_tools: boolean;
+}
+
+/**
+ * `GET /api/providers` returns a bare array: the server's `ProviderList`
+ * newtype is `#[serde(transparent)]`, so it serializes as its inner vector.
+ */
+export type ProviderList = ProviderStatus[];
+
+export interface ChatSession {
+  session_id: string;
+  title: string;
+  model_id: string;
+  created_at: string;
+}
+
+export interface SessionList {
+  sessions: ChatSession[];
+}
+
+/** Settings stored by the host (never provider secrets). */
+export interface AppSettings {
+  provider: string | null;
+  model: string | null;
+  context_tokens: number;
+  max_tokens: number;
+  show_source_badges: boolean;
+  compact_mode: boolean;
+}
+
+/** Host-measured limits proposed for the current model and hardware. */
+export interface SettingsRecommendation {
+  context_tokens: number;
+  max_tokens: number;
+  reasons: string[];
+}
+
+/**
+ * One persisted chat row. The server stores the same `ChatContent` union the
+ * live chat uses, so older text-only rows are plain strings and multimodal
+ * rows are part arrays; `contentToText()` renders both.
+ */
+export interface PersistedChatMessage {
+  message_id: number;
+  session_id: string;
+  role: 'system' | 'user' | 'assistant';
+  content: ChatContent;
+  token_count: number;
+  generation_time_sec: number;
+  created_at: string;
+}
+
+export interface SessionMessages {
+  messages: PersistedChatMessage[];
 }
 
 export interface DownloadRequest {
@@ -215,3 +318,82 @@ export type ProvisionState =
   | { state: 'running'; bytes_done: number; total_bytes: number }
   | { state: 'done'; bytes: number }
   | { state: 'failed'; message: string };
+
+// ---- task workflows (spec 2026-11-27, §10/§11) ------------------------------
+
+export type WorkflowRunStatus = 'running' | 'completed' | 'failed';
+export type WorkflowStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'blocked';
+export type WorkflowProvider = 'auto' | 'local' | 'openai' | 'anthropic' | 'gemini' | 'kimi';
+
+export interface WorkflowStepDraft {
+  id: string;
+  prompt: string;
+  depends_on: string[];
+  provider: WorkflowProvider;
+}
+
+export interface WorkflowRequest {
+  model: string;
+  steps: WorkflowStepDraft[];
+}
+
+export interface WorkflowRunRow {
+  run_id: string;
+  model: string;
+  status: WorkflowRunStatus;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface WorkflowStepRow {
+  run_id: string;
+  step_id: string;
+  prompt: string;
+  depends_on: string[];
+  provider: string | null;
+  status: WorkflowStepStatus;
+  output: string | null;
+  source: string | null;
+  error: string | null;
+  position: number;
+}
+
+export interface WorkflowRunDetail {
+  run: WorkflowRunRow;
+  steps: WorkflowStepRow[];
+}
+
+export interface CreateWorkflowResponse {
+  run_id: string;
+  status: WorkflowRunStatus;
+}
+
+export interface WorkflowListResponse {
+  runs: WorkflowRunRow[];
+}
+
+export type ImageProvider = 'openai' | 'gemini' | 'local';
+export type ImageSize = 'square1024' | 'portrait1024x1536' | 'landscape1536x1024';
+
+export interface GenerateImageRequest {
+  prompt: string;
+  provider: ImageProvider;
+  size: ImageSize;
+}
+
+export interface ImageMetadata {
+  image_id: string;
+  provider: string;
+  model: string;
+  prompt: string;
+  media_sha256: string;
+  media_path: string;
+  mime_type: string;
+  byte_len: number;
+  size: string;
+  created_at_epoch_ms: number;
+}
+
+export interface ImageListResponse {
+  images: ImageMetadata[];
+}

@@ -11,27 +11,43 @@ pub mod devices;
 pub mod distributed;
 pub mod downloads;
 mod error;
+pub mod images;
+pub mod lan;
 pub mod llama;
 pub mod models;
 pub mod pairing;
+pub mod providers;
 pub mod provisioning;
+pub mod sessions;
+pub mod settings;
+pub mod workflows;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
+pub use lan::{LanApiConfig, DEFAULT_LAN_PORT, LAN_API_ENV, LAN_PORT_ENV};
 
 use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
-use crate::discovery::mdns::NodeRegistry;
+use crate::discovery::mdns::{start_master_advert, MasterServiceInfo, NodeRegistry};
+use crate::imagegen::registry::ImageBackendRegistry;
+use crate::imagegen::{DEFAULT_GEMINI_IMAGES_URL, DEFAULT_OPENAI_IMAGES_URL};
+use crate::media::MediaStore;
+use crate::providers::ProviderRegistry;
+use crate::secrets::{KeyringSecretStore, SecretStore, UnconfiguredSecretStore};
 use crate::security::SecurityState;
 use crate::store::Store;
 use crate::telemetry::TelemetryBus;
-use axum::http::{header, HeaderValue, Method};
-use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post, put};
+use axum::{Json, Router};
+use serde_json::json;
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -77,6 +93,21 @@ pub struct AppState {
     /// Per-device model push progress, in memory only (spec 2026-11-03-model-
     /// provisioning, D-P8).
     pub provisioning: Arc<provisioning::ProvisioningRegistry>,
+    /// OS-keychain-backed credentials. Never holds a plaintext fallback and
+    /// is never serialized into an API response.
+    pub secrets: Arc<dyn SecretStore>,
+    /// Cloud provider registry. Rebuilt whenever the secret store is swapped
+    /// so `configured` statuses cannot go stale.
+    pub providers: Arc<ProviderRegistry>,
+    /// Whether this server accepts image parts in chat requests. Defaults to
+    /// `false` so legacy deployments stay text-only until explicitly enabled.
+    pub multimodal_enabled: bool,
+    /// Content-addressed image store shared by the upload route and cloud
+    /// adapters. Never serialized into an API response.
+    pub media: Arc<MediaStore>,
+    /// Cloud image backends. Rebuilt whenever the secret store is swapped so
+    /// generation calls cannot go out with stale credentials.
+    pub image_backends: Arc<ImageBackendRegistry>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -111,6 +142,14 @@ impl AppState {
         host: HostInfo,
     ) -> Self {
         let security = Arc::new(SecurityState::default());
+        let secrets: Arc<dyn SecretStore> = Arc::new(UnconfiguredSecretStore);
+        let providers = Arc::new(ProviderRegistry::new(secrets.clone()));
+        let image_backends = Arc::new(ImageBackendRegistry::new(
+            Arc::new(UnconfiguredSecretStore),
+            DEFAULT_OPENAI_IMAGES_URL,
+            DEFAULT_GEMINI_IMAGES_URL,
+            false,
+        ));
         Self {
             cluster_id,
             registry,
@@ -128,6 +167,11 @@ impl AppState {
             host_memory: Arc::new(crate::worker_health::SysinfoHostMemory),
             onboarding: None,
             provisioning: Arc::new(provisioning::ProvisioningRegistry::default()),
+            secrets,
+            providers,
+            multimodal_enabled: false,
+            media: Arc::new(MediaStore::new(default_media_root())),
+            image_backends,
         }
     }
 
@@ -189,11 +233,56 @@ impl AppState {
         self
     }
 
+    /// Installs a secret store and rebuilds the provider and image backends
+    /// registries so credential lookups always use the current source. The
+    /// value itself is never copied into app state.
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
+        self.providers =
+            ProviderRegistry::new(secrets.clone()).with_media_store_shared(self.media.clone());
+        self.image_backends = Arc::new(ImageBackendRegistry::from_env(secrets.clone()));
+        self.secrets = secrets;
+        self
+    }
+
+    /// Installs a preconfigured provider registry (tests inject a loopback
+    /// base URL). The secret store is intentionally left untouched.
+    pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
+        self.providers = providers.with_media_store_shared(self.media.clone());
+        self
+    }
+
+    /// Installs a preconfigured image backend registry (tests inject mock
+    /// endpoints and the local flag). The secret store is left untouched.
+    pub fn with_image_backends(mut self, image_backends: Arc<ImageBackendRegistry>) -> Self {
+        self.image_backends = image_backends;
+        self
+    }
+
     /// Overrides the security state (bootstrap shares one CA/enrollment
     /// registry between [`AppState`] and the adaptive chat backend).
     pub fn with_security(mut self, security: Arc<SecurityState>) -> Self {
         self.security = security;
         self
+    }
+
+    /// Enables or disables image attachments on the local `/v1` chat surface.
+    pub fn with_multimodal(mut self, multimodal_enabled: bool) -> Self {
+        self.multimodal_enabled = multimodal_enabled;
+        self
+    }
+
+    /// Installs the content-addressed image store used by uploads and adapters.
+    pub fn with_media(mut self, media: MediaStore) -> Self {
+        let media = Arc::new(media);
+        self.providers = self.providers.with_media_store_shared(media.clone());
+        self.media = media;
+        self
+    }
+
+    /// Points the image store at a caller-supplied root (the desktop app's
+    /// `media/` directory). The directory is created on the first valid write.
+    pub fn with_media_root(self, root: PathBuf) -> Self {
+        self.with_media(MediaStore::new(root))
     }
 
     /// Overrides the GGUF download directory.
@@ -262,6 +351,8 @@ impl AppState {
             fallback,
             telemetry_cache.clone(),
         ));
+        // One keyring store backs both chat providers and image generation.
+        let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore);
         Self::new(
             cluster_id,
             registry,
@@ -273,6 +364,8 @@ impl AppState {
         .with_security(security)
         .with_telemetry_cache(telemetry_cache)
         .with_models_dir(models_dir)
+        .with_secrets(secrets.clone())
+        .with_image_backends(Arc::new(ImageBackendRegistry::from_env(secrets)))
         .with_onboarding(discover_onboarding())
     }
 }
@@ -315,10 +408,146 @@ fn discover_onboarding() -> Option<Arc<crate::onboarding::OnboardingService>> {
 
 /// Download destination when no explicit directory was configured: `models/`
 /// under the current working directory.
+fn default_media_root() -> PathBuf {
+    default_models_dir().join("media")
+}
+
 fn default_models_dir() -> PathBuf {
     std::env::current_dir()
         .map(|dir| dir.join("models"))
         .unwrap_or_else(|_| PathBuf::from("models"))
+}
+
+/// `POST /api/media`: validates one image part and stores it by content hash.
+///
+/// The route is absent when the multimodal gate is off. Body parsing is kept
+/// deliberately small: only the `file` field of a `multipart/form-data` request
+/// is read, and every validation rule (MIME, magic bytes, size limit, hash)
+/// stays in [`MediaStore::put`]. No bytes or file contents are logged.
+async fn upload_media(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !state.multimodal_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return invalid_image_attachment();
+    };
+    let Some(boundary) = multipart_boundary(content_type) else {
+        return invalid_image_attachment();
+    };
+    let Some((mime_type, file_name, bytes)) = multipart_file(&body, &boundary) else {
+        return invalid_image_attachment();
+    };
+
+    match state.media.put(bytes, mime_type, &file_name).await {
+        Ok(reference) => (
+            StatusCode::OK,
+            Json(json!({
+                "media_hash": reference.media_hash,
+                "mime_type": reference.mime_type,
+                "file_name": reference.file_name,
+                "byte_count": reference.byte_count,
+            })),
+        )
+            .into_response(),
+        Err(_) => invalid_image_attachment(),
+    }
+}
+
+fn invalid_image_attachment() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_image_attachment" })),
+    )
+        .into_response()
+}
+
+/// Extracts the boundary parameter without accepting a lookalike parameter
+/// name or an unquoted value with trailing whitespace.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let (_, parameters) = content_type.split_once(';')?;
+    parameters.split(';').find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Finds the `file` part in a multipart body and borrows its MIME type and
+/// bytes. Other parts are ignored, so a stray field cannot smuggle a second
+/// image into the upload.
+fn multipart_file<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a str, String, &'a [u8])> {
+    let delimiter = format!("--{boundary}");
+    let mut cursor = 0usize;
+    while let Some(offset) = find_subslice(&body[cursor..], delimiter.as_bytes()) {
+        let marker_end = cursor + offset + delimiter.len();
+        let part_start = match body.get(marker_end..marker_end + 2) {
+            Some(b"\r\n") => marker_end + 2,
+            Some(b"--") => return None,
+            _ => {
+                cursor = marker_end;
+                continue;
+            }
+        };
+        let header_end = part_start + find_subslice(&body[part_start..], b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&body[part_start..header_end]).ok()?;
+        let mut is_file = false;
+        let mut mime_type = None;
+        let mut file_name = None;
+        for line in headers.split("\r\n") {
+            if line
+                .to_ascii_lowercase()
+                .starts_with("content-disposition:")
+            {
+                is_file = header_parameter(line, "name").as_deref() == Some("file");
+                file_name = header_parameter(line, "filename");
+            } else if line.to_ascii_lowercase().starts_with("content-type:") {
+                mime_type = line
+                    .split_once(':')
+                    .map(|(_, value)| value.trim())
+                    .filter(|value| !value.is_empty());
+            }
+        }
+        let data_start = header_end + 4;
+        let closing = format!("\r\n--{boundary}");
+        let data_end = data_start + find_subslice(&body[data_start..], closing.as_bytes())?;
+        if is_file {
+            return Some((
+                mime_type.unwrap_or("application/octet-stream"),
+                file_name.unwrap_or_else(|| "attachment".to_string()),
+                &body[data_start..data_end],
+            ));
+        }
+        cursor = data_end;
+    }
+    None
+}
+
+fn header_parameter(line: &str, key: &str) -> Option<String> {
+    let (_, parameters) = line.split_once(';')?;
+    parameters.split(';').find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case(key) {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Whether a browser may use the loopback API (spec 2026-10-24, D-G1).
@@ -373,7 +602,7 @@ fn cors_layer() -> CorsLayer {
                 .map(browser_origin_is_allowed)
                 .unwrap_or(false)
         }))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE])
         // Some Chromium builds send a Private Network Access preflight when a
         // page asks for a loopback address; grant it only to allowed origins.
@@ -399,6 +628,39 @@ pub fn router(state: AppState) -> Router {
             post(provisioning::start).get(provisioning::status),
         )
         .route("/api/devices/:id", delete(devices::revoke))
+        .route("/api/providers", get(providers::list))
+        .route("/api/providers/:id/test", post(providers::test))
+        .route("/api/images/generate", post(images::generate_image))
+        .route("/api/images/:id/metadata", get(images::get_image_metadata))
+        .route("/api/images/:id", get(images::get_image_bytes))
+        .route("/api/images", get(images::list_images))
+        .route(
+            "/api/media",
+            post(upload_media).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        )
+        .route("/api/sessions", get(sessions::list))
+        .route(
+            "/api/sessions/:id",
+            get(sessions::get)
+                .put(sessions::rename)
+                .delete(sessions::delete),
+        )
+        .route("/api/sessions/:id/messages", get(sessions::messages))
+        .route(
+            "/api/settings/secrets/:provider",
+            put(providers::put_secret).delete(providers::delete_secret),
+        )
+        .route("/api/config", get(settings::config))
+        .route("/api/settings", get(settings::get).put(settings::put))
+        .route(
+            "/api/settings/recommendations",
+            get(settings::recommendations),
+        )
+        .route(
+            "/api/workflows",
+            get(workflows::list_workflows).post(workflows::create_workflow),
+        )
+        .route("/api/workflows/:id", get(workflows::get_workflow))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())
@@ -474,7 +736,53 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
     // live telemetry.
     tokio::spawn(crate::worker_health::worker_health_poll(state.clone()));
 
+    // The LAN listener is opt-in. The hint address carries only the configured
+    // port; `serve_lan` replaces its IP with a resolved private IPv4 and never
+    // binds the loopback hint.
+    let config = LanApiConfig::from_env();
+    if config.enabled {
+        let lan_hint = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), config.port);
+        let lan_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_lan(lan_hint, lan_state).await {
+                tracing::warn!("LAN API listener stopped: {error}");
+            }
+        });
+    }
+
     axum::serve(listener, router(state)).await
+}
+
+/// Starts the opt-in LAN listener on a resolved private IPv4 and advertises
+/// only public pairing metadata over mDNS-SD.
+///
+/// `addr` contributes the configured port; its IP is a loopback hint that is
+/// never bound. When no LAN IPv4 exists this logs the documented message and
+/// returns, leaving the loopback listener untouched.
+pub async fn serve_lan(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
+    if !LanApiConfig::from_env().enabled {
+        return Ok(());
+    }
+    let Some(lan_ip) = crate::discovery::mdns::resolve_lan_bind_addr_from_interfaces() else {
+        tracing::warn!(
+            "LAN API enabled but no LAN IPv4 address was found; manual host:port is unavailable"
+        );
+        return Ok(());
+    };
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(lan_ip), addr.port());
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let info = MasterServiceInfo {
+        instance_name: state.host.node_id.clone(),
+        node_id: state.host.node_id.clone(),
+        fingerprint: state.security.ca.fingerprint().to_string(),
+        port: bind_addr.port(),
+    };
+    // Held for the lifetime of this future; dropping it unregisters the advert.
+    let _advert = start_master_advert(&info, lan_ip).map_err(std::io::Error::other)?;
+
+    tracing::info!("AI Upcycler LAN API listening on http://{bind_addr}");
+    axum::serve(listener, lan::lan_router(state)).await
 }
 
 /// Binds the pairing-only listener ([`pairing_router`]) and serves until the

@@ -125,7 +125,9 @@ pub fn run() {
                 // Persist the CA under the app data dir: without this every
                 // host restart rotates it and every paired worker is dropped.
                 Some(data_dir.join("trust")),
-            );
+            )
+            .with_media_root(data_dir.join("media"))
+            .with_multimodal(std::env::var("AI_UPCYCLER_MULTIMODAL").as_deref() == Ok("1"));
 
             // `prepare_pairing` resolves this shared state; its Arcs are the
             // same instances the API listeners below serve from.

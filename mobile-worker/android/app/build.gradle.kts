@@ -16,6 +16,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -35,6 +36,19 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    // Task 10/12 Compose toolchain. Kotlin 1.9.24 pairs with compiler 1.5.14.
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.14"
+    }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
     }
 
     // grpc-netty pulls extra META-INF metadata that collides when packaged into
@@ -83,7 +97,35 @@ protobuf {
 }
 
 dependencies {
+    // Compose (Task 12 block, installed here because Task 10 ships the UI).
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.02")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    // Task 12 smoke test: ActivityScenario/Compose rule and JUnit4 runner.
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+
     implementation("io.grpc:grpc-netty:1.63.0")
+
+    // The control/pairing screen uses a Material3 theme; without this the
+    // resource linker cannot resolve Theme.Material3.* parents.
+    implementation("com.google.android.material:material:1.12.0")
+
+    // Keystore-backed storage for the LAN bearer token and provider keys.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Task 9: on-device UI preferences (non-secret flags only).
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
 
     // Not optional: gRPC over TLS on Android cannot work without this.
     //
@@ -108,7 +150,21 @@ dependencies {
     compileOnly("org.apache.tomcat:annotations-api:6.0.53")
 
     testImplementation("junit:junit:4.13.2")
+    // Task 9: Robolectric-backed DataStore preference tests.
+    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("org.robolectric:robolectric:4.12.2")
     // In-process gRPC transport (split out of grpc-core in 1.60) so the service
     // can be exercised on the JVM without a device or a real socket.
     testImplementation("io.grpc:grpc-inprocess:1.63.0")
+
+    // LAN chat transport; org.json is supplied by Android in production and by
+    // this test artifact on the JVM.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("org.json:json:20240303")
+
+    // Task 10: image list/bytes boundary. Reuses the single okhttp stack above;
+    // B's LanClient.defaultCallFactory() is injected in production.
+    implementation("com.google.code.gson:gson:2.10.1")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

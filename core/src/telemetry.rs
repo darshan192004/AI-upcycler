@@ -63,6 +63,9 @@ pub struct WorkerHealthEventData {
 pub struct GenerationMetrics {
     pub tokens_per_second: f64,
     pub current_token: u64,
+    /// Where the generation ran: `local`, `adb:<serial>`, or a provider id.
+    /// Defaults to `"local"` when no chunk supplied a source.
+    pub source: String,
     /// The master's own RAM utilization; `None` when it could not be read.
     pub master_ram_utilization_pct: Option<f64>,
     pub worker_nodes: Vec<WorkerTelemetry>,
@@ -85,6 +88,25 @@ pub struct DownloadProgressData {
     pub received_bytes: u64,
     pub total_bytes: u64,
     pub status: DownloadStatus,
+}
+
+/// Payload of `workflow_step_started` (spec 2026-11-27, §10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowStepStartedData {
+    pub run_id: String,
+    pub step_id: String,
+}
+
+/// Payload of `workflow_step_completed`, including failure and blocked
+/// outcomes. Clients must read `status`, not infer it from an error string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowStepCompletedData {
+    pub run_id: String,
+    pub step_id: String,
+    pub status: crate::workflows::StepStatus,
+    pub output: Option<String>,
+    pub source: Option<String>,
+    pub error: Option<String>,
 }
 
 /// A telemetry message, serialised for the wire as
@@ -111,6 +133,14 @@ pub enum TelemetryEvent {
     ModelDownloadProgress {
         timestamp: u64,
         data: DownloadProgressData,
+    },
+    WorkflowStepStarted {
+        timestamp: u64,
+        data: WorkflowStepStartedData,
+    },
+    WorkflowStepCompleted {
+        timestamp: u64,
+        data: WorkflowStepCompletedData,
     },
 }
 
@@ -146,6 +176,20 @@ impl TelemetryEvent {
 
     pub fn model_download_progress(data: DownloadProgressData) -> Self {
         Self::ModelDownloadProgress {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn workflow_step_started(data: WorkflowStepStartedData) -> Self {
+        Self::WorkflowStepStarted {
+            timestamp: now_epoch_secs(),
+            data,
+        }
+    }
+
+    pub fn workflow_step_completed(data: WorkflowStepCompletedData) -> Self {
+        Self::WorkflowStepCompleted {
             timestamp: now_epoch_secs(),
             data,
         }

@@ -9,6 +9,8 @@
 //! - `ca-cert.pem`  - the CA certificate, public material.
 //! - `ca-key.dpapi` - the CA signing key, DPAPI-wrapped (Windows).
 //! - `ca-key.pem`   - the CA signing key, mode 0600 (other platforms).
+//! - `lan-tokens.json` - SHA-256 hashes of LAN bearer tokens, keyed by node id.
+//!   The tokens themselves are only ever handed to the worker at pairing.
 //!
 //! The key is never written in the clear on Windows: whoever can read it can
 //! mint a client certificate this master will accept as an enrolled worker.
@@ -21,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 const CA_CERT_FILE: &str = "ca-cert.pem";
 const ENROLLMENTS_FILE: &str = "enrollments.json";
+const LAN_TOKENS_FILE: &str = "lan-tokens.json";
 
 #[cfg(windows)]
 const CA_KEY_FILE: &str = "ca-key.dpapi";
@@ -136,6 +139,52 @@ impl TrustStore {
     /// records describe workers whose certificates the new CA never signed.
     pub fn clear_enrollments(&self) {
         let _ = fs::remove_file(self.dir.join(ENROLLMENTS_FILE));
+    }
+
+    /// LAN token hashes as `(node_id, sha256 hex)`. As with enrollments, an
+    /// unreadable file yields nothing: the master must start, and a worker can
+    /// always pair again. Neither the file nor its hashes are logged.
+    pub fn load_lan_tokens(&self) -> HashMap<String, String> {
+        let path = self.dir.join(LAN_TOKENS_FILE);
+        let Ok(raw) = fs::read_to_string(&path) else {
+            return HashMap::new();
+        };
+        match serde_json::from_str::<HashMap<String, String>>(&raw) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    "ignoring unreadable LAN token store {}: {error}",
+                    path.display()
+                );
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Replaces the persisted `(node_id, sha256 hex)` map through the same
+    /// temp-file/rename helper as `save_ca`, so a crash cannot truncate it.
+    pub fn save_lan_tokens(&self, entries: &HashMap<String, String>) -> Result<(), TrustError> {
+        fs::create_dir_all(&self.dir).map_err(|e| self.io_error(&self.dir, e))?;
+        let json =
+            serde_json::to_string_pretty(entries).map_err(|e| TrustError::Encode(e.to_string()))?;
+        let path = self.dir.join(LAN_TOKENS_FILE);
+        write_atomic(&path, json.as_bytes()).map_err(|e| self.io_error(&path, e))
+    }
+
+    /// Forgets one token hash. The bearer token is already gone from memory on
+    /// revocation; this keeps a restart from restoring a revoked credential.
+    pub fn delete_lan_token(&self, node_id: &str) {
+        let mut entries = self.load_lan_tokens();
+        if entries.remove(node_id).is_some() {
+            if let Err(error) = self.save_lan_tokens(&entries) {
+                tracing::warn!("could not persist the LAN token revocation ({error})");
+            }
+        }
+    }
+
+    /// Drops every token hash, alongside the enrollments they were issued for.
+    pub fn clear_lan_tokens(&self) {
+        let _ = fs::remove_file(self.dir.join(LAN_TOKENS_FILE));
     }
 
     #[cfg(windows)]
@@ -301,6 +350,30 @@ mod tests {
             store.load_ca().is_none(),
             "a certificate without its key cannot sign anything"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lan_token_hashes_round_trip_and_can_be_deleted_or_cleared() {
+        let dir = temp_dir();
+        let store = TrustStore::new(&dir);
+        assert!(
+            store.load_lan_tokens().is_empty(),
+            "an empty store holds no tokens"
+        );
+
+        let mut entries = HashMap::new();
+        entries.insert("phone-a".to_string(), "a".repeat(64));
+        entries.insert("phone-b".to_string(), "b".repeat(64));
+        store.save_lan_tokens(&entries).expect("save token hashes");
+        assert_eq!(store.load_lan_tokens(), entries);
+
+        store.delete_lan_token("phone-a");
+        assert_eq!(store.load_lan_tokens().len(), 1);
+        assert!(!store.load_lan_tokens().contains_key("phone-a"));
+
+        store.clear_lan_tokens();
+        assert!(store.load_lan_tokens().is_empty());
         fs::remove_dir_all(&dir).ok();
     }
 

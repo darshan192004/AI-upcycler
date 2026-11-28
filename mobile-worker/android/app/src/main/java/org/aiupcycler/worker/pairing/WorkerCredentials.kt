@@ -8,6 +8,9 @@ package org.aiupcycler.worker.pairing
  * worker serves `WorkerService` behind, [clientCertPem]/[clientKeyPem] are for
  * worker-to-master links. `main`-source code does not load the client pair yet -
  * the mTLS server lifecycle (spec D-B5) is the slice that switches to it.
+ *
+ * [lanToken] is in memory only: pairing hands it to the secret store, and no
+ * plaintext credential file holds it (plan task 7).
  */
 data class WorkerCredentials(
     val caPem: String,
@@ -23,4 +26,34 @@ data class WorkerCredentials(
      * trusted, not as an unverified claim.
      */
     val fingerprint: String,
-)
+    /** `DiscoveredNode::node_id` returned by the master for this worker. */
+    val nodeId: String,
+    /** LAN API bearer token, held only in memory until routed to a SecretStore. */
+    val lanToken: String,
+    /** The master's LAN API port. */
+    val lanPort: Int,
+) {
+    /**
+     * Compatibility overload for the pre-existing mTLS-only test fixture,
+     * which lives outside task 7's write surface and only needs certificates.
+     * Production callers must supply the LAN fields explicitly.
+     */
+    constructor(
+        caPem: String,
+        serverCertPem: String,
+        serverKeyPem: String,
+        clientCertPem: String,
+        clientKeyPem: String,
+        fingerprint: String,
+    ) : this(
+        caPem = caPem,
+        serverCertPem = serverCertPem,
+        serverKeyPem = serverKeyPem,
+        clientCertPem = clientCertPem,
+        clientKeyPem = clientKeyPem,
+        fingerprint = fingerprint,
+        nodeId = "",
+        lanToken = "",
+        lanPort = 0,
+    )
+}

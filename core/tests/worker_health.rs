@@ -280,6 +280,7 @@ async fn the_generation_path_never_asks_a_worker_for_health() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "model": "llama-8b",
+                "provider": "local",
                 "stream": true,
                 "messages": [{ "role": "user", "content": "hello" }]
             }))

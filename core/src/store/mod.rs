@@ -4,7 +4,10 @@
 //! shared across async handlers (SQLite is single-writer). The schema mirrors
 //! `docs/database.md` and is applied idempotently on open.
 
+use crate::api::backend::MessageContent;
+use crate::settings::AppSettings;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -18,7 +21,26 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("store mutex poisoned")]
     Poisoned,
+    /// A cloud model id collides with an existing local GGUF (or vice versa).
+    #[error("{0}")]
+    Conflict(String),
+    /// Image attachment metadata is malformed; the message was rolled back.
+    #[error("invalid attachment")]
+    InvalidAttachment,
+    #[error("invalid settings json: {0}")]
+    SettingsJson(#[from] serde_json::Error),
+    #[error("invalid setting: {0}")]
+    InvalidSettings(String),
 }
+
+/// Marker prefix for catalog rows that represent cloud-only models. Such rows
+/// keep routing resolvable but are hidden from `/v1/models` because there is
+/// no GGUF to download or serve locally.
+pub const VIRTUAL_MODEL_PATH_PREFIX: &str = "virtual:";
+
+/// Marker for `content` values that hold serialized `MessageContent`.
+/// Unmarked values remain legacy plain text, including `[]` and quoted JSON.
+const MESSAGE_CONTENT_MARKER: &str = "mc1:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRow {
@@ -95,7 +117,7 @@ pub struct ChatMessageRow {
     pub message_id: i64,
     pub session_id: String,
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
     pub token_count: i64,
     pub generation_time_sec: f64,
     pub created_at: String,
@@ -105,9 +127,79 @@ pub struct ChatMessageRow {
 pub struct NewChatMessage {
     pub session_id: String,
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
     pub token_count: i64,
     pub generation_time_sec: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewWorkflowStep {
+    pub step_id: String,
+    pub prompt: String,
+    pub depends_on_json: String,
+    pub provider: Option<String>,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRunRow {
+    pub run_id: String,
+    pub model: String,
+    pub status: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStepRow {
+    pub run_id: String,
+    pub step_id: String,
+    pub prompt: String,
+    pub depends_on: Vec<String>,
+    pub provider: Option<String>,
+    pub status: String,
+    pub output: Option<String>,
+    pub source: Option<String>,
+    pub error: Option<String>,
+    pub position: i64,
+}
+
+/// Content-addressed image metadata attached to a chat message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentRow {
+    pub message_id: i64,
+    pub media_hash: String,
+    pub mime_type: String,
+    pub file_name: String,
+    pub byte_count: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewImage {
+    pub image_id: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub media_sha256: String,
+    pub media_path: String,
+    pub mime_type: String,
+    pub byte_len: i64,
+    pub size: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRow {
+    pub image_id: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub media_sha256: String,
+    pub media_path: String,
+    pub mime_type: String,
+    pub byte_len: i64,
+    pub size: String,
+    pub created_at_epoch_ms: i64,
 }
 
 /// SQLite-backed store for cluster, model, benchmark and chat persistence.
@@ -126,9 +218,10 @@ impl Store {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        recover_interrupted_workflows(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -218,25 +311,7 @@ impl Store {
 
     pub fn upsert_model(&self, model: &NewModel) -> Result<(), StoreError> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO models (model_id, file_name, quantization_format, total_layers, weight_size_bytes, local_file_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(model_id) DO UPDATE SET
-                file_name = excluded.file_name,
-                quantization_format = excluded.quantization_format,
-                total_layers = excluded.total_layers,
-                weight_size_bytes = excluded.weight_size_bytes,
-                local_file_path = excluded.local_file_path",
-            params![
-                model.model_id,
-                model.file_name,
-                model.quantization_format,
-                model.total_layers,
-                model.weight_size_bytes,
-                model.local_file_path,
-            ],
-        )?;
-        Ok(())
+        upsert_model_in(&conn, model)
     }
 
     pub fn get_model(&self, model_id: &str) -> Result<Option<ModelRow>, StoreError> {
@@ -249,6 +324,40 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Registers a cloud-only model id without a local GGUF. Existing virtual
+    /// rows are refreshed idempotently; a real local model with the same id is
+    /// a conflict, so a cloud route can never shadow a downloaded GGUF.
+    pub fn ensure_virtual_model(&self, model_id: &str, provider: &str) -> Result<(), StoreError> {
+        // Check and write under one lock: a local download completing in the
+        // gap between get_model and upsert_model could otherwise be replaced.
+        let conn = self.lock()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT local_file_path FROM models WHERE model_id = ?1",
+                params![model_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(path) = existing {
+            if !path.starts_with(VIRTUAL_MODEL_PATH_PREFIX) {
+                return Err(StoreError::Conflict(format!(
+                    "model id '{model_id}' is already a local GGUF"
+                )));
+            }
+        }
+        upsert_model_in(
+            &conn,
+            &NewModel {
+                model_id: model_id.to_string(),
+                file_name: model_id.to_string(),
+                quantization_format: "cloud".to_string(),
+                total_layers: 0,
+                weight_size_bytes: 0,
+                local_file_path: format!("{VIRTUAL_MODEL_PATH_PREFIX}{provider}"),
+            },
+        )
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelRow>, StoreError> {
@@ -295,6 +404,33 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn rename_session(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<Option<ChatSessionRow>, StoreError> {
+        let changed = {
+            let conn = self.lock()?;
+            conn.execute(
+                "UPDATE chat_sessions SET title = ?1 WHERE session_id = ?2",
+                params![title, session_id],
+            )?
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_session(session_id)
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let deleted = conn.execute(
+            "DELETE FROM chat_sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<ChatSessionRow>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -313,13 +449,14 @@ impl Store {
 
     pub fn append_message(&self, message: &NewChatMessage) -> Result<i64, StoreError> {
         let conn = self.lock()?;
+        let content = encode_message_content(&message.content)?;
         conn.execute(
             "INSERT INTO chat_messages (session_id, role, content, token_count, generation_time_sec)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 message.session_id,
                 message.role,
-                message.content,
+                content,
                 message.token_count,
                 message.generation_time_sec,
             ],
@@ -336,6 +473,457 @@ impl Store {
         let rows = stmt.query_map(params![session_id], map_message)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // --- workflows ----------------------------------------------------------
+
+    pub fn create_workflow_run(
+        &self,
+        run_id: &str,
+        model: &str,
+        steps: &[NewWorkflowStep],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO workflow_runs (run_id, model, status) VALUES (?1, ?2, 'running')",
+            params![run_id, model],
+        )?;
+        for step in steps {
+            tx.execute(
+                "INSERT INTO workflow_steps \
+                 (run_id, step_id, prompt, depends_on, provider, status, position) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    run_id,
+                    step.step_id,
+                    step.prompt,
+                    step.depends_on_json,
+                    step.provider,
+                    step.position,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_workflow_runs(&self) -> Result<Vec<WorkflowRunRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, model, status, created_at, finished_at \
+             FROM workflow_runs ORDER BY created_at, run_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WorkflowRunRow {
+                run_id: row.get(0)?,
+                model: row.get(1)?,
+                status: row.get(2)?,
+                created_at: row.get(3)?,
+                finished_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_workflow_run(&self, run_id: &str) -> Result<Option<WorkflowRunRow>, StoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT run_id, model, status, created_at, finished_at \
+             FROM workflow_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(WorkflowRunRow {
+                    run_id: row.get(0)?,
+                    model: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_workflow_steps(&self, run_id: &str) -> Result<Vec<WorkflowStepRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, step_id, prompt, depends_on, provider, status, \
+             output, source, error, position FROM workflow_steps \
+             WHERE run_id = ?1 ORDER BY position, step_id",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            let raw: String = row.get(3)?;
+            let depends_on: Vec<String> = serde_json::from_str(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(WorkflowStepRow {
+                run_id: row.get(0)?,
+                step_id: row.get(1)?,
+                prompt: row.get(2)?,
+                depends_on,
+                provider: row.get(4)?,
+                status: row.get(5)?,
+                output: row.get(6)?,
+                source: row.get(7)?,
+                error: row.get(8)?,
+                position: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_workflow_step_status(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        status: &str,
+        output: Option<&str>,
+        source: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE workflow_steps SET status = ?1, output = ?2, source = ?3, error = ?4 \
+             WHERE run_id = ?5 AND step_id = ?6",
+            params![status, output, source, error, run_id, step_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_workflow_run_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        finished: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        if finished {
+            conn.execute(
+                "UPDATE workflow_runs SET status = ?1, finished_at = CURRENT_TIMESTAMP \
+                 WHERE run_id = ?2",
+                params![status, run_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE workflow_runs SET status = ?1 WHERE run_id = ?2",
+                params![status, run_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Marks every non-terminal step and the run itself failed after a sink
+    /// error. Completed steps are left untouched so their outputs stay valid.
+    pub fn fail_workflow_run_after_sink_error(
+        &self,
+        run_id: &str,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE workflow_steps SET status = 'failed', error = ?1 \
+             WHERE run_id = ?2 AND status IN ('pending', 'running')",
+            params![error, run_id],
+        )?;
+        tx.execute(
+            "UPDATE workflow_runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP \
+             WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Inserts a chat message and its attachment metadata in one transaction.
+    /// Invalid attachment metadata aborts the whole message.
+    pub async fn insert_message_with_attachments(
+        &self,
+        msg: &NewChatMessage,
+        attachments: &[(String, String, String, u64)],
+    ) -> Result<i64, StoreError> {
+        let content = encode_message_content(&msg.content)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let result = (|| -> Result<i64, StoreError> {
+            tx.execute(
+                "INSERT INTO chat_messages (session_id, role, content, token_count, generation_time_sec)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    msg.session_id,
+                    msg.role,
+                    content,
+                    msg.token_count,
+                    msg.generation_time_sec,
+                ],
+            )?;
+            let message_id = tx.last_insert_rowid();
+            let created_at: String =
+                tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                    row.get(0)
+                })?;
+            for (media_hash, mime_type, file_name, byte_count) in attachments {
+                let valid_hash = media_hash.len() == 64
+                    && media_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+                let byte_count =
+                    i64::try_from(*byte_count).map_err(|_| StoreError::InvalidAttachment)?;
+                if !valid_hash || byte_count == 0 {
+                    return Err(StoreError::InvalidAttachment);
+                }
+                tx.execute(
+                    "INSERT INTO attachments \
+                     (message_id, media_hash, mime_type, file_name, byte_count, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![message_id, media_hash, mime_type, file_name, byte_count, created_at,],
+                )?;
+            }
+            Ok(message_id)
+        })();
+        match result {
+            Ok(message_id) => {
+                tx.commit()?;
+                Ok(message_id)
+            }
+            Err(error) => {
+                let _ = tx.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    /// Stored attachment metadata for one message.
+    pub async fn attachments_for_message(
+        &self,
+        message_id: i64,
+    ) -> Result<Vec<AttachmentRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, media_hash, mime_type, file_name, byte_count, created_at \
+             FROM attachments WHERE message_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![message_id], |row| {
+            Ok(AttachmentRow {
+                message_id: row.get(0)?,
+                media_hash: row.get(1)?,
+                mime_type: row.get(2)?,
+                file_name: row.get(3)?,
+                byte_count: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // --- images -------------------------------------------------------------
+
+    pub fn insert_image(&self, image: &NewImage) -> Result<ImageRow, StoreError> {
+        let conn = self.lock()?;
+        let created_at_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| StoreError::Poisoned)?
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT INTO images (image_id, provider, model, prompt, media_sha256, media_path,
+                                 mime_type, byte_len, size, created_at_epoch_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                image.image_id,
+                image.provider,
+                image.model,
+                image.prompt,
+                image.media_sha256,
+                image.media_path,
+                image.mime_type,
+                image.byte_len,
+                image.size,
+                created_at_epoch_ms,
+            ],
+        )?;
+        Ok(ImageRow {
+            image_id: image.image_id.clone(),
+            provider: image.provider.clone(),
+            model: image.model.clone(),
+            prompt: image.prompt.clone(),
+            media_sha256: image.media_sha256.clone(),
+            media_path: image.media_path.clone(),
+            mime_type: image.mime_type.clone(),
+            byte_len: image.byte_len,
+            size: image.size.clone(),
+            created_at_epoch_ms,
+        })
+    }
+
+    pub fn get_image(&self, image_id: &str) -> Result<Option<ImageRow>, StoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT image_id, provider, model, prompt, media_sha256, media_path,
+                    mime_type, byte_len, size, created_at_epoch_ms
+             FROM images WHERE image_id = ?1",
+            params![image_id],
+            map_image,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_images(&self, limit: i64, offset: i64) -> Result<Vec<ImageRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT image_id, provider, model, prompt, media_sha256, media_path,
+                    mime_type, byte_len, size, created_at_epoch_ms
+             FROM images ORDER BY created_at_epoch_ms DESC, image_id DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], map_image)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // --- settings -----------------------------------------------------------
+
+    pub fn get_settings(&self) -> Result<AppSettings, StoreError> {
+        // Missing rows fall back to the application defaults, not to the
+        // primitive `Default` values (0/false). All six keys are read under
+        // one connection lock so a concurrent write cannot mix generations.
+        let defaults = AppSettings::default();
+        let conn = self.lock()?;
+        Ok(AppSettings {
+            provider: setting_in(&conn, "provider")?.unwrap_or(defaults.provider),
+            model: setting_in(&conn, "model")?.unwrap_or(defaults.model),
+            context_tokens: setting_in(&conn, "context_tokens")?.unwrap_or(defaults.context_tokens),
+            max_tokens: setting_in(&conn, "max_tokens")?.unwrap_or(defaults.max_tokens),
+            show_source_badges: setting_in(&conn, "show_source_badges")?
+                .unwrap_or(defaults.show_source_badges),
+            compact_mode: setting_in(&conn, "compact_mode")?.unwrap_or(defaults.compact_mode),
+        })
+    }
+
+    pub fn put_settings(&self, settings: &AppSettings) -> Result<(), StoreError> {
+        settings
+            .validate()
+            .map_err(|message| StoreError::InvalidSettings(message.into()))?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let now = now_epoch_ms();
+        put_setting_json_in(&tx, "provider", &settings.provider, now)?;
+        put_setting_json_in(&tx, "model", &settings.model, now)?;
+        put_setting_json_in(&tx, "context_tokens", &settings.context_tokens, now)?;
+        put_setting_json_in(&tx, "max_tokens", &settings.max_tokens, now)?;
+        put_setting_json_in(&tx, "show_source_badges", &settings.show_source_badges, now)?;
+        put_setting_json_in(&tx, "compact_mode", &settings.compact_mode, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn setting_json(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT value_json FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+}
+
+fn encode_message_content(content: &MessageContent) -> Result<String, StoreError> {
+    let json = serde_json::to_string(content).map_err(|error| {
+        StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    })?;
+    Ok(format!("{MESSAGE_CONTENT_MARKER}{json}"))
+}
+
+fn decode_message_content(raw: &str) -> MessageContent {
+    let Some(json) = raw.strip_prefix(MESSAGE_CONTENT_MARKER) else {
+        // Unmarked rows are legacy literal text, including `[]` and quoted JSON.
+        return MessageContent::Text(raw.to_string());
+    };
+    serde_json::from_str(json).unwrap_or_else(|_| MessageContent::Text(raw.to_string()))
+}
+
+fn upsert_model_in(conn: &Connection, model: &NewModel) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO models (model_id, file_name, quantization_format, total_layers, weight_size_bytes, local_file_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(model_id) DO UPDATE SET
+             file_name = excluded.file_name,
+             quantization_format = excluded.quantization_format,
+             total_layers = excluded.total_layers,
+             weight_size_bytes = excluded.weight_size_bytes,
+             local_file_path = excluded.local_file_path",
+        params![
+            model.model_id,
+            model.file_name,
+            model.quantization_format,
+            model.total_layers,
+            model.weight_size_bytes,
+            model.local_file_path,
+        ],
+    )?;
+    Ok(())
+}
+
+fn recover_interrupted_workflows(conn: &mut Connection) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE workflow_steps SET status = 'failed', \
+         error = COALESCE(error, 'interrupted by restart') \
+         WHERE status IN ('pending', 'running')",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE workflow_runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP \
+         WHERE status IN ('pending', 'running')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn setting_in<T: DeserializeOwned>(conn: &Connection, key: &str) -> Result<Option<T>, StoreError> {
+    conn.query_row(
+        "SELECT value_json FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()?
+    .map(|text: String| serde_json::from_str(&text).map_err(StoreError::SettingsJson))
+    .transpose()
+}
+
+fn put_setting_json_in<T: Serialize>(
+    conn: &Connection,
+    key: &str,
+    value: &T,
+    now: i64,
+) -> Result<(), StoreError> {
+    let text = serde_json::to_string(value).map_err(StoreError::SettingsJson)?;
+    conn.execute(
+        "INSERT INTO settings (key, value_json, updated_at_epoch_ms)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+             value_json = excluded.value_json,
+             updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+        params![key, text, now],
+    )?;
+    Ok(())
+}
+
+fn now_epoch_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(0)
 }
 
 fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
@@ -375,14 +963,31 @@ fn map_benchmark(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRow> {
 }
 
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessageRow> {
+    let raw: String = row.get(3)?;
+    let content = decode_message_content(&raw);
     Ok(ChatMessageRow {
         message_id: row.get(0)?,
         session_id: row.get(1)?,
         role: row.get(2)?,
-        content: row.get(3)?,
+        content,
         token_count: row.get(4)?,
         generation_time_sec: row.get(5)?,
         created_at: row.get(6)?,
+    })
+}
+
+fn map_image(row: &rusqlite::Row<'_>) -> Result<ImageRow, rusqlite::Error> {
+    Ok(ImageRow {
+        image_id: row.get(0)?,
+        provider: row.get(1)?,
+        model: row.get(2)?,
+        prompt: row.get(3)?,
+        media_sha256: row.get(4)?,
+        media_path: row.get(5)?,
+        mime_type: row.get(6)?,
+        byte_len: row.get(7)?,
+        size: row.get(8)?,
+        created_at_epoch_ms: row.get(9)?,
     })
 }
 
@@ -527,8 +1132,367 @@ mod tests {
 
         let messages = store.list_messages("s1").unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content, "hello!");
+        assert_eq!(messages[1].content, MessageContent::Text("hello!".into()));
         assert_eq!(messages[1].generation_time_sec, 0.25);
         assert_eq!(store.list_sessions().unwrap().len(), 1);
+    }
+
+    use crate::api::backend::ContentPart;
+
+    #[tokio::test]
+    async fn insert_message_with_attachments_is_atomic() {
+        let db = store();
+        db.upsert_model(&NewModel {
+            model_id: "m1".into(),
+            file_name: "m1.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 32,
+            weight_size_bytes: 1,
+            local_file_path: "/m1.gguf".into(),
+        })
+        .unwrap();
+        db.create_session("1", "s1", "m1").unwrap();
+        let msg = NewChatMessage {
+            session_id: "1".into(),
+            role: "user".into(),
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "look".into(),
+                },
+                ContentPart::Image {
+                    media_hash: "cd".repeat(32),
+                    mime_type: "image/png".into(),
+                    file_name: "a.png".into(),
+                    byte_count: 4,
+                },
+            ]),
+            token_count: 0,
+            generation_time_sec: 0.0,
+        };
+        db.insert_message_with_attachments(
+            &msg,
+            &[("cd".repeat(32), "image/png".into(), "a.png".into(), 4)],
+        )
+        .await
+        .unwrap();
+        let rows = db.attachments_for_message(1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mime_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_rolls_back_message() {
+        let db = store();
+        db.upsert_model(&NewModel {
+            model_id: "m1".into(),
+            file_name: "m1.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 32,
+            weight_size_bytes: 1,
+            local_file_path: "/m1.gguf".into(),
+        })
+        .unwrap();
+        db.create_session("2", "s2", "m1").unwrap();
+        let msg = NewChatMessage {
+            session_id: "2".into(),
+            role: "user".into(),
+            content: MessageContent::Text("x".into()),
+            token_count: 0,
+            generation_time_sec: 0.0,
+        };
+        let res = db
+            .insert_message_with_attachments(
+                &msg,
+                &[("bad-hash".into(), "image/png".into(), "a.png".into(), 4)],
+            )
+            .await;
+        assert!(res.is_err());
+        assert!(db.list_messages("2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_round_trip_uses_json_values() {
+        let store = store();
+        let settings = crate::settings::AppSettings {
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            context_tokens: 16_384,
+            max_tokens: 2_048,
+            show_source_badges: false,
+            compact_mode: true,
+        };
+
+        store.put_settings(&settings).unwrap();
+
+        assert_eq!(store.get_settings().unwrap(), settings);
+        assert_eq!(
+            store.setting_json("context_tokens").unwrap().unwrap(),
+            "16384"
+        );
+        assert_eq!(
+            store.setting_json("provider").unwrap().unwrap(),
+            "\"openai\""
+        );
+    }
+
+    #[test]
+    fn settings_default_when_table_is_empty() {
+        let store = store();
+        assert_eq!(
+            store.get_settings().unwrap(),
+            crate::settings::AppSettings::default()
+        );
+    }
+
+    #[test]
+    fn put_settings_rejects_invalid_values_before_writing() {
+        let store = store();
+        let invalid = crate::settings::AppSettings {
+            context_tokens: 512,
+            ..crate::settings::AppSettings::default()
+        };
+
+        let error = store.put_settings(&invalid).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid setting: context_tokens must be between 1024 and 65536"
+        );
+        assert_eq!(
+            store.get_settings().unwrap(),
+            crate::settings::AppSettings::default()
+        );
+    }
+
+    #[test]
+    fn new_content_is_marked_and_legacy_text_stays_text() {
+        let db = store();
+        db.upsert_model(&NewModel {
+            model_id: "m1".into(),
+            file_name: "m1.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 1,
+            weight_size_bytes: 1,
+            local_file_path: "/m1.gguf".into(),
+        })
+        .unwrap();
+        db.create_session("s1", "s1", "m1").unwrap();
+        let id = db
+            .append_message(&NewChatMessage {
+                session_id: "s1".into(),
+                role: "user".into(),
+                content: MessageContent::Parts(vec![ContentPart::Text {
+                    text: "hello".into(),
+                }]),
+                token_count: 1,
+                generation_time_sec: 0.0,
+            })
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT content FROM chat_messages WHERE message_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw.starts_with(MESSAGE_CONTENT_MARKER));
+        for legacy in ["[]", "\"quoted text\""] {
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content) VALUES ('s1', 'user', ?1)",
+                params![legacy],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let rows = db.list_messages("s1").unwrap();
+        assert_eq!(
+            rows[0].content,
+            MessageContent::Parts(vec![ContentPart::Text {
+                text: "hello".into(),
+            }])
+        );
+        assert_eq!(rows[1].content, MessageContent::Text("[]".into()));
+        assert_eq!(
+            rows[2].content,
+            MessageContent::Text("\"quoted text\"".into())
+        );
+    }
+
+    #[test]
+    fn interrupted_workflows_reach_a_terminal_state_on_store_open() {
+        let dir = std::path::PathBuf::from(r"D:\ai-upcycler-temp")
+            .join(format!("ai-upcycler-wf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.sqlite");
+        {
+            let db = Store::open(&path).unwrap();
+            db.create_workflow_run(
+                "wf-1",
+                "m1",
+                &[NewWorkflowStep {
+                    step_id: "s1".into(),
+                    prompt: "hello".into(),
+                    depends_on_json: "[]".into(),
+                    provider: None,
+                    position: 0,
+                }],
+            )
+            .unwrap();
+            db.set_workflow_step_status("wf-1", "s1", "running", None, None, None)
+                .unwrap();
+        }
+
+        let db = Store::open(&path).unwrap();
+        let run = db.get_workflow_run("wf-1").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.finished_at.is_some());
+        let steps = db.list_workflow_steps("wf-1").unwrap();
+        assert_eq!(steps[0].status, "failed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sink_errors_fail_non_terminal_workflow_rows() {
+        let db = store();
+        db.create_workflow_run(
+            "wf-2",
+            "m1",
+            &[NewWorkflowStep {
+                step_id: "s1".into(),
+                prompt: "hello".into(),
+                depends_on_json: "[]".into(),
+                provider: None,
+                position: 0,
+            }],
+        )
+        .unwrap();
+        db.set_workflow_step_status("wf-2", "s1", "running", None, None, None)
+            .unwrap();
+
+        db.fail_workflow_run_after_sink_error("wf-2", "sink failed")
+            .unwrap();
+
+        let steps = db.list_workflow_steps("wf-2").unwrap();
+        assert_eq!(steps[0].status, "failed");
+        assert_eq!(steps[0].error.as_deref(), Some("sink failed"));
+        let run = db.get_workflow_run("wf-2").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.finished_at.is_some());
+    }
+
+    #[test]
+    fn session_rename_updates_title_and_returns_row() {
+        let store = store();
+        store
+            .upsert_model(&NewModel {
+                model_id: "llama-8b".into(),
+                file_name: "llama.gguf".into(),
+                quantization_format: "Q4_K_M".into(),
+                total_layers: 32,
+                weight_size_bytes: 1_024,
+                local_file_path: "D:\\ai-upcycler-target\\models\\llama.gguf".into(),
+            })
+            .unwrap();
+        store.create_session("s1", "Old title", "llama-8b").unwrap();
+
+        let renamed = store.rename_session("s1", "New title").unwrap().unwrap();
+
+        assert_eq!(renamed.title, "New title");
+        assert_eq!(store.get_session("s1").unwrap().unwrap().title, "New title");
+    }
+
+    #[test]
+    fn session_rename_missing_returns_none() {
+        let store = store();
+        assert!(store.rename_session("missing", "Title").unwrap().is_none());
+    }
+
+    #[test]
+    fn session_delete_cascades_messages() {
+        let store = store();
+        store
+            .upsert_model(&NewModel {
+                model_id: "llama-8b".into(),
+                file_name: "llama.gguf".into(),
+                quantization_format: "Q4_K_M".into(),
+                total_layers: 32,
+                weight_size_bytes: 1_024,
+                local_file_path: "D:\\ai-upcycler-target\\models\\llama.gguf".into(),
+            })
+            .unwrap();
+        store.create_session("s1", "Title", "llama-8b").unwrap();
+        store
+            .append_message(&NewChatMessage {
+                session_id: "s1".into(),
+                role: "user".into(),
+                content: MessageContent::Text("keep me out after delete".into()),
+                token_count: 3,
+                generation_time_sec: 0.1,
+            })
+            .unwrap();
+
+        assert!(store.delete_session("s1").unwrap());
+        assert!(store.get_session("s1").unwrap().is_none());
+        assert!(store.list_messages("s1").unwrap().is_empty());
+        assert!(!store.delete_session("s1").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    fn sample(image_id: &str) -> NewImage {
+        NewImage {
+            image_id: image_id.into(),
+            provider: "openai".into(),
+            model: "gpt-image-2.6-flare".into(),
+            prompt: "a red bicycle".into(),
+            media_sha256: "0123456789abcdef".repeat(4),
+            media_path: "images/01/0123456789abcdef.png".into(),
+            mime_type: "image/png".into(),
+            byte_len: 68,
+            size: "1024x1024".into(),
+        }
+    }
+
+    #[test]
+    fn insert_get_and_list_images() {
+        let store = Store::open_in_memory().unwrap();
+        let row = store.insert_image(&sample("img-1")).unwrap();
+        assert_eq!(row.image_id, "img-1");
+        assert_eq!(row.provider, "openai");
+        assert_eq!(row.media_path, "images/01/0123456789abcdef.png");
+
+        assert_eq!(
+            store.get_image("img-1").unwrap().unwrap().prompt,
+            "a red bicycle"
+        );
+        assert!(store.get_image("missing").unwrap().is_none());
+
+        store.insert_image(&sample("img-2")).unwrap();
+        let listed = store.list_images(1, 1).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].image_id, "img-1");
+    }
+
+    #[test]
+    fn schema_is_idempotent_and_stores_metadata_only() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'images'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("BLOB"));
+        assert!(sql.contains("media_sha256"));
+        assert!(sql.contains("media_path"));
+        assert!(sql.contains("created_at_epoch_ms"));
     }
 }

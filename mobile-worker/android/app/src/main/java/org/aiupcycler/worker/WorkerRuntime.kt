@@ -134,7 +134,7 @@ class WorkerRuntime(private val context: Context) {
     ): EnrollmentResult {
         val pairing = try {
             if (fingerprintIsComplete) {
-                PairingUri.parse("$PAYLOAD_PREFIX$fingerprint&token=$pin")
+                PairingUri.parse("${PAYLOAD_PREFIX}fp=$fingerprint&token=$pin")
             } else {
                 PairingUri.parseManual(pin, fingerprint)
             }

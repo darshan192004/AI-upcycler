@@ -11,8 +11,8 @@ use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use super::{ApiError, ApiResult, AppState};
-use crate::security::{is_valid_certificate_address, PairingError};
+use super::{ApiError, ApiResult, AppState, LanApiConfig};
+use crate::security::{generate_lan_token, is_valid_certificate_address, PairingError};
 
 /// Subject alternative names used when a worker declares none: the ADB tunnel
 /// makes the master dial the phone's own loopback (`adb reverse`).
@@ -101,6 +101,13 @@ pub struct EnrollResponse {
     pub server_cert_pem: String,
     pub server_key_pem: String,
     pub fingerprint: String,
+    /// Bearer credential for the master's LAN API. Returned only here, once;
+    /// the host keeps only its SHA-256 hash.
+    pub lan_token: String,
+    /// Effective port of the LAN listener, including an env override.
+    pub lan_port: u16,
+    /// The id this worker enrolled under, so it can report it to the master.
+    pub node_id: String,
 }
 
 pub async fn enroll(
@@ -144,12 +151,30 @@ pub async fn enroll(
         .ca
         .issue_server_cert(&addresses)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Only now that the PIN was redeemed and both certificates were issued is
+    // there an enrollment worth handing a LAN credential for.
+    let lan_token = generate_lan_token();
     let ids = enrollment_ids(node_id, serial.as_deref());
+    // Hold one lock across the complete enrollment: devices::revoke takes the
+    // same lock around enrollment + LAN-token removal, so the two cannot race.
+    let _enrollment_guard = state
+        .security
+        .enrollment_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     for id in &ids {
         state
             .security
             .enrollments
             .enroll(id, device_name, addresses.clone());
+        state
+            .security
+            .enrollments
+            .set_lan_token(id, &lan_token)
+            .map_err(|error| {
+                tracing::warn!("could not persist the LAN token hash: {error}");
+                ApiError::Internal("could not persist the LAN token hash".into())
+            })?;
     }
     // One phone reaches the master under two ids: its mDNS fullname over Wi-Fi
     // and `adb:<serial>` over USB. Enrolment is the only moment both are known
@@ -191,6 +216,9 @@ pub async fn enroll(
         server_cert_pem: server.cert_pem,
         server_key_pem: server.key_pem,
         fingerprint: state.security.ca.fingerprint().to_string(),
+        lan_token,
+        lan_port: LanApiConfig::from_env().port,
+        node_id: node_id.to_string(),
     }))
 }
 

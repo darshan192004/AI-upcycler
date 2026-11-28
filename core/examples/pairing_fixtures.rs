@@ -67,6 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_cert_pem: server.cert_pem.clone(),
         server_key_pem: server.key_pem.clone(),
         fingerprint: ca.fingerprint().to_string(),
+        // Synthetic fixture values only: no real LAN credential is generated or stored here.
+        lan_token: "lan-test-token".to_string(),
+        lan_port: 8090,
+        node_id: "fixture-worker".to_string(),
     };
     write(
         &dir,

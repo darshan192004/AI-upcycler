@@ -1,13 +1,28 @@
 import type {
+  AppSettings,
   AvailableDevice,
   AvailableDevicesResponse,
   ChatRequest,
+  ChatSession,
+  CreateWorkflowResponse,
   DownloadRequest,
+  GenerateImageRequest,
+  ImageListResponse,
+  ImageMetadata,
+  MediaRef,
   ModelList,
   ProvisionState,
+  ProviderList,
+  ProviderStatus,
   RevokeResponse,
   ScanResponse,
+  SessionList,
+  SessionMessages,
+  SettingsRecommendation,
   Topology,
+  WorkflowListResponse,
+  WorkflowRequest,
+  WorkflowRunDetail,
 } from './types';
 
 export const API_BASE = 'http://127.0.0.1:8080';
@@ -34,7 +49,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(detail);
   }
-  return (await resp.json()) as T;
+  // Successful writes may answer 204 with no body (e.g. session deletion).
+  const text = await resp.text();
+  if (text.length === 0) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export function getTopology(): Promise<Topology> {
@@ -102,6 +120,43 @@ export async function streamChat(
   onDone();
 }
 
+// ---- multimodal chat gate and media uploads (sub-project C) ---------------
+
+/**
+ * The gate lives on the host; the client must fail closed when it cannot be
+ * read. An optional config endpoint supplies it; Tauri may instead inject the
+ * same flag into the page before React mounts.
+ */
+export async function getMultimodalEnabled(): Promise<boolean> {
+  const injected = (window as Window & { __AI_UPCYCLER_MULTIMODAL__?: boolean })
+    .__AI_UPCYCLER_MULTIMODAL__;
+  if (typeof injected === 'boolean') return injected;
+  try {
+    const config = await request<{
+      multimodal_enabled?: boolean;
+      multimodal?: boolean;
+    }>('/api/config');
+    return config.multimodal_enabled === true || config.multimodal === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Uploads one image and returns the media reference used in chat parts. */
+export async function uploadImage(file: File): Promise<MediaRef> {
+  const form = new FormData();
+  form.append('file', file);
+  const resp = await fetch(`${API_BASE}/api/media`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!resp.ok) {
+    const body = (await resp.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? 'invalid_image_attachment');
+  }
+  return (await resp.json()) as MediaRef;
+}
+
 // ---- device onboarding (spec 2026-11-03, slice A) --------------------------
 
 export function getAvailableDevices(): Promise<AvailableDevicesResponse> {
@@ -162,4 +217,105 @@ export function startProvision(id: string, modelId: string): Promise<ProvisionSt
 
 export function getProvisionState(id: string): Promise<ProvisionState> {
   return request<ProvisionState>(`/api/devices/${encodeURIComponent(id)}/provision`);
+}
+
+// ---- cloud providers and shared chat sessions (sub-project B) --------------
+
+/** A bare array, not an object with a `providers` field (serde transparent). */
+export function listProviders(): Promise<ProviderList> {
+  return request<ProviderList>('/api/providers');
+}
+
+export function putProviderSecret(
+  id: string,
+  value: string,
+): Promise<ProviderStatus> {
+  return request<ProviderStatus>(
+    `/api/settings/secrets/${encodeURIComponent(id)}`,
+    { method: 'PUT', body: JSON.stringify({ value }) },
+  );
+}
+
+export function deleteProviderSecret(id: string): Promise<ProviderStatus> {
+  return request<ProviderStatus>(
+    `/api/settings/secrets/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function listSessions(): Promise<SessionList> {
+  return request<SessionList>('/api/sessions');
+}
+
+export function listSessionMessages(sessionId: string): Promise<SessionMessages> {
+  return request<SessionMessages>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+  );
+}
+
+// ---- persisted settings and session management (sub-project D) ------------
+
+export function getSettings(): Promise<AppSettings> {
+  return request<AppSettings>('/api/settings');
+}
+
+export function putSettings(settings: AppSettings): Promise<AppSettings> {
+  return request<AppSettings>('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+}
+
+export function getSettingsRecommendations(): Promise<SettingsRecommendation> {
+  return request<SettingsRecommendation>('/api/settings/recommendations');
+}
+
+export function renameSession(sessionId: string, title: string): Promise<ChatSession> {
+  return request<ChatSession>(
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'PUT', body: JSON.stringify({ title }) },
+  );
+}
+
+export function deleteSession(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
+}
+
+// ---- task workflows (spec 2026-11-27, §10) --------------------------------
+
+export function createWorkflow(req: WorkflowRequest): Promise<CreateWorkflowResponse> {
+  return request<CreateWorkflowResponse>('/api/workflows', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
+export function listWorkflows(): Promise<WorkflowListResponse> {
+  return request<WorkflowListResponse>('/api/workflows');
+}
+
+export function getWorkflow(runId: string): Promise<WorkflowRunDetail> {
+  return request<WorkflowRunDetail>(`/api/workflows/${encodeURIComponent(runId)}`);
+}
+
+export function generateImage(req: GenerateImageRequest): Promise<ImageMetadata> {
+  return request<ImageMetadata>('/api/images/generate', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
+export function listImages(limit = 60, offset = 0): Promise<ImageListResponse> {
+  const query = `limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`;
+  return request<ImageListResponse>(`/api/images?${query}`);
+}
+
+export function getImageMetadata(id: string): Promise<ImageMetadata> {
+  return request<ImageMetadata>(`/api/images/${encodeURIComponent(id)}/metadata`);
+}
+
+export function imageUrl(id: string): string {
+  return `${API_BASE}/api/images/${encodeURIComponent(id)}`;
 }

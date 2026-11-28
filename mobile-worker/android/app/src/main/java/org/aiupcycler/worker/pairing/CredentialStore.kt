@@ -1,6 +1,8 @@
 package org.aiupcycler.worker.pairing
 
 import java.io.File
+import org.aiupcycler.worker.chat.secrets.MemorySecretStore
+import org.aiupcycler.worker.chat.secrets.SecretStore
 
 /**
  * Persists the credentials enrollment issues, as PEM files under an
@@ -13,13 +15,18 @@ import java.io.File
  * `allowBackup="false"` (spec D-B4) already keeps private keys out of cloud
  * backup either way.
  *
- * A failure never strands the worker: every file is written to a staging
- * directory first, so nothing touches the live set until all six are on disk,
- * and any failed write attempt clears what it staged. Publication then
- * overwrites the previous files in place. See [save] for what that does and
- * does not guarantee for a failure *during* publication.
+ * The bearer secret is *not* a file: it is routed to the injected [SecretStore],
+ * while only the non-secret node id and port join the PEM files. A failure
+ * never strands the worker: every file is written to a staging directory
+ * first, so nothing touches the live set until all eight are on disk, and any
+ * failed write attempt clears what it staged. Publication then overwrites the
+ * previous files in place. See [save] for what that does and does not guarantee
+ * for a failure *during* publication.
  */
-class CredentialStore(private val directory: File) {
+class CredentialStore(
+    private val directory: File,
+    private val secrets: SecretStore = MemorySecretStore(),
+) {
 
     /** Whether a complete credential set is present. */
     fun hasCredentials(): Boolean = FILES.all { File(directory, it).isFile }
@@ -34,6 +41,10 @@ class CredentialStore(private val directory: File) {
             clientCertPem = read(CLIENT_CERT),
             clientKeyPem = read(CLIENT_KEY),
             fingerprint = read(FINGERPRINT).trim(),
+            nodeId = read(NODE_ID).trim(),
+            lanToken = secrets.read(SecretStore.LAN_TOKEN_KEY).orEmpty(),
+            lanPort = read(LAN_PORT).trim().toIntOrNull()
+                ?: throw java.io.IOException("invalid LAN port file: ${File(directory, LAN_PORT)}"),
         )
     }
 
@@ -49,7 +60,7 @@ class CredentialStore(private val directory: File) {
      * failed to arrive - the previous behaviour, which could strand the worker
      * with no credentials at all.
      *
-     * The files are pairwise consistent because all six come from one
+     * The files are pairwise consistent because all eight come from one
      * enrollment response, and a partial overwrite is only possible if the
      * write itself fails (disk full), which the caller surfaces as an
      * [java.io.IOException] and answers by re-pairing.
@@ -70,6 +81,8 @@ class CredentialStore(private val directory: File) {
             CLIENT_CERT to credentials.clientCertPem,
             CLIENT_KEY to credentials.clientKeyPem,
             FINGERPRINT to credentials.fingerprint,
+            NODE_ID to credentials.nodeId,
+            LAN_PORT to credentials.lanPort.toString(),
         )
 
         try {
@@ -78,6 +91,9 @@ class CredentialStore(private val directory: File) {
             for ((name, value) in values) {
                 File(staging, name).writeText(value)
             }
+            // The bearer secret leaves this class here and nowhere else: no
+            // file, staging or published, ever receives it.
+            secrets.write(SecretStore.LAN_TOKEN_KEY, credentials.lanToken)
             // Publish: overwrite in place. `renameTo` replaces an existing file
             // on every filesystem this runs on; the copy fallback exists for
             // the ones that refuse a rename across directories.
@@ -99,7 +115,14 @@ class CredentialStore(private val directory: File) {
 
     /** Forgets the pairing: the worker returns to plaintext-ADB-only service. */
     fun clear() {
-        directory.deleteRecursively()
+        try {
+            directory.deleteRecursively()
+        } finally {
+            secrets.delete(SecretStore.LAN_TOKEN_KEY)
+            SecretStore.PROVIDERS.forEach { provider ->
+                secrets.delete(SecretStore.keyFor(provider))
+            }
+        }
     }
 
     private fun read(name: String): String {
@@ -108,16 +131,22 @@ class CredentialStore(private val directory: File) {
         return file.readText()
     }
 
-    private companion object {
-        const val STAGING = ".staging"
+    companion object {
+        private const val STAGING = ".staging"
 
-        const val CA = "ca.pem"
-        const val SERVER_CERT = "server-cert.pem"
-        const val SERVER_KEY = "server-key.pem"
-        const val CLIENT_CERT = "client-cert.pem"
-        const val CLIENT_KEY = "client-key.pem"
-        const val FINGERPRINT = "fingerprint.txt"
+        private const val CA = "ca.pem"
+        private const val SERVER_CERT = "server-cert.pem"
+        private const val SERVER_KEY = "server-key.pem"
+        private const val CLIENT_CERT = "client-cert.pem"
+        private const val CLIENT_KEY = "client-key.pem"
+        private const val FINGERPRINT = "fingerprint.txt"
+        private const val NODE_ID = "node_id.txt"
+        private const val LAN_PORT = "lan_port.txt"
 
-        val FILES = listOf(CA, SERVER_CERT, SERVER_KEY, CLIENT_CERT, CLIENT_KEY, FINGERPRINT)
+        /** All persisted files; the bearer secret is deliberately absent. */
+        val FILES = listOf(
+            CA, SERVER_CERT, SERVER_KEY, CLIENT_CERT, CLIENT_KEY,
+            FINGERPRINT, NODE_ID, LAN_PORT,
+        )
     }
 }

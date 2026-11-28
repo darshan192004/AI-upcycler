@@ -1,9 +1,10 @@
 import { create } from 'zustand';
-import { getTopology, listModels } from '../lib/api';
+import { getTopology, listModels, listProviders } from '../lib/api';
 import type {
   DownloadProgressData,
   GenerationMetrics,
   ModelEntry,
+  ProviderStatus,
   TelemetryEvent,
   Topology,
   WorkerHealth,
@@ -15,6 +16,8 @@ interface ClusterState {
   topology: Topology | null;
   apiOnline: boolean;
   models: ModelEntry[];
+  /** Credential-free provider status from `GET /api/providers`. */
+  providers: ProviderStatus[];
   generationHistory: number[];
   latestMetrics: GenerationMetrics | null;
   /** The freshest measured health per worker id. */
@@ -24,6 +27,7 @@ interface ClusterState {
   downloads: Record<string, DownloadProgressData>;
   refreshTopology: () => Promise<void>;
   refreshModels: () => Promise<void>;
+  refreshProviders: () => Promise<void>;
   applyTelemetry: (event: TelemetryEvent) => void;
 }
 
@@ -31,6 +35,7 @@ export const useClusterStore = create<ClusterState>((set, get) => ({
   topology: null,
   apiOnline: false,
   models: [],
+  providers: [],
   generationHistory: [],
   latestMetrics: null,
   workerHealth: {},
@@ -50,6 +55,15 @@ export const useClusterStore = create<ClusterState>((set, get) => ({
     try {
       const list = await listModels();
       set({ models: list.data, apiOnline: true });
+    } catch {
+      set({ apiOnline: false });
+    }
+  },
+
+  refreshProviders: async () => {
+    try {
+      const providers = await listProviders();
+      set({ providers, apiOnline: true });
     } catch {
       set({ apiOnline: false });
     }

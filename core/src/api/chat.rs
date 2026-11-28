@@ -8,26 +8,34 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::backend::{
-    ChatMessage, FunctionCall, GenerationRequest, Stop, ToolCall, ToolCallDelta, ToolDef,
+    ChatMessage, FunctionCall, GenerationChunk, GenerationRequest, MessageContent, Stop, ToolCall,
+    ToolCallDelta, ToolDef,
 };
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::discovery::mdns::NodeRegistry;
-use crate::store::{NewChatMessage, Store};
+use crate::providers::{descriptor_for, CloudRoute, ProviderId};
+use crate::routing::RoutePolicy;
+use crate::store::{NewChatMessage, Store, StoreError, VIRTUAL_MODEL_PATH_PREFIX};
 use crate::telemetry::{
     now_epoch_secs, GenerationMetrics, TelemetryBus, TelemetryEvent, WorkerTelemetry,
 };
 use crate::worker_health::TelemetryCache;
 
 const ROLE_ASSISTANT: &str = "assistant";
+const IMAGE_REQUIRES_VISION: &str = "image_attachments_require_vision_provider";
+const PROVIDER_LACKS_VISION: &str = "provider_lacks_vision_support";
+const NO_VISION_MODEL: &str = "no_vision_capable_model_loaded";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -51,6 +59,16 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Where to run the turn: `auto` (default), `local`, or a cloud provider
+    /// id. A `provider:model` id is inferred only when this field is absent.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl ChatCompletionRequest {
+    fn wants_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+    }
 }
 
 fn default_temperature() -> f32 {
@@ -59,6 +77,93 @@ fn default_temperature() -> f32 {
 
 fn default_max_tokens() -> u32 {
     1024
+}
+
+/// A single typed refusal chunk. The real chat handler refuses before session
+/// writes; this stream keeps the SSE error contract testable independently of
+/// the transport and gives callers exactly one error, never a partial answer.
+fn image_attachment_error_stream() -> BoxStream<'static, Result<GenerationChunk, String>> {
+    Box::pin(async_stream::stream! {
+        yield Err(IMAGE_REQUIRES_VISION.to_string());
+    })
+}
+
+fn bad_request_code(code: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": code }))).into_response()
+}
+
+async fn image_refusal_response(stream_requested: bool) -> Response {
+    let chunks = image_attachment_error_stream().collect::<Vec<_>>().await;
+    let code = chunks
+        .into_iter()
+        .find_map(|item| item.err())
+        .unwrap_or_else(|| IMAGE_REQUIRES_VISION.to_string());
+
+    if stream_requested {
+        let event = Event::default().data(json!({ "error": { "message": code } }).to_string());
+        (
+            StatusCode::BAD_REQUEST,
+            Sse::new(futures::stream::iter(std::iter::once(Ok::<
+                Event,
+                Infallible,
+            >(event)))),
+        )
+            .into_response()
+    } else {
+        bad_request_code(&code)
+    }
+}
+
+fn has_image(request: &ChatCompletionRequest) -> bool {
+    request.messages.iter().any(|m| m.content.has_images())
+}
+
+fn tool_turn_has_image(request: &ChatCompletionRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|m| m.role == "tool" && m.content.has_images())
+}
+
+/// Local engines and cluster workers cannot render image parts. `Auto` picks
+/// the local/cluster path unless the backend is the labelled offline stub and
+/// a cloud route was inferred from the model id.
+fn is_local_or_cluster_turn(
+    policy: &RoutePolicy,
+    resolved: Option<&CloudRoute>,
+    state: &AppState,
+) -> bool {
+    match policy {
+        RoutePolicy::Local => true,
+        RoutePolicy::Auto => state.backend.is_real() || resolved.is_none(),
+        RoutePolicy::Cloud(_) => false,
+    }
+}
+
+fn cloud_route_for_image<'a>(
+    policy: &RoutePolicy,
+    resolved: Option<&'a CloudRoute>,
+    state: &AppState,
+) -> Option<&'a CloudRoute> {
+    match policy {
+        RoutePolicy::Cloud(_) => resolved,
+        RoutePolicy::Auto if !state.backend.is_real() => resolved,
+        _ => None,
+    }
+}
+
+fn route_supports_vision(route: &CloudRoute) -> bool {
+    descriptor_for(route.provider)
+        .models
+        .iter()
+        .any(|model| model.id == route.model && model.supports_vision)
+}
+
+fn provider_has_vision(provider: ProviderId) -> bool {
+    descriptor_for(provider)
+        .models
+        .iter()
+        .any(|model| model.supports_vision)
 }
 
 #[derive(Debug, Serialize)]
@@ -92,26 +197,132 @@ pub async fn chat_completions(
     if request.messages.is_empty() {
         return Err(ApiError::BadRequest("messages must not be empty".into()));
     }
-    let model = state
-        .store
-        .get_model(&request.model)?
-        .ok_or_else(|| ApiError::NotFound(format!("model '{}'", request.model)))?;
 
-    // Agent requests are host-only in phase 1 (spec D-A2). Refuse before the
+    // Fail-closed order: gate → tool role → local/cluster → vision capability →
+    // adapter. Every refusal returns before session writes or backend calls.
+    let has_image = has_image(&request);
+    if has_image && !state.multimodal_enabled {
+        return Ok(bad_request_code("multimodal_disabled"));
+    }
+    if has_image && tool_turn_has_image(&request) {
+        return Ok(image_refusal_response(request.stream).await);
+    }
+
+    let policy = RoutePolicy::parse(request.provider.as_deref()).map_err(ApiError::BadRequest)?;
+    let resolved = match state
+        .providers
+        .resolve(&request.model, request.provider.as_deref())
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            // A known cloud provider with no vision-capable catalog entry is a
+            // capability failure, never a reason to fall back to local text.
+            if has_image && matches!(policy, RoutePolicy::Cloud(id) if !provider_has_vision(id)) {
+                return Ok(bad_request_code(NO_VISION_MODEL));
+            }
+            return Err(ApiError::BadRequest(error));
+        }
+    };
+
+    if has_image && is_local_or_cluster_turn(&policy, resolved.as_ref(), &state) {
+        return Ok(image_refusal_response(request.stream).await);
+    }
+
+    if has_image {
+        match cloud_route_for_image(&policy, resolved.as_ref(), &state) {
+            Some(route) if !route_supports_vision(route) => {
+                return Ok(bad_request_code(PROVIDER_LACKS_VISION));
+            }
+            Some(_) => {}
+            None => {
+                if matches!(policy, RoutePolicy::Cloud(id) if !provider_has_vision(id)) {
+                    return Ok(bad_request_code(NO_VISION_MODEL));
+                }
+            }
+        }
+    }
+
+    // Agent requests are host-only in phase 1 (spec D-A2). Cloud providers
+    // have no tool renderer in this phase; refuse both cases before the
     // session or user turn is persisted, so a rejected request leaves no
     // half-written conversation behind.
-    if request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        && !state.backend.tool_calling_available()
-    {
-        return Err(ApiError::BadRequest(
-            "tool calls require a local host engine (llama-server); \
-             the distributed route cannot call tools"
-                .into(),
-        ));
+    if request.wants_tools() {
+        if matches!(policy, RoutePolicy::Cloud(_)) {
+            return Err(ApiError::BadRequest(
+                "tool calls require a local host engine (llama-server); \
+                 cloud providers cannot call tools in this phase"
+                    .into(),
+            ));
+        }
+        if !state.backend.tool_calling_available() {
+            return Err(ApiError::BadRequest(
+                "tool calls require a local host engine (llama-server); \
+                 the distributed route cannot call tools"
+                    .into(),
+            ));
+        }
     }
+
+    let cloud = match (policy, resolved) {
+        (RoutePolicy::Cloud(id), Some(route)) if route.provider == id => {
+            require_cloud_credentials(&state, &route)?;
+            Some(route)
+        }
+        (RoutePolicy::Cloud(id), None) => {
+            return Err(ApiError::BadRequest(format!(
+                "model '{}' is not available for provider '{}'",
+                request.model,
+                id.as_str()
+            )));
+        }
+        (RoutePolicy::Cloud(id), Some(_)) => {
+            return Err(ApiError::BadRequest(format!(
+                "model '{}' does not belong to provider '{}'",
+                request.model,
+                id.as_str()
+            )));
+        }
+        (RoutePolicy::Local, _) => None,
+        (RoutePolicy::Auto, Some(route)) if !state.backend.is_real() => {
+            require_cloud_credentials(&state, &route)?;
+            Some(route)
+        }
+        (RoutePolicy::Auto, None) if !state.backend.is_real() => {
+            return Err(ApiError::BadRequest(format!(
+                "no local engine is loaded and no cloud route is configured for model '{}'; \
+                 set provider to 'local' to use the offline stub, or configure a cloud provider",
+                request.model
+            )));
+        }
+        (RoutePolicy::Auto, _) => None,
+    };
+
+    // The session keeps the caller's id so history shows what they asked for.
+    // The envelope and adapter use a canonical `provider:model` id for cloud
+    // turns; adapters strip that prefix themselves before contacting the API.
+    let model_id = match &cloud {
+        Some(route) => {
+            reject_local_model_collision(&state, &request, route)?;
+            let canonical = format!("{}:{}", route.provider.as_str(), route.model);
+            for id in [request.model.as_str(), canonical.as_str()] {
+                state
+                    .store
+                    .ensure_virtual_model(id, route.provider.as_str())
+                    .map_err(|error| match error {
+                        StoreError::Conflict(message) => ApiError::Conflict(message),
+                        other => other.into(),
+                    })?;
+            }
+            canonical
+        }
+        None => {
+            state
+                .store
+                .get_model(&request.model)?
+                .ok_or_else(|| ApiError::NotFound(format!("model '{}'", request.model)))?
+                .model_id
+        }
+    };
 
     let session_id = resolve_session(&state, &request)?;
     if let Some(user) = request.messages.iter().rev().find(|m| m.role == "user") {
@@ -119,13 +330,14 @@ pub async fn chat_completions(
             session_id: session_id.clone(),
             role: user.role.clone(),
             content: user.content.clone(),
-            token_count: approx_tokens(&user.content),
+            token_count: approx_tokens(&user.content.content_text()),
             generation_time_sec: 0.0,
         })?;
     }
 
     let generation = GenerationRequest {
-        model: model.model_id.clone(),
+        model: model_id,
+        provider: request.provider.clone(),
         messages: request.messages.clone(),
         temperature: request.temperature,
         max_tokens: request.max_tokens,
@@ -136,23 +348,65 @@ pub async fn chat_completions(
         top_p: request.top_p,
         seed: request.seed,
     };
+    let stream: BoxStream<'static, Result<GenerationChunk, String>> = match &cloud {
+        Some(route) => state.providers.stream(route, generation.clone()),
+        None => state.backend.generate(generation.clone()),
+    };
 
     if request.stream {
-        Ok(stream_response(state, session_id, generation).into_response())
+        Ok(stream_response(state, session_id, generation.model.clone(), stream).into_response())
     } else {
-        Ok(buffered_response(state, session_id, generation)
+        Ok(buffered_response(state, session_id, generation, stream)
             .await?
             .into_response())
     }
+}
+
+fn require_cloud_credentials(state: &AppState, route: &CloudRoute) -> ApiResult<()> {
+    let configured = state
+        .providers
+        .statuses()
+        .iter()
+        .any(|status| status.id == route.provider && status.configured);
+    if configured {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "{} is not configured; save its API key in Settings before using it",
+            route.provider.as_str()
+        )))
+    }
+}
+
+/// A caller that explicitly asks a cloud provider for an existing local model
+/// id would otherwise silently replay a fake "cloud" turn over that GGUF.
+fn reject_local_model_collision(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    route: &CloudRoute,
+) -> ApiResult<()> {
+    if let Some(existing) = state.store.get_model(&request.model)? {
+        if !existing
+            .local_file_path
+            .starts_with(VIRTUAL_MODEL_PATH_PREFIX)
+        {
+            return Err(ApiError::Conflict(format!(
+                "model '{}' is a local model for provider '{}'",
+                request.model,
+                route.provider.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn buffered_response(
     state: AppState,
     session_id: String,
     generation: GenerationRequest,
+    mut stream: BoxStream<'static, Result<GenerationChunk, String>>,
 ) -> ApiResult<Json<ChatCompletionResponse>> {
     let started = Instant::now();
-    let mut stream = state.backend.generate(generation.clone());
 
     let mut content = String::new();
     let mut completion_tokens: u64 = 0;
@@ -161,8 +415,12 @@ async fn buffered_response(
     let mut prompt_tokens: Option<u64> = None;
     let mut tool_deltas: Vec<ToolCallDelta> = Vec::new();
     let mut finish_reason: Option<String> = None;
+    let mut source: Option<String> = None;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(ApiError::Internal)?;
+        if let Some(chunk_source) = chunk.source {
+            source = Some(chunk_source);
+        }
         if chunk.prompt_tokens.is_some() {
             prompt_tokens = chunk.prompt_tokens.map(u64::from);
         }
@@ -188,7 +446,7 @@ async fn buffered_response(
     persist_assistant(
         &state.store,
         &session_id,
-        &content,
+        MessageContent::Text(content.clone()),
         completion_tokens,
         elapsed,
     );
@@ -196,6 +454,7 @@ async fn buffered_response(
         &state.telemetry,
         &state.registry,
         &state.telemetry_cache,
+        source.as_deref().unwrap_or("local"),
         completion_tokens,
         elapsed,
     );
@@ -204,7 +463,7 @@ async fn buffered_response(
         generation
             .messages
             .iter()
-            .map(|m| approx_tokens(&m.content))
+            .map(|m| approx_tokens(&m.content.content_text()))
             .sum::<i64>() as u64
     });
 
@@ -217,7 +476,7 @@ async fn buffered_response(
             index: 0,
             message: ChatMessage {
                 role: ROLE_ASSISTANT.into(),
-                content,
+                content: MessageContent::Text(content),
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -238,10 +497,10 @@ async fn buffered_response(
 fn stream_response(
     state: AppState,
     session_id: String,
-    generation: GenerationRequest,
+    model: String,
+    mut backend: BoxStream<'static, Result<GenerationChunk, String>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let id = chatcmpl_id();
-    let model = generation.model.clone();
     let store = state.store.clone();
     let telemetry = state.telemetry.clone();
     let registry = state.registry.clone();
@@ -256,13 +515,23 @@ fn stream_response(
         let mut finish_reason: Option<String> = None;
         let mut saw_tool_calls = false;
         let mut tool_indices: HashSet<u32> = HashSet::new();
-        let mut backend = state.backend.generate(generation.clone());
+        let mut source: Option<String> = None;
         while let Some(item) = backend.next().await {
             match item {
                 Ok(chunk) => {
                     completion_tokens += u64::from(chunk.tokens_emitted);
                     content.push_str(&chunk.content);
-                    publish_metrics(&telemetry, &registry, &cache, completion_tokens, started.elapsed().as_secs_f64());
+                    if let Some(chunk_source) = chunk.source {
+                        source = Some(chunk_source);
+                    }
+                    publish_metrics(
+                        &telemetry,
+                        &registry,
+                        &cache,
+                        source.as_deref().unwrap_or("local"),
+                        completion_tokens,
+                        started.elapsed().as_secs_f64(),
+                    );
                     if !chunk.content.is_empty() {
                         yield Ok(sse_event(chunk_value(&id, &model, json!({ "content": chunk.content }), None)));
                     }
@@ -306,7 +575,7 @@ fn stream_response(
         yield Ok(sse_event(chunk_value(&id, &model, json!({}), Some(&reason))));
         yield Ok(Event::default().data("[DONE]"));
 
-        persist_assistant(&store, &session_id, &content, completion_tokens, started.elapsed().as_secs_f64());
+        persist_assistant(&store, &session_id, MessageContent::Text(content.clone()), completion_tokens, started.elapsed().as_secs_f64());
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -317,7 +586,7 @@ fn resolve_session(state: &AppState, request: &ChatCompletionRequest) -> ApiResu
         .messages
         .iter()
         .find(|m| m.role == "user")
-        .map(|m| truncate(&m.content, 48))
+        .map(|m| truncate(&m.content.content_text(), 48))
         .unwrap_or_else(|| "New chat".to_string());
 
     match &request.session_id {
@@ -382,14 +651,14 @@ fn merge_tool_calls(deltas: Vec<ToolCallDelta>) -> Vec<ToolCall> {
 fn persist_assistant(
     store: &Store,
     session_id: &str,
-    content: &str,
+    content: MessageContent,
     tokens: u64,
     elapsed_secs: f64,
 ) {
     if let Err(error) = store.append_message(&NewChatMessage {
         session_id: session_id.to_string(),
         role: ROLE_ASSISTANT.to_string(),
-        content: content.to_string(),
+        content,
         token_count: tokens as i64,
         generation_time_sec: elapsed_secs,
     }) {
@@ -401,6 +670,7 @@ fn publish_metrics(
     telemetry: &TelemetryBus,
     registry: &NodeRegistry,
     cache: &TelemetryCache,
+    source: &str,
     current_token: u64,
     elapsed_secs: f64,
 ) {
@@ -428,6 +698,7 @@ fn publish_metrics(
     telemetry.publish(TelemetryEvent::generation_metrics(GenerationMetrics {
         tokens_per_second,
         current_token,
+        source: source.to_string(),
         master_ram_utilization_pct: cache.master_ram().and_then(|(value, _)| value),
         worker_nodes,
     }));
@@ -506,6 +777,7 @@ mod tests {
             max_tokens: 64,
             stream,
             session_id: Some("s1".into()),
+            provider: Some("local".into()),
             tools: None,
             tool_choice: None,
             stop: None,
@@ -595,6 +867,7 @@ mod tests {
             &state.telemetry,
             &state.registry,
             &state.telemetry_cache,
+            "local",
             10,
             1.0,
         );
@@ -606,6 +879,7 @@ mod tests {
                 assert_eq!(data.worker_nodes[0].temp_celsius, Some(38.5));
                 assert_eq!(data.worker_nodes[0].battery_pct, Some(92.0));
                 assert_eq!(data.master_ram_utilization_pct, Some(42.0));
+                assert_eq!(data.source, "local");
             }
             other => panic!("expected generation metrics, got {other:?}"),
         }
@@ -632,6 +906,7 @@ mod tests {
             &state.telemetry,
             &state.registry,
             &state.telemetry_cache,
+            "local",
             10,
             1.0,
         );
@@ -642,6 +917,7 @@ mod tests {
                 assert_eq!(data.worker_nodes[0].temp_celsius, None);
                 assert_eq!(data.worker_nodes[0].battery_pct, None);
                 assert_eq!(data.master_ram_utilization_pct, None);
+                assert_eq!(data.source, "local");
             }
             other => panic!("expected generation metrics, got {other:?}"),
         }
@@ -654,6 +930,27 @@ mod tests {
         let session = state.store.get_session(&id).unwrap().unwrap();
         assert_eq!(session.title, "hello there");
         assert_eq!(session.model_id, "llama-8b");
+    }
+
+    #[test]
+    fn session_title_uses_every_text_part() {
+        use crate::api::backend::ContentPart;
+
+        let state = seeded_state();
+        let mut req = request(false);
+        req.session_id = Some("s-parts".into());
+        req.messages[0].content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Summarize ".into(),
+            },
+            ContentPart::Text {
+                text: "this report".into(),
+            },
+        ]);
+
+        let id = resolve_session(&state, &req).unwrap();
+        let session = state.store.get_session(&id).unwrap().unwrap();
+        assert_eq!(session.title, "Summarize this report");
     }
 
     #[tokio::test]
@@ -692,14 +989,17 @@ mod tests {
             session_id: session_id.clone(),
             ..Default::default()
         };
-        let Json(response) = buffered_response(state.clone(), session_id.clone(), generation)
-            .await
-            .unwrap();
+        let stream = state.backend.generate(generation.clone());
+        let Json(response) =
+            buffered_response(state.clone(), session_id.clone(), generation, stream)
+                .await
+                .unwrap();
 
         assert_eq!(response.choices[0].finish_reason, "stop");
         assert!(response.choices[0]
             .message
             .content
+            .as_str()
             .contains("[stub:llama-8b]"));
         assert!(response.usage.completion_tokens > 0);
 
@@ -712,5 +1012,52 @@ mod tests {
     fn approx_tokens_counts_words() {
         assert_eq!(approx_tokens("a b c"), 3);
         assert_eq!(approx_tokens(""), 1);
+    }
+
+    fn image_request() -> ChatCompletionRequest {
+        let mut req = request(true);
+        req.provider = Some("local".into());
+        req.messages[0].content = serde_json::from_value(json!([{
+            "type":"image",
+            "media_hash":"ab".repeat(32),
+            "mime_type":"image/png",
+            "file_name":"a.png",
+            "byte_count":4
+        }]))
+        .expect("image content");
+        req
+    }
+
+    /// Mirrors the stream dispatch used by the API: the refusal is one typed
+    /// chunk, not an HTTP status, so callers see a single error in the stream.
+    async fn dispatch_image_turn_for_test(
+        _state: &AppState,
+        _request: &ChatCompletionRequest,
+    ) -> Vec<Result<GenerationChunk, String>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let stream = image_attachment_error_stream();
+        tokio::spawn(async move {
+            for item in stream.collect::<Vec<_>>().await {
+                let _ = tx.send(item).await;
+            }
+        });
+        let mut chunks = Vec::new();
+        while let Some(item) = rx.recv().await {
+            chunks.push(item);
+        }
+        chunks
+    }
+
+    #[tokio::test]
+    async fn stream_yields_single_error_chunk_for_local_image() {
+        let mut state = seeded_state();
+        state.multimodal_enabled = true;
+
+        let chunks = dispatch_image_turn_for_test(&state, &image_request()).await;
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            Err(code) => assert_eq!(code, "image_attachments_require_vision_provider"),
+            Ok(chunk) => panic!("expected the refusal error, got {chunk:?}"),
+        }
     }
 }

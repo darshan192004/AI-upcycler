@@ -8,7 +8,9 @@
 //! clients holding a cert signed by this CA.
 
 use crate::rpc::engine::{WorkerTlsConfig, WorkerTransport, WorkerTransportSource};
-use crate::trust::TrustStore;
+use crate::trust::{TrustError, TrustStore};
+use base64::Engine as _;
+use rand::RngCore as _;
 use rcgen::{
     string::Ia5String, BasicConstraints, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
@@ -19,6 +21,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use subtle::{Choice, ConstantTimeEq};
 
 /// Default pairing session lifetime (docs/security.md §3 QR/PIN flow).
 pub const PAIRING_TTL: Duration = Duration::from_secs(300);
@@ -339,6 +342,54 @@ impl PairingManager {
     }
 }
 
+/// Prefix that marks a LAN bearer token, so a token can be recognised without
+/// treating arbitrary user input as a credential.
+const LAN_TOKEN_PREFIX: &str = "aiu1_";
+
+/// Generates a LAN bearer token: 32 OS-random bytes in unpadded base64url,
+/// prefixed for easy identification. The plaintext goes only into the pairing
+/// response; the master keeps the hash.
+pub fn generate_lan_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!(
+        "{LAN_TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
+/// The SHA-256 of a presented LAN token. Stored in hex on disk, held as raw
+/// bytes in memory, and compared in constant time.
+pub fn hash_lan_token(token: &str) -> [u8; 32] {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
+/// Parses one persisted hash. Anything that is not exactly 64 lowercase hex
+/// characters is ignored rather than trusted as a credential.
+fn parse_lan_token_hash(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    for (chunk, byte) in value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(hash.iter_mut())
+    {
+        *byte = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(hash)
+}
+
 /// Workers that completed pairing, keyed by the `node_id` the master dials them
 /// by (`DiscoveredNode::node_id` for mDNS, `adb:<serial>` for USB).
 ///
@@ -349,6 +400,8 @@ impl PairingManager {
 #[derive(Default)]
 pub struct EnrollmentRegistry {
     workers: Mutex<HashMap<String, EnrolledWorker>>,
+    /// SHA-256 of each worker's LAN bearer token, never the token itself.
+    lan_tokens: Mutex<HashMap<String, [u8; 32]>>,
     store: Option<Arc<TrustStore>>,
 }
 
@@ -381,6 +434,7 @@ impl EnrollmentRegistry {
             .collect();
         Self {
             workers: Mutex::new(workers),
+            lan_tokens: Mutex::new(HashMap::new()),
             store: Some(store),
         }
     }
@@ -435,6 +489,120 @@ impl EnrollmentRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.workers.lock().expect("enrollment lock").is_empty()
+    }
+
+    /// Records the hash of one worker's LAN token, replacing any previous hash
+    /// for that id. Re-pairing therefore invalidates the old token.
+    ///
+    /// The write-through happens under the same lock as the in-memory change:
+    /// a token that could not be persisted must not stay live, or a restart
+    /// would revoke a credential the caller was told had been issued.
+    pub fn set_lan_token(&self, node_id: &str, token: &str) -> Result<(), TrustError> {
+        let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
+        let previous = tokens.insert(node_id.to_string(), hash_lan_token(token));
+        if let Some(store) = self.store.as_ref() {
+            if let Err(error) = store.save_lan_tokens(&hex_lan_tokens(&tokens)) {
+                match previous {
+                    Some(hash) => {
+                        tokens.insert(node_id.to_string(), hash);
+                    }
+                    None => {
+                        tokens.remove(node_id);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored hash for an id, if that id has a LAN token.
+    pub fn get_lan_token(&self, node_id: &str) -> Option<[u8; 32]> {
+        self.lan_tokens
+            .lock()
+            .expect("LAN token lock")
+            .get(node_id)
+            .copied()
+    }
+
+    /// Hashes a presented token and checks it against every enrolled id. The
+    /// LAN bearer header carries no id, so any live token authenticates the
+    /// caller; comparing all hashes avoids an early exit on the first miss.
+    pub fn verify_lan_token(&self, token: &str) -> bool {
+        self.verify_lan_token_hash(&hash_lan_token(token))
+    }
+
+    /// Constant-time comparison against the stored token hashes.
+    pub fn verify_lan_token_hash(&self, hash: &[u8; 32]) -> bool {
+        let tokens = self.lan_tokens.lock().expect("LAN token lock");
+        let mut matched = Choice::from(0u8);
+        for stored in tokens.values() {
+            matched |= stored.as_slice().ct_eq(hash.as_slice());
+        }
+        bool::from(matched)
+    }
+
+    /// Forgets the token hashes for the given ids and any aliases still sharing
+    /// those hashes, then persists the removal.
+    ///
+    /// Callers pass every id known to belong to the device, so a re-pair that
+    /// rotated only one alias cannot leave an older token live under another
+    /// id. The same-hash fallback preserves the behavior for aliases enrolled
+    /// together. A failed write-through is reported and rolled back: memory
+    /// must keep matching what a restart will load.
+    pub fn revoke_lan_token_ids(&self, node_ids: &[String]) -> Result<bool, TrustError> {
+        let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
+        let snapshot: Vec<(String, [u8; 32])> = tokens
+            .iter()
+            .map(|(id, hash)| (id.clone(), *hash))
+            .collect();
+        let targets: Vec<[u8; 32]> = node_ids
+            .iter()
+            .filter_map(|id| tokens.get(id).copied())
+            .collect();
+        let aliases: Vec<(String, [u8; 32])> = snapshot
+            .into_iter()
+            .filter(|(id, hash)| node_ids.contains(id) || targets.contains(hash))
+            .collect();
+        if aliases.is_empty() {
+            return Ok(false);
+        }
+        for (id, _) in &aliases {
+            tokens.remove(id);
+        }
+        if let Some(store) = self.store.as_ref() {
+            if let Err(error) = store.save_lan_tokens(&hex_lan_tokens(&tokens)) {
+                for (id, hash) in aliases {
+                    tokens.insert(id, hash);
+                }
+                return Err(error);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Forgets the token hash for one id (and every alias sharing it).
+    pub fn revoke_lan_token(&self, node_id: &str) -> Result<bool, TrustError> {
+        self.revoke_lan_token_ids(&[node_id.to_string()])
+    }
+
+    /// Loads the persisted hashes after the CA has been resolved. Hashes from
+    /// a rotated CA are cleared before this is called, so only tokens whose
+    /// certificates are still valid come back.
+    pub fn load_lan_tokens(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let mut loaded = HashMap::new();
+        for (node_id, value) in store.load_lan_tokens() {
+            match parse_lan_token_hash(&value) {
+                Some(hash) => {
+                    loaded.insert(node_id, hash);
+                }
+                None => tracing::warn!("ignoring an unreadable LAN token hash"),
+            }
+        }
+        *self.lan_tokens.lock().expect("LAN token lock") = loaded;
     }
 
     /// Forgets an enrollment and persists the removal.
@@ -537,6 +705,9 @@ pub struct SecurityState {
     pub ca: NodeCa,
     pub pairing: PairingManager,
     pub enrollments: EnrollmentRegistry,
+    /// Serializes enrollment against revocation: both touch the enrollment
+    /// record and the LAN token, which otherwise have separate locks.
+    pub enrollment_lock: Arc<Mutex<()>>,
 }
 
 impl Default for SecurityState {
@@ -547,6 +718,7 @@ impl Default for SecurityState {
             ca: NodeCa::generate().expect("ephemeral CA generation"),
             pairing: PairingManager::new(PAIRING_TTL),
             enrollments: EnrollmentRegistry::new(),
+            enrollment_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -560,23 +732,25 @@ impl SecurityState {
     /// start before the CA was persisted.
     pub fn load_or_generate(trust_dir: impl Into<PathBuf>) -> Self {
         let store = Arc::new(TrustStore::new(trust_dir));
-        let ca = match store.load_ca() {
+        let (ca, reused_ca) = match store.load_ca() {
             Some((cert, key)) => match NodeCa::from_parts(&cert, &key) {
-                Ok(ca) => ca,
+                Ok(ca) => (ca, true),
                 Err(error) => {
                     tracing::warn!(
                         "persisted CA in {} is unusable ({error}); generating a new one",
                         store.dir().display()
                     );
                     store.clear_enrollments();
-                    generate_and_persist(&store)
+                    store.clear_lan_tokens();
+                    (generate_and_persist(&store), false)
                 }
             },
             None => {
                 // No usable CA: any stored enrollment was signed by one that no
                 // longer exists, so keeping it would authorize nothing.
                 store.clear_enrollments();
-                generate_and_persist(&store)
+                store.clear_lan_tokens();
+                (generate_and_persist(&store), false)
             }
         };
         tracing::info!(
@@ -584,10 +758,17 @@ impl SecurityState {
             &ca.fingerprint()[..8],
             store.dir().display()
         );
+        let enrollments = EnrollmentRegistry::with_store(store);
+        // A newly generated CA invalidates tokens from the previous trust root,
+        // even if the cleanup write failed on a read-only trust directory.
+        if reused_ca {
+            enrollments.load_lan_tokens();
+        }
         Self {
             ca,
             pairing: PairingManager::new(PAIRING_TTL),
-            enrollments: EnrollmentRegistry::with_store(store),
+            enrollments,
+            enrollment_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -615,6 +796,14 @@ fn six_digit_pin() -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The on-disk shape of the LAN token registry: lowercase hex only.
+fn hex_lan_tokens(tokens: &HashMap<String, [u8; 32]>) -> HashMap<String, String> {
+    tokens
+        .iter()
+        .map(|(node_id, hash)| (node_id.clone(), hex(hash)))
+        .collect()
 }
 
 /// DER bytes of a PEM certificate, so a CA loaded from disk can be
@@ -809,6 +998,24 @@ mod tests {
     }
 
     #[test]
+    fn the_lan_token_registry_stores_only_hashes_and_compares_them() {
+        let registry = EnrollmentRegistry::new();
+        let token = generate_lan_token();
+        let hash = hash_lan_token(&token);
+
+        assert_eq!(hash.len(), 32);
+        assert!(!registry.verify_lan_token(&token));
+        registry
+            .set_lan_token("phone-a", &token)
+            .expect("set token");
+        assert_eq!(registry.get_lan_token("phone-a"), Some(hash));
+        assert!(registry.verify_lan_token(&token));
+        assert!(registry.revoke_lan_token("phone-a").expect("revoke"));
+        assert!(!registry.verify_lan_token(&token));
+        assert!(!registry.revoke_lan_token("phone-a").expect("revoke"));
+    }
+
+    #[test]
     fn a_revoked_enrollment_does_not_come_back_after_a_restart() {
         let dir = temp_trust_dir();
         {
@@ -824,6 +1031,52 @@ mod tests {
             !restarted.enrollments.is_enrolled("phone-a"),
             "a revocation that only lived in memory would let a revoked phone back in"
         );
+    }
+
+    #[test]
+    fn revoking_one_alias_revokes_every_alias_sharing_the_token() {
+        let registry = EnrollmentRegistry::new();
+        let token = generate_lan_token();
+        registry
+            .set_lan_token("phone.local.", &token)
+            .expect("set mDNS token");
+        registry
+            .set_lan_token("adb:16284c49", &token)
+            .expect("set USB alias token");
+        assert!(registry.verify_lan_token(&token));
+
+        assert!(registry
+            .revoke_lan_token("adb:16284c49")
+            .expect("revoke USB alias"));
+        assert!(
+            !registry.verify_lan_token(&token),
+            "the same hash under another alias would keep the token live"
+        );
+        assert_eq!(registry.get_lan_token("phone.local."), None);
+    }
+
+    #[test]
+    fn revoking_linked_ids_revokes_divergent_token_hashes() {
+        let registry = EnrollmentRegistry::new();
+        let usb_token = generate_lan_token();
+        let wifi_token = generate_lan_token();
+        registry
+            .set_lan_token("adb:16284c49", &usb_token)
+            .expect("set USB token");
+        registry
+            .set_lan_token("phone.local.", &wifi_token)
+            .expect("set Wi-Fi token");
+        assert!(registry.verify_lan_token(&usb_token));
+        assert!(registry.verify_lan_token(&wifi_token));
+
+        assert!(registry
+            .revoke_lan_token_ids(&["adb:16284c49".to_string(), "phone.local.".to_string(),])
+            .expect("revoke linked ids"));
+        assert!(
+            !registry.verify_lan_token(&usb_token),
+            "an older USB token must not survive revoking the linked device"
+        );
+        assert!(!registry.verify_lan_token(&wifi_token));
     }
 
     fn temp_trust_dir() -> PathBuf {

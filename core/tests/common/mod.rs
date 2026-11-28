@@ -397,6 +397,31 @@ pub async fn serve_mock_identity(
     (port, handle)
 }
 
+/// Serves an axum `Router` on an ephemeral loopback port.
+///
+/// Returns the base URL (without a trailing slash) and the server task. The
+/// caller stops the mock by aborting that handle. A broadcast channel drives
+/// axum's graceful shutdown: the sender is held by the server task for its
+/// whole life, so an in-flight request can be drained if a signal is ever
+/// published, while normal teardown stays an explicit `JoinHandle::abort()`.
+pub async fn spawn_mock_provider(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock provider");
+    let addr = listener.local_addr().expect("mock provider local addr");
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let handle = tokio::spawn(async move {
+        let _shutdown_tx = shutdown_tx;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await
+            .expect("mock provider server");
+    });
+    (format!("http://{addr}"), handle)
+}
+
 /// Serves `worker` behind mutual TLS using the master's own server identity.
 pub async fn serve_mock_tls(worker: MockWorker, ca: &NodeCa) -> (u16, tokio::task::JoinHandle<()>) {
     serve_mock_identity(
