@@ -14,6 +14,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     Forbidden(String),
+    #[error("{0}")]
+    Unauthorized(String),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
     #[error("{0}")]
@@ -27,6 +29,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Store(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(json!({
@@ -59,5 +62,8 @@ mod tests {
 
         let response = ApiError::Forbidden("bad pin".into()).into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = ApiError::Unauthorized("unauthorized".into()).into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

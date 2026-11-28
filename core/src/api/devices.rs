@@ -111,7 +111,12 @@ pub async fn revoke(
             // must not stop the enrollment from being removed.
             let _ = service.disconnect(&id);
         }
-        security.enrollments.revoke(&id)
+        let revoked = security.enrollments.revoke(&id);
+        // The LAN bearer token is the other credential for this device: both
+        // must die in the same blocking step, or a revoked phone could still
+        // reach the LAN API with a token it kept from pairing.
+        security.enrollments.revoke_lan_token(&id);
+        revoked
     })
     .await
     .map_err(join_failure)?;
