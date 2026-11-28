@@ -254,4 +254,84 @@ class ChatReducerTest {
         assertEquals("server-42", next.messages.single().stableId)
         assertEquals("answer!", next.messages.single().content)
     }
+
+    // Task 11 provider/source/progress contract. Every value below is
+    // synthetic: no real token, provider key, host, or device serial is used.
+    @Test
+    fun providerChoiceAutoOmitsProviderAndExplicitChoicesSendExactIds() {
+        fun bodyFor(choice: ProviderChoice) = org.json.JSONObject(
+            LanRequestBuilder.chatBody("s-provider-test", "local-synthetic", choice, emptyList()),
+        )
+
+        val auto = bodyFor(ProviderChoice.Auto)
+
+        assertFalse(auto.has("provider"))
+        assertEquals(null, providerRequestValue(ProviderChoice.Auto))
+        assertEquals("local", bodyFor(ProviderChoice.Local).optString("provider"))
+        assertEquals("local", providerRequestValue(ProviderChoice.Local))
+        assertEquals("openai", bodyFor(ProviderChoice.Cloud("openai")).optString("provider"))
+        assertEquals("openai", providerRequestValue(ProviderChoice.Cloud("openai")))
+        assertEquals("kimi", providerRequestValue(ProviderChoice.Cloud("kimi")))
+    }
+
+    @Test
+    fun sourceBadgeTextMapsEverySourceToExactVisibleLabel() {
+        val customProvider = ProviderStatus("custom-cloud", "Custom Cloud", configured = true)
+
+        assertEquals("Local engine", sourceBadgeText(Source.Local))
+        assertEquals("Worker synthetic-serial", sourceBadgeText(Source.Worker("adb:synthetic-serial")))
+        assertEquals("Cloud OpenAI", sourceBadgeText(Source.Provider("openai")))
+        assertEquals(
+            "Cloud Custom Cloud",
+            sourceBadgeText(Source.Provider("custom-cloud"), listOf(customProvider)),
+        )
+        assertEquals("Source unknown", sourceBadgeText(null))
+        assertEquals("Source unknown", sourceBadgeText(Source.Provider("not-configured")))
+    }
+
+    @Test
+    fun provisioningTextUsesExactBytesAndTerminalStatesNeverPercentages() {
+        val running = ProvisionState.Running(bytesDone = 12_345L, totalBytes = 67_890L)
+        val failure = "provision failed: HTTP 503 (retry later)"
+
+        assertEquals("12345/67890", provisioningText(running))
+        assertFalse(provisioningText(running).contains("%"))
+        assertEquals("Model ready", provisioningText(ProvisionState.Done(bytes = 67_890L)))
+        assertEquals(failure, provisioningText(ProvisionState.Failed(failure)))
+        assertTrue(shouldPollProvisioning(running))
+        assertFalse(shouldPollProvisioning(ProvisionState.Idle))
+        assertFalse(shouldPollProvisioning(ProvisionState.Done(bytes = 67_890L)))
+        assertFalse(shouldPollProvisioning(ProvisionState.Failed(failure)))
+    }
+
+    @Test
+    fun providerChangeKeepsModelInNewCatalogAndResetsModelOutsideIt() {
+        val local = ModelEntry(id = "local-synthetic")
+        val localPrefixed = ModelEntry(id = "beta:dup")
+        val openAi = ModelEntry(id = "openai:gpt-4o-mini", ownedBy = "openai")
+        val anthropic = ModelEntry(id = "anthropic:synthetic", ownedBy = "anthropic")
+        val state = baseState.copy(
+            models = listOf(local, localPrefixed, openAi, anthropic),
+            selectedModel = "openai:gpt-4o-mini",
+        )
+
+        assertEquals(
+            listOf("openai:gpt-4o-mini"),
+            availableModelIds(state, ProviderChoice.Cloud("openai")),
+        )
+        assertEquals(listOf("local-synthetic", "beta:dup"), availableModelIds(state, ProviderChoice.Local))
+
+        val kept = reduce(state, ChatEvent.ProviderSelected(ProviderChoice.Cloud("openai")))
+        assertEquals(ProviderChoice.Cloud("openai"), kept.selectedProvider)
+        assertEquals("openai:gpt-4o-mini", kept.selectedModel)
+
+        val reset = reduce(state.copy(selectedModel = "local-synthetic"), ChatEvent.ProviderSelected(ProviderChoice.Cloud("openai")))
+        assertEquals("openai:gpt-4o-mini", reset.selectedModel)
+
+        val localReset = reduce(state, ChatEvent.ProviderSelected(ProviderChoice.Local))
+        assertEquals("local-synthetic", localReset.selectedModel)
+
+        val empty = reduce(state, ChatEvent.ProviderSelected(ProviderChoice.Cloud("not-configured")))
+        assertEquals("", empty.selectedModel)
+    }
 }
