@@ -477,6 +477,35 @@ rather than a stale transfer.
   to that device is already running. The checks run in that order, before a
   byte moves.
 
+### 3.6 Task workflow runs (spec 2026-11-27, §10)
+
+`POST /api/workflows` starts a DAG. The body requires a `model` and a non-empty
+`steps` array; each step has `id`, `prompt`, `depends_on` (array of step ids),
+and optional `provider` (`auto`, `local`, or a configured provider id). Unknown,
+duplicate, self-, repeated, or cyclic dependencies are rejected with `400`.
+
+```json
+{
+  "model": "llama-8b",
+  "steps": [
+    { "id": "draft", "prompt": "Draft the outline", "depends_on": [], "provider": "local" },
+    { "id": "review", "prompt": "Review the outline", "depends_on": ["draft"], "provider": "local" }
+  ]
+}
+```
+
+Success is `202` with `{"run_id":"wf-...","status":"running"}`. Steps execute in
+deterministic topological order through the same provider bridge as chat; a
+failed step blocks its transitive dependents and unrelated steps still run.
+
+`GET /api/workflows` returns `{"runs":[{"run_id","model","status","created_at","finished_at"}]}`
+with statuses `running`, `completed`, `failed`.
+
+`GET /api/workflows/{id}` returns `{"run":{...},"steps":[...]}`. Each step
+carries `step_id`, `prompt`, `depends_on`, `provider`, `status`, `output`,
+`source`, `error`, and `position`. Step statuses are `pending`, `running`,
+`completed`, `failed`, `blocked`. An unknown id returns `404`.
+
 ---
 
 ## 4. WebSocket Real-Time Telemetry API
@@ -551,6 +580,21 @@ keeps its last measured snapshot, with `observed_at_epoch_ms` saying how old it 
   }
 }
 ```
+
+`workflow_step_started` and `workflow_step_completed` carry workflow progress
+for the desktop timeline and the phone's read-only view. Both use the tagged
+format; `status` in a completed event is `completed`, `failed`, or `blocked`.
+
+```json
+{"event":"workflow_step_started","timestamp":1764278400,
+ "data":{"run_id":"wf-...","step_id":"draft"}}
+{"event":"workflow_step_completed","timestamp":1764278401,
+ "data":{"run_id":"wf-...","step_id":"draft","status":"completed",
+         "output":"...","source":"local","error":null}}
+```
+
+The socket does not replay old events: clients load initial state from
+`GET /api/workflows/{id}` and apply WS events on top of it.
 
 ## 5. Browser Origins
 

@@ -252,6 +252,11 @@ not a change to this agent path.
   CPU, the quantisation, and the context. Measure on your own machine before
   relying on them.
 
+Workflow runs (`POST /api/workflows`) are separate from chat sessions. Steps do
+not inherit an agent's session: each run gets its own `workflow-<run_id>`
+generation session id. A step's `provider` follows the same `auto`/`local`/
+provider-id rules as chat requests; loopback remains unauthenticated.
+
 ## Related documents
 
 - `docs/api.md` section 2.3 for the endpoint surface, and section 6 for the
