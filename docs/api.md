@@ -2,9 +2,10 @@
 
 ## 1. Overview
 
-**AI Upcycler** exposes two primary API surfaces:
-1. **Host Desktop External REST & WebSocket API**: Exposed on port `8080` of the Master Node (OpenAI-compatible) for consumption by frontend UIs, scripts, and local extensions.
+**AI Upcycler** exposes three API surfaces:
+1. **Host Desktop External REST & WebSocket API**: Exposed on port `8080` of the Master Node (OpenAI-compatible) for consumption by frontend UIs, scripts, and local extensions. It stays bound to `127.0.0.1` and unauthenticated; see §5 for the browser-origin boundary.
 2. **Inter-Node RPC Protocol**: Protocol Buffer binary protocol over TCP port `50062` between the Master Node and Worker Nodes.
+3. **LAN REST API (opt-in, off by default)**: a separate bearer-authenticated listener for the phone client, on its own port and allowlist (§6).
 
 ---
 
@@ -138,9 +139,10 @@ filtered out of `GET /v1/models`. Local GGUF ids keep their existing lookup and
 
 ### 2.5 Provider and secret endpoints
 
-Base URL: `http://localhost:8080/api`. These endpoints are loopback-only and
-unauthenticated in this phase. Every example below uses the placeholder
-`sk-...`; no real key is shown or returned.
+Base URL: `http://localhost:8080/api`. On loopback these endpoints are
+unauthenticated (§5 describes the browser-origin boundary); the LAN mirror in §6
+requires a bearer token. Every example below uses the placeholder `sk-...`; no
+real key is shown or returned.
 
 #### `GET /api/providers`
 
@@ -199,6 +201,24 @@ unauthenticated in this phase. Every example below uses the placeholder
 - **Response**: `200 OK` with the same status-only object, now
   `configured: false`. Repeated deletion is idempotent; an unknown provider
   path is `404`.
+
+### 2.6 Read-only shared session routes
+
+Chat completions create sessions through `session_id`; these routes only let a
+phone or desktop client rediscover them and replay their messages. Neither
+client keeps a local session database. There are no write routes here —
+rename and delete belong to a later phase.
+
+| Route | Response |
+|---|---|
+| `GET /api/sessions` | `200 OK` `{"sessions":[...]}` — session rows ordered by `created_at, session_id`, with no message bodies. |
+| `GET /api/sessions/:id` | `200 OK` with one session row. |
+| `GET /api/sessions/:id/messages` | `200 OK` `{"messages":[...]}` — message rows with `message_id`, `role`, `content`, `token_count`, `generation_time_sec`, `created_at`. |
+
+A missing `:id` is `404` in the standard error envelope. Message `content` is
+ordinary user-facing text; there is no separate field for secrets or
+encrypted-looking payloads. These routes are also available on the LAN
+allowlist (§6), where each request needs a bearer token.
 
 ---
 
@@ -378,12 +398,20 @@ neither is the master (it is not a polled worker).
     omitted, they default to `["127.0.0.1", "localhost"]` (the `adb reverse`
     loopback tunnel). An explicitly empty list is a `400`, not a default.
 - **Response**: `200 OK` — redeems the PIN and issues the worker's two mTLS
-  identities, plus the CA to trust. Both are signed by the master's ephemeral CA
-  and pinned to one role (TLS certificates here are never dual-purpose):
-  - `server_cert_pem`/`server_key_pem` — **server** role. The worker serves
-    `WorkerService` behind this; the master validates it against `fingerprint`
-    on every dial, and its SANs are the `addresses` above.
-  - `client_cert_pem`/`client_key_pem` — **client** role, for worker→master links.
+  identities, plus the CA to trust. Both are pinned to one role (TLS
+  certificates here are never dual-purpose):
+  - `ca_pem` / `fingerprint` — the CA certificate to trust and its fingerprint;
+    the master validates the worker's server certificate against this on every
+    dial.
+  - `server_cert_pem` / `server_key_pem` — **server** role. The worker serves
+    `WorkerService` behind this; its SANs are the `addresses` above.
+  - `client_cert_pem` / `client_key_pem` — **client** role, for worker→master
+    links.
+  - `lan_token` — the bearer credential for the opt-in LAN API (§6), returned
+    only here, once. Its value is never reproduced in these docs; the host
+    keeps only a SHA-256 hash in `lan-tokens.json` (§5 of `docs/security.md`).
+  - `lan_port` — the LAN listener port (default `8090`; see §6).
+  - `node_id` — the id this worker enrolled under, echoed back to the client.
 ```json
 {
   "ca_pem": "-----BEGIN CERTIFICATE-----…",
@@ -391,11 +419,15 @@ neither is the master (it is not a polled worker).
   "client_key_pem": "-----BEGIN PRIVATE KEY-----…",
   "server_cert_pem": "-----BEGIN CERTIFICATE-----…",
   "server_key_pem": "-----BEGIN PRIVATE KEY-----…",
-  "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8"
+  "fingerprint": "d87240d8adc360808043b42fd7e91fbe5cbbec0d21805b1b3d14b3d6ba17b4b8",
+  "lan_port": 8090,
+  "node_id": "Pixel-8._aiupcycler-worker._tcp.local."
 }
 ```
-  The enrollment is recorded in-memory against `node_id`; the master's CA is
-  ephemeral, so it is discarded on restart along with the certificates it signed.
+  The response also contains `lan_token`; its value is deliberately omitted here.
+  The enrollment and the token hash are persisted in the trust directory. When
+  the stored CA is missing or unusable, the master generates a new one and
+  clears both enrollments and token hashes, rotating every LAN token.
 - **Errors**: `400` when `device_name` is empty or longer than 64 characters, when
   `node_id` is empty or longer than 128 characters, or when an address is neither
   an IP literal nor a DNS name (or more than 8 are given); `403` when the PIN is
@@ -453,7 +485,7 @@ rather than a stale transfer.
 - **Events Emitted**:
   - `node_connected`: Broadcast when a new mobile device connects.
   - `node_disconnected`: Broadcast when a device loses connection.
-  - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference. `data.source` is `local`, `adb:<serial>`, or a provider id.
+  - `generation_metrics`: Emits token speed (tokens/sec), RAM utilization, and temperatures during inference. `generation_metrics.data.source` is `local`, `adb:<serial>` (a real cluster worker), or a provider id (`openai`, `anthropic`, `gemini`, `kimi`); agent requests that omit `provider` keep their existing event shape and source.
   - `worker_health`: Emits the freshest measured health of every worker (battery, CPU temperature, free RAM) plus the master's own RAM utilization. Published after each poll cycle (every 5 s).
   - `model_download_progress`: Emits GGUF download progress (`running` / `complete` / `error`) with received and total bytes.
 
@@ -473,11 +505,6 @@ rather than a stale transfer.
   }
 }
 ```
-
-For `generation_metrics`, `data.source` is the backend that produced the
-tokens: `local`, `adb:<serial>` (a real cluster worker), or a provider id
-(`openai`, `anthropic`, `gemini`, `kimi`). Agent requests that omit `provider`
-keep their existing event shape and source.
 
 ```json
 {
@@ -545,5 +572,52 @@ answers `403` to a foreign origin, because browsers do not apply CORS to
 WebSocket upgrades (spec 2026-10-24).
 
 This is not authentication. A program running as the same user can still call
-the API; that boundary is the OS account, and it stays documented as a known
-limit in `docs/tasks.md`.
+the loopback API; that boundary is the OS account, and it stays documented as a
+known limit in `docs/tasks.md`. The LAN listener (§6) has no CORS layer; its
+routes require a bearer token instead.
+
+---
+
+## 6. LAN REST API (opt-in)
+
+The LAN listener exists for the phone chat client. It is **off by default** and
+is a separate listener from loopback `127.0.0.1:8080`: the loopback API stays
+unauthenticated, while every LAN route below requires
+`Authorization: Bearer <pairing token>`. mDNS discovery itself needs no token.
+Neither listener may be published through a proxy, tunnel, or firewall rule
+(`docs/AGENTS.md` §8).
+
+| Setting | Contract |
+|---|---|
+| `AI_UPCYCLER_LAN_API` | Set to exactly `AI_UPCYCLER_LAN_API=1` to enable; any other value (including absence) leaves it off. |
+| `AI_UPCYCLER_LAN_API_PORT` | Listener port, default `8090`; an invalid value falls back to `8090` with a warning. The effective port is returned as `lan_port` at enrollment (§3.4). |
+
+When enabled, the listener binds a resolved LAN IPv4 address only (never
+`0.0.0.0`) and advertises `_aiupcycler-master._tcp.local.` via mDNS. TXT records
+carry public metadata only — `version`, `node_id`, `api_port`, `fingerprint` —
+never a token. The phone also accepts a manual `host:port` when mDNS does not
+cross subnets. Discovery validates the fingerprint against the one received at
+pairing.
+
+**Exact route allowlist** (all of these require the bearer header; this is not
+the loopback router):
+
+| Method and route | Purpose |
+|---|---|
+| `GET /v1/models` | Registered local models (§2.1). |
+| `POST /v1/chat/completions` | Streaming or non-streaming chat (§2.2, §2.4). |
+| `GET /api/providers` | Provider status (§2.5). |
+| `POST /api/providers/:id/test` | One short provider completion (§2.5). |
+| `PUT /api/settings/secrets/:provider` | Write a provider key (§2.5). |
+| `DELETE /api/settings/secrets/:provider` | Delete a provider key (§2.5). |
+| `GET /api/sessions` | List sessions (§2.6). |
+| `GET /api/sessions/:id` | One session (§2.6). |
+| `GET /api/sessions/:id/messages` | Session messages (§2.6). |
+| `GET /api/devices/:id/provision` | Provisioning status (§3.5). |
+
+Pairing, device control, cluster management, model download, and the telemetry
+WebSocket are **not** on the LAN allowlist. A missing, malformed, revoked, or
+rotated token returns `401` with the fixed body
+`{"error":{"message":"unauthorized","type":"unauthorized","code":401}}` — no
+model, session, or provider detail. Token format, storage, rotation, and
+revocation are specified in `docs/security.md` §5.

@@ -206,8 +206,8 @@ chat UI is unchanged.
 
 Agent requests should omit `provider`: omission means `auto`, which keeps the
 host/tool behaviour described above. The loopback API remains unauthenticated
-in sub-project A. A LAN listener is still out of scope; it belongs to
-sub-project B.
+in sub-project A; the phone's LAN listener is a separate opt-in surface (§8),
+not a change to this agent path.
 
 ## 7. Troubleshooting
 
@@ -224,9 +224,18 @@ sub-project B.
 
 ## 8. Limits and safety
 
-- The API binds to `127.0.0.1` only and has no authentication. Do not expose
-  the port through a proxy, tunnel, or firewall rule. Anyone who can reach it
-  can use your model and, through an agent, your files.
+- Rule 1 — loopback: the agent API on `127.0.0.1:8080` has no authentication and
+  must stay bound to loopback. Never expose it through a proxy, tunnel, or
+  firewall rule. Anyone who can reach it can use your model and, through an
+  agent, your files.
+- Rule 2 — LAN: the LAN API is off unless `AI_UPCYCLER_LAN_API=1`, and
+  `AI_UPCYCLER_LAN_API_PORT` selects its port (default 8090). It is a separate
+  bearer-authenticated listener for the phone: discovery uses
+  `_aiupcycler-master._tcp` mDNS, pairing supplies the `lan_token`, the host
+  stores only its SHA-256 hash in `lan-tokens.json`, and a rejected credential
+  returns `401` with no detail. It must not be published through a proxy,
+  tunnel, or firewall rule either. Routes and settings: `docs/api.md` §6;
+  token lifecycle: `docs/security.md` §5.
 - One host engine serves one GGUF in this phase. There is no in-app switch
   between the host model and the cluster's active model.
 - Distributed tool calling is not implemented. Cluster workers serve plain
@@ -245,7 +254,9 @@ sub-project B.
 
 ## Related documents
 
-- `docs/api.md` section 2.3 for the endpoint surface.
+- `docs/api.md` section 2.3 for the endpoint surface, and section 6 for the
+  opt-in LAN listener.
+- `docs/security.md` section 5 for the LAN token lifecycle and boundaries.
 - `docs/superpowers/specs/2026-10-24-agent-api-compatibility-design.md` for the
   request/response contract and the host-only decision.
 - `docs/launch-readiness.md` for the remaining distribution and hardware work.
