@@ -2,6 +2,7 @@ pub mod adb;
 pub mod api;
 pub mod autoconfig;
 pub mod discovery;
+pub mod imagegen;
 pub mod media;
 pub mod mmap;
 pub mod onboarding;
