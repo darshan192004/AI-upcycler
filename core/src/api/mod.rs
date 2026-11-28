@@ -26,7 +26,7 @@ pub use lan::{LanApiConfig, DEFAULT_LAN_PORT, LAN_API_ENV, LAN_PORT_ENV};
 use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
-use crate::discovery::mdns::NodeRegistry;
+use crate::discovery::mdns::{start_master_advert, MasterServiceInfo, NodeRegistry};
 use crate::providers::ProviderRegistry;
 use crate::secrets::{KeyringSecretStore, SecretStore, UnconfiguredSecretStore};
 use crate::security::SecurityState;
@@ -37,7 +37,7 @@ use axum::routing::{delete, get, post, put};
 use axum::Router;
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -516,7 +516,53 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
     // live telemetry.
     tokio::spawn(crate::worker_health::worker_health_poll(state.clone()));
 
+    // The LAN listener is opt-in. The hint address carries only the configured
+    // port; `serve_lan` replaces its IP with a resolved private IPv4 and never
+    // binds the loopback hint.
+    let config = LanApiConfig::from_env();
+    if config.enabled {
+        let lan_hint = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), config.port);
+        let lan_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_lan(lan_hint, lan_state).await {
+                tracing::warn!("LAN API listener stopped: {error}");
+            }
+        });
+    }
+
     axum::serve(listener, router(state)).await
+}
+
+/// Starts the opt-in LAN listener on a resolved private IPv4 and advertises
+/// only public pairing metadata over mDNS-SD.
+///
+/// `addr` contributes the configured port; its IP is a loopback hint that is
+/// never bound. When no LAN IPv4 exists this logs the documented message and
+/// returns, leaving the loopback listener untouched.
+pub async fn serve_lan(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
+    if !LanApiConfig::from_env().enabled {
+        return Ok(());
+    }
+    let Some(lan_ip) = crate::discovery::mdns::resolve_lan_bind_addr_from_interfaces() else {
+        tracing::warn!(
+            "LAN API enabled but no LAN IPv4 address was found; manual host:port is unavailable"
+        );
+        return Ok(());
+    };
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(lan_ip), addr.port());
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let info = MasterServiceInfo {
+        instance_name: state.host.node_id.clone(),
+        node_id: state.host.node_id.clone(),
+        fingerprint: state.security.ca.fingerprint().to_string(),
+        port: bind_addr.port(),
+    };
+    // Held for the lifetime of this future; dropping it unregisters the advert.
+    let _advert = start_master_advert(&info, lan_ip).map_err(std::io::Error::other)?;
+
+    tracing::info!("AI Upcycler LAN API listening on http://{bind_addr}");
+    axum::serve(listener, lan::lan_router(state)).await
 }
 
 /// Binds the pairing-only listener ([`pairing_router`]) and serves until the
