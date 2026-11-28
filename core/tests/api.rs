@@ -1164,3 +1164,138 @@ async fn refuses_a_foreign_telemetry_origin_and_lets_the_shell_in() {
         "a native client sends no origin and must still subscribe; got: {native}"
     );
 }
+
+/// Polls the detail endpoint until the background executor finishes.
+async fn wait_for_workflow(app: Router, run_id: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, body) = send(
+                app.clone(),
+                "GET",
+                &format!("/api/workflows/{run_id}"),
+                None,
+            )
+            .await;
+            if body["run"]["status"] != "running" {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("workflow finished within 5 seconds")
+}
+
+#[tokio::test]
+async fn creates_and_reads_a_two_step_workflow() {
+    let state = state();
+    let app = router(state.clone());
+    let (status, created) = send(
+        app.clone(),
+        "POST",
+        "/api/workflows",
+        Some(json!({
+            "model": "llama-8b",
+            "steps": [
+                {"id":"a","prompt":"first","depends_on":[],"provider":"local"},
+                {"id":"b","prompt":"second","depends_on":["a"],"provider":"local"}
+            ]
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = created["run_id"].as_str().unwrap().to_string();
+    assert_eq!(created["status"], "running");
+
+    let detail = wait_for_workflow(app.clone(), &run_id).await;
+    assert_eq!(detail["run"]["status"], "completed");
+    assert_eq!(detail["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["steps"][0]["status"], "completed");
+    assert_eq!(detail["steps"][1]["depends_on"][0], "a");
+    assert!(detail["steps"][0]["output"]
+        .as_str()
+        .unwrap()
+        .contains("[stub:llama-8b]"));
+
+    let (status, list) = send(app, "GET", "/api/workflows", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["runs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn workflow_validation_rejects_bad_graphs_without_creating_a_run() {
+    let state = state();
+    let app = router(state.clone());
+    let (status, body) = send(
+        app.clone(),
+        "POST",
+        "/api/workflows",
+        Some(json!({
+            "model": "llama-8b",
+            "steps": [
+                {"id":"a","prompt":"one","depends_on":["b"]},
+                {"id":"b","prompt":"two","depends_on":["a"]}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().contains("cycle"));
+
+    let (status, list) = send(app, "GET", "/api/workflows", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["runs"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn workflow_detail_for_unknown_run_is_not_found() {
+    let (status, body) = send(router(state()), "GET", "/api/workflows/wf-missing", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("wf-missing"));
+}
+
+#[tokio::test]
+async fn workflow_progress_is_published_over_the_existing_telemetry_bus() {
+    let state = state();
+    let mut receiver = state.telemetry.subscribe();
+    let app = router(state);
+    let (status, created) = send(
+        app,
+        "POST",
+        "/api/workflows",
+        Some(json!({
+            "model": "llama-8b",
+            "steps": [{"id":"a","prompt":"one","depends_on":[],"provider":"local"}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = created["run_id"].as_str().unwrap().to_string();
+
+    let mut saw_started = false;
+    let saw_completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match receiver.recv().await.expect("bus open") {
+                TelemetryEvent::WorkflowStepStarted { data, .. } if data.run_id == run_id => {
+                    assert_eq!(data.step_id, "a");
+                    saw_started = true;
+                }
+                TelemetryEvent::WorkflowStepCompleted { data, .. }
+                    if data.run_id == run_id && data.step_id == "a" =>
+                {
+                    return data.status.as_str().to_string();
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("progress events arrive");
+
+    assert!(saw_started, "started must precede completed");
+    assert_eq!(saw_completed, "completed");
+}

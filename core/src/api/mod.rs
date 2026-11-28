@@ -18,6 +18,7 @@ pub mod pairing;
 pub mod providers;
 pub mod provisioning;
 pub mod sessions;
+pub mod workflows;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
@@ -451,6 +452,11 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/secrets/:provider",
             put(providers::put_secret).delete(providers::delete_secret),
         )
+        .route(
+            "/api/workflows",
+            get(workflows::list_workflows).post(workflows::create_workflow),
+        )
+        .route("/api/workflows/:id", get(workflows::get_workflow))
         .route("/api/telemetry", get(ws::handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer())
