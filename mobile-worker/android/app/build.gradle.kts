@@ -162,4 +162,9 @@ dependencies {
     // this test artifact on the JVM.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("org.json:json:20240303")
+
+    // Task 10: image list/bytes boundary. Reuses the single okhttp stack above;
+    // B's LanClient.defaultCallFactory() is injected in production.
+    implementation("com.google.code.gson:gson:2.10.1")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
