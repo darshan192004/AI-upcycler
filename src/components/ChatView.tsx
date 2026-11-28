@@ -11,13 +11,17 @@ import {
   Square,
 } from 'lucide-react';
 import {
+  deleteSession,
   getMultimodalEnabled,
+  getSettings,
   listSessionMessages,
   listSessions,
+  renameSession,
   streamChat,
   uploadImage,
 } from '../lib/api';
 import type {
+  AppSettings,
   ChatContent,
   ChatMessage,
   ChatSession,
@@ -25,6 +29,7 @@ import type {
   ProviderStatus,
 } from '../lib/types';
 import { useClusterStore } from '../store/cluster';
+import { SettingsPanel } from './SettingsPanel';
 
 type ProviderChoice = '' | 'local' | ProviderStatus['id'];
 type SourceKind = 'local' | 'worker' | 'cloud' | 'unknown';
@@ -82,6 +87,10 @@ export function ChatView() {
   const [attachments, setAttachments] = useState<MediaRef[]>([]);
   const [multimodalEnabled, setMultimodalEnabled] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [sessionTitleDraft, setSessionTitleDraft] = useState('');
 
   const localSeqRef = useRef(0);
   const firstTurnRef = useRef(false);
@@ -106,6 +115,11 @@ export function ChatView() {
   useEffect(() => {
     void refreshProviders();
     void loadSessions();
+    void getSettings()
+      .then(setSettings)
+      .catch(() => {
+        // Offline: generation falls back to the built-in 512-token limit.
+      });
   }, [refreshProviders, loadSessions]);
 
   useEffect(() => {
@@ -150,6 +164,9 @@ export function ChatView() {
     [source, providers],
   );
 
+  /** Rename/delete act on the selected row, never on the unsaved new session. */
+  const savedSession = sessions.find((s) => s.session_id === sessionId) ?? null;
+
   useEffect(() => {
     if (modelOptions.length === 0) {
       if (selectedModel !== '') setSelectedModel('');
@@ -190,6 +207,8 @@ export function ChatView() {
   async function selectSession(id: string) {
     setSessionId(id);
     setError(null);
+    setRenaming(false);
+    firstTurnRef.current = false;
     abortRef.current?.abort();
     setBusy(false);
     if (!id) {
@@ -210,6 +229,42 @@ export function ChatView() {
       setError(message);
       setMessages([]);
     }
+  }
+
+  async function saveSessionTitle() {
+    const title = sessionTitleDraft.trim();
+    if (!title || !savedSession) {
+      setRenaming(false);
+      return;
+    }
+    try {
+      setError(null);
+      const updated = await renameSession(sessionId, title);
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === updated.session_id ? updated : s)),
+      );
+      setRenaming(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function removeSession() {
+    const removedId = sessionId;
+    try {
+      setError(null);
+      await deleteSession(removedId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    abortRef.current?.abort();
+    setSessions((prev) => prev.filter((s) => s.session_id !== removedId));
+    setSessionId(crypto.randomUUID());
+    setMessages([]);
+    setRenaming(false);
+    setSessionTitleDraft('');
+    firstTurnRef.current = false;
   }
 
   async function attachFile(file: File | undefined) {
@@ -258,7 +313,7 @@ export function ChatView() {
     const request = {
       model: selectedModel,
       messages: history,
-      max_tokens: 512,
+      max_tokens: settings?.max_tokens ?? 512,
       session_id: sessionId,
       ...(selectedProvider !== '' ? { provider: selectedProvider } : {}),
     };
@@ -392,8 +447,87 @@ export function ChatView() {
             <SourceIcon className="h-3.5 w-3.5" aria-hidden="true" />
             <span>{sourceInfo.label}</span>
           </span>
+
+          <div className="chat-field">
+            <span>Session actions</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                aria-label="Rename session"
+                disabled={!savedSession || renaming}
+                onClick={() => {
+                  setSessionTitleDraft(savedSession?.title ?? '');
+                  setRenaming(true);
+                }}
+                className="min-h-11 rounded-lg border border-[#475569] bg-[#1B2336] px-2 text-xs text-slate-200 transition-colors hover:border-emerald-400/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Rename
+              </button>
+              <button
+                type="button"
+                aria-label="Delete session"
+                disabled={!savedSession}
+                onClick={() => void removeSession()}
+                className="min-h-11 rounded-lg border border-[#475569] bg-[#1B2336] px-2 text-xs text-slate-200 transition-colors hover:border-red-400/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Delete
+              </button>
+              <button
+                type="button"
+                aria-label="Open generation settings"
+                aria-expanded={settingsOpen}
+                onClick={() => setSettingsOpen((open) => !open)}
+                className="min-h-11 rounded-lg border border-[#475569] bg-[#1B2336] px-2 text-xs text-slate-200 transition-colors hover:border-emerald-400/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E]"
+              >
+                Settings
+              </button>
+            </div>
+          </div>
         </div>
       </div>
+
+      {renaming && (
+        <div className="flex flex-wrap items-end gap-2 border-b border-white/8 px-5 py-3">
+          <label className="chat-field min-w-0 flex-1">
+            <span>Session title</span>
+            <input
+              aria-label="Session title"
+              type="text"
+              value={sessionTitleDraft}
+              onChange={(e) => setSessionTitleDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void saveSessionTitle();
+                }
+              }}
+              className="mt-1 min-h-11 w-full rounded-lg border border-[#475569] bg-[#0F172A] px-2 py-1 text-sm text-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E]"
+            />
+          </label>
+          <button
+            type="button"
+            aria-label="Save session title"
+            onClick={() => void saveSessionTitle()}
+            className="min-h-11 rounded-lg bg-[#22C55E] px-3 text-xs font-semibold text-[#0F172A] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E]"
+          >
+            Save title
+          </button>
+          <button
+            type="button"
+            aria-label="Cancel rename"
+            onClick={() => setRenaming(false)}
+            className="min-h-11 rounded-lg border border-[#475569] px-3 text-xs text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E]"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {settingsOpen && (
+        <div className="border-b border-white/8 px-5 py-3">
+          <SettingsPanel settings={settings} onSettingsChange={setSettings} />
+        </div>
+      )}
 
       {error && (
         <div
@@ -582,7 +716,7 @@ export function ChatView() {
             <button
               type="button"
               onClick={stop}
-              className="chat-send flex h-11 w-11 cursor-pointer items-center justify-center rounded-xl border border-red-400/40 bg-red-500/15 text-red-300 transition-colors hover:bg-red-500/25"
+              className="chat-send flex h-11 w-11 cursor-pointer items-center justify-center rounded-xl border border-red-400/40 bg-red-500/15 text-red-300 transition-colors hover:bg-red-500/25 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E]"
               aria-label="Stop generation"
             >
               <Square className="h-4 w-4" aria-hidden="true" />
@@ -592,7 +726,7 @@ export function ChatView() {
               type="button"
               onClick={() => void send(draft)}
               disabled={!canSend}
-              className="chat-send flex h-11 w-11 cursor-pointer items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-emerald-600 text-slate-950 shadow-[0_0_20px_rgba(16,185,129,0.35)] transition-all hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
+              className="chat-send flex h-11 w-11 cursor-pointer items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-emerald-600 text-slate-950 shadow-[0_0_20px_rgba(16,185,129,0.35)] transition-all hover:brightness-110 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E] disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none"
               aria-label="Send message"
             >
               <Send className="h-4 w-4" aria-hidden="true" />

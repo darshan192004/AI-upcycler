@@ -221,8 +221,40 @@ export interface SessionList {
   sessions: ChatSession[];
 }
 
+/** Settings stored by the host (never provider secrets). */
+export interface AppSettings {
+  provider: string | null;
+  model: string | null;
+  context_tokens: number;
+  max_tokens: number;
+  show_source_badges: boolean;
+  compact_mode: boolean;
+}
+
+/** Host-measured limits proposed for the current model and hardware. */
+export interface SettingsRecommendation {
+  context_tokens: number;
+  max_tokens: number;
+  reasons: string[];
+}
+
+/**
+ * One persisted chat row. The server stores the same `ChatContent` union the
+ * live chat uses, so older text-only rows are plain strings and multimodal
+ * rows are part arrays; `contentToText()` renders both.
+ */
+export interface PersistedChatMessage {
+  message_id: number;
+  session_id: string;
+  role: 'system' | 'user' | 'assistant';
+  content: ChatContent;
+  token_count: number;
+  generation_time_sec: number;
+  created_at: string;
+}
+
 export interface SessionMessages {
-  messages: Array<ChatMessage & { message_id: number; created_at: string }>;
+  messages: PersistedChatMessage[];
 }
 
 export interface DownloadRequest {

@@ -1,7 +1,9 @@
 import type {
+  AppSettings,
   AvailableDevice,
   AvailableDevicesResponse,
   ChatRequest,
+  ChatSession,
   CreateWorkflowResponse,
   DownloadRequest,
   MediaRef,
@@ -13,6 +15,7 @@ import type {
   ScanResponse,
   SessionList,
   SessionMessages,
+  SettingsRecommendation,
   Topology,
   WorkflowListResponse,
   WorkflowRequest,
@@ -43,7 +46,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(detail);
   }
-  return (await resp.json()) as T;
+  // Successful writes may answer 204 with no body (e.g. session deletion).
+  const text = await resp.text();
+  if (text.length === 0) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export function getTopology(): Promise<Topology> {
@@ -242,6 +248,36 @@ export function listSessionMessages(sessionId: string): Promise<SessionMessages>
   return request<SessionMessages>(
     `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
   );
+}
+
+// ---- persisted settings and session management (sub-project D) ------------
+
+export function getSettings(): Promise<AppSettings> {
+  return request<AppSettings>('/api/settings');
+}
+
+export function putSettings(settings: AppSettings): Promise<AppSettings> {
+  return request<AppSettings>('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+}
+
+export function getSettingsRecommendations(): Promise<SettingsRecommendation> {
+  return request<SettingsRecommendation>('/api/settings/recommendations');
+}
+
+export function renameSession(sessionId: string, title: string): Promise<ChatSession> {
+  return request<ChatSession>(
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'PUT', body: JSON.stringify({ title }) },
+  );
+}
+
+export function deleteSession(sessionId: string): Promise<void> {
+  return request<void>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
 }
 
 // ---- task workflows (spec 2026-11-27, §10) --------------------------------
