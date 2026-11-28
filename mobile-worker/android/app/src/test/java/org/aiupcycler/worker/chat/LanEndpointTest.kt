@@ -38,4 +38,12 @@ class LanEndpointTest {
         assertEquals(8080, endpoint.port)
         assertEquals("http://[2001:db8::1]:8080", endpoint.baseUrl())
     }
+
+    @Test
+    fun invalidHostsAreRejectedBeforeAUrlIsBuilt() {
+        for (host in listOf("bad host", "bad_host")) {
+            val error = runCatching { LanEndpoint(host, 8080) }.exceptionOrNull()
+            assertEquals("LAN endpoint host is invalid", error?.message)
+        }
+    }
 }

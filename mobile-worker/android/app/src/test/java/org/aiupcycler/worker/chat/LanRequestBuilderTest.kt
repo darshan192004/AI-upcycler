@@ -84,6 +84,15 @@ class LanRequestBuilderTest {
     }
 
     @Test
+    fun endpointStoreIgnoresInvalidPersistedHost() {
+        val storage = RecordingEndpointStorage()
+        storage.writeString(LanEndpoint.PREF_HOST, "bad host")
+        storage.writeInt(LanEndpoint.PREF_PORT, 8090)
+
+        assertNull(LanEndpointStore(storage).read())
+    }
+
+    @Test
     fun chatBodyMarksStreamAndSessionAndOmitsAutoProvider() {
         val body = JSONObject(
             LanRequestBuilder.chatBody("s-test-1", "local-model", ProviderChoice.Auto, history),

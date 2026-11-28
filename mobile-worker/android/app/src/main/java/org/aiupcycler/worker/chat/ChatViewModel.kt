@@ -189,9 +189,16 @@ class ChatViewModel(
             _errorBanner.value = Banner.InvalidAttachment()
             return
         }
+        val generation = synchronized(selectionLock) { selectionGeneration }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { client.uploadImage(fileName, mimeType, bytes) }
-                .onSuccess { dispatch(ChatEvent.AttachmentAdded(it)) }
+                .onSuccess { media ->
+                    synchronized(selectionLock) {
+                        if (generation == selectionGeneration) {
+                            dispatch(ChatEvent.AttachmentAdded(media))
+                        }
+                    }
+                }
                 .onFailure { _errorBanner.value = Banner.InvalidAttachment() }
         }
     }
@@ -201,8 +208,8 @@ class ChatViewModel(
     }
 
     fun newSession() {
-        activeCall.getAndSet(null)?.cancel()
         synchronized(turnLock) { currentTurn = null }
+        activeCall.getAndSet(null)?.cancel()
         streamActive.set(false)
         hasCompletedTurn = false
         _errorBanner.value = null
@@ -226,15 +233,22 @@ class ChatViewModel(
 
     fun selectSession(sessionId: String) {
         if (sessionId.isBlank()) return
-        activeCall.getAndSet(null)?.cancel()
         synchronized(turnLock) { currentTurn = null }
+        activeCall.getAndSet(null)?.cancel()
         streamActive.set(false)
         hasCompletedTurn = false
         // Selection and generation advance under one lock, so a read that was
         // already in flight cannot apply to a newer selection.
         val generation = synchronized(selectionLock) {
             selectionGeneration += 1
-            _uiState.update { it.copy(activeSessionId = sessionId, messages = emptyList(), busy = false) }
+            _uiState.update {
+                it.copy(
+                    activeSessionId = sessionId,
+                    messages = emptyList(),
+                    attachments = emptyList(),
+                    busy = false,
+                )
+            }
             selectionGeneration
         }
 
@@ -244,7 +258,10 @@ class ChatViewModel(
                 .onSuccess { messages ->
                     synchronized(selectionLock) {
                         if (generation == selectionGeneration) {
-                            _uiState.update { it.copy(messages = messages) }
+                            _uiState.update { state ->
+                                if (state.busy || state.messages.isNotEmpty()) state
+                                else state.copy(messages = messages)
+                            }
                         }
                     }
                 }

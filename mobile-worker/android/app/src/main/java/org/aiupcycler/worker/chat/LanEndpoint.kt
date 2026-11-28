@@ -14,6 +14,9 @@ data class LanEndpoint(val host: String, val port: Int) {
     init {
         require(host.isNotBlank()) { "LAN endpoint host must not be empty" }
         require(port in 1..65535) { "LAN endpoint port must be between 1 and 65535" }
+        require(
+            runCatching { URI("http", null, host, port, null, null, null) }.isSuccess,
+        ) { "LAN endpoint host is invalid" }
     }
 
     /** URI's host-aware constructor brackets IPv6 literals, leaving IPv4/DNS as-is. */
@@ -84,7 +87,7 @@ class LanEndpointStore(private val storage: LanEndpointStorage) {
         val host = storage.readString(LanEndpoint.PREF_HOST, null) ?: return null
         if (host.isBlank()) return null
         val port = storage.readInt(LanEndpoint.PREF_PORT, -1)
-        return LanEndpoint.parse("$host:$port")
+        return runCatching { LanEndpoint.parse("$host:$port") }.getOrNull()
     }
 
     fun save(endpoint: LanEndpoint) {

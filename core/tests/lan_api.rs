@@ -307,9 +307,7 @@ async fn pairing_response_carries_a_token_and_hashes_every_enrollment_id() {
 
 #[tokio::test]
 async fn pairing_response_reports_the_configured_lan_port() {
-    let _lock = LAN_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = lock_lan_env().await;
     let _restore = RestoreLanEnv {
         enabled: std::env::var_os(LAN_API_ENV),
         port: std::env::var_os(LAN_PORT_ENV),
@@ -710,12 +708,21 @@ use ai_upcycler_core::discovery::mdns::{
 };
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::sync::OnceLock;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-/// Serializes the two env-mutating tests in this file.
-static LAN_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+/// Serializes the two env-mutating tests in this file. An async mutex keeps
+/// the guard alive across request awaits without tripping `await_holding_lock`.
+static LAN_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn lock_lan_env() -> tokio::sync::MutexGuard<'static, ()> {
+    LAN_ENV_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 struct RestoreLanEnv {
     enabled: Option<std::ffi::OsString>,
@@ -789,11 +796,9 @@ fn capture_warnings<F: FnOnce()>(run: F) -> Vec<String> {
     std::mem::take(&mut *collected)
 }
 
-#[test]
-fn config_env_gate_and_port_warnings_are_exact() {
-    let _lock = LAN_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+#[tokio::test]
+async fn config_env_gate_and_port_warnings_are_exact() {
+    let _lock = lock_lan_env().await;
     let _restore = RestoreLanEnv {
         enabled: std::env::var_os(LAN_API_ENV),
         port: std::env::var_os(LAN_PORT_ENV),

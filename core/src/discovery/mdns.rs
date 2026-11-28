@@ -262,6 +262,24 @@ impl NodeRegistry {
         resolve_alias(&aliases, node_id)
     }
 
+    /// Every id known to belong to the same physical worker as `node_id`.
+    ///
+    /// Revocation uses this to remove credentials learned under an alias even
+    /// when that alias later received a different token hash.
+    pub fn aliases_for(&self, node_id: &str) -> Vec<String> {
+        let aliases = self.aliases.lock().unwrap();
+        let canonical = resolve_alias(&aliases, node_id);
+        let mut ids = vec![canonical.clone()];
+        for (alias, _) in aliases.iter() {
+            if resolve_alias(&aliases, alias) == canonical {
+                ids.push(alias.clone());
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// Marks the mDNS browser as running (`true`) or stopped (`false`).
     pub fn set_mdns_active(&self, active: bool) {
         self.mdns_active.store(active, Ordering::Relaxed);
@@ -674,6 +692,10 @@ mod tests {
             wifi,
             "the canonical id resolves to itself"
         );
+        let mut linked = vec![wifi.to_string(), "adb:16284c49".to_string()];
+        linked.sort();
+        assert_eq!(registry.aliases_for("adb:16284c49"), linked);
+        assert_eq!(registry.aliases_for(wifi), linked);
     }
 
     #[test]

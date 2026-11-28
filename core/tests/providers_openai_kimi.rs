@@ -10,16 +10,18 @@ use ai_upcycler_core::api::backend::{
     ChatMessage, ContentPart, FunctionDef, GenerationChunk, GenerationRequest, MessageContent,
     Stop, ToolDef,
 };
-use ai_upcycler_core::media::MediaStore;
+use ai_upcycler_core::media::{MediaRef, MediaStore};
 use ai_upcycler_core::providers::{descriptor_for, CloudRoute, ProviderId, ProviderRegistry};
 use ai_upcycler_core::secrets::{SecretScope, SecretStore};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -91,20 +93,55 @@ fn registry(provider: ProviderId, key: &str, base_url: String) -> ProviderRegist
         )
 }
 
-/// Installs a media store so the adapter under test is the media-aware path.
-/// The D:-only root is synthetic; no file is read by the budget checks.
-fn registry_with_media(provider: ProviderId, key: &str, base_url: String) -> ProviderRegistry {
-    registry(provider, key, base_url).with_media_store(MediaStore::new(
-        PathBuf::from(r"D:\ai-upcycler-temp").join("openai-attachment-budget"),
-    ))
+/// D:-only synthetic media root, unique per process and instant.
+fn media_root(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    PathBuf::from(r"D:\ai-upcycler-temp")
+        .join(tag)
+        .join(format!("{}-{nanos}", std::process::id()))
 }
 
-fn image_part(byte_count: u64) -> ContentPart {
+/// Installs a media store so the adapter under test is the media-aware path.
+fn registry_with_media_at(
+    provider: ProviderId,
+    key: &str,
+    base_url: String,
+    root: PathBuf,
+) -> ProviderRegistry {
+    registry(provider, key, base_url).with_media_store(MediaStore::new(root))
+}
+
+fn registry_with_media(provider: ProviderId, key: &str, base_url: String) -> ProviderRegistry {
+    registry_with_media_at(provider, key, base_url, media_root("openai-media"))
+}
+
+/// Synthetic PNG-shaped bytes. The media store validates magic, not decoding,
+/// so this keeps fixtures small while still exercising the real storage path.
+fn attachment_bytes(len: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(len, 0);
+    bytes
+}
+
+/// Writes a fixture directly under the content-addressed layout. Used only for
+/// an object larger than `MediaStore::put` would accept, to prove the provider
+/// budget is enforced from the stored object rather than request metadata.
+fn write_raw_object(root: &Path, media_hash: &str, bytes: &[u8]) {
+    assert_eq!(media_hash.len(), 64);
+    let dir = root.join(&media_hash[..2]);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    std::fs::write(dir.join(&media_hash[2..]), bytes).expect("fixture object");
+}
+
+fn image_part_from(stored: &MediaRef) -> ContentPart {
     ContentPart::Image {
-        media_hash: "ab".repeat(32),
-        mime_type: "image/png".into(),
-        file_name: "synthetic.png".into(),
-        byte_count,
+        media_hash: stored.media_hash.clone(),
+        mime_type: stored.mime_type.clone(),
+        file_name: stored.file_name.clone(),
+        byte_count: stored.byte_count,
     }
 }
 
@@ -326,27 +363,50 @@ async fn openai_media_adapter_preserves_optional_message_metadata() {
 
 #[tokio::test]
 async fn openai_rejects_attachment_budget_violations_before_any_request() {
+    const TEN_MIB: usize = 10 * 1024 * 1024;
+    let root = media_root("openai-attachment-budget");
+    let store = MediaStore::new(root.clone());
+    let small = store
+        .put(&attachment_bytes(64), "image/png", "small.png")
+        .await
+        .expect("small stored object");
+    let full = store
+        .put(&attachment_bytes(TEN_MIB), "image/png", "full.png")
+        .await
+        .expect("full stored object");
+
+    // `put` refuses objects over its own cap, so write this one fixture into
+    // the content-addressed layout directly. The provider must read the real
+    // size rather than trusting a caller-supplied count.
+    let oversized_hash = "cd".repeat(32);
+    write_raw_object(&root, &oversized_hash, &attachment_bytes(TEN_MIB + 1));
+
     let mut oversized_file = generation_request("gpt-4o");
-    oversized_file.messages[1].content =
-        MessageContent::Parts(vec![image_part(10 * 1024 * 1024 + 1)]);
+    oversized_file.messages[1].content = MessageContent::Parts(vec![ContentPart::Image {
+        media_hash: oversized_hash,
+        mime_type: "image/png".into(),
+        file_name: "oversized.png".into(),
+        byte_count: (TEN_MIB + 1) as u64,
+    }]);
 
     let mut too_many_images = generation_request("gpt-4o");
     too_many_images.messages[1].content =
-        MessageContent::Parts((0..5).map(|_| image_part(1)).collect());
+        MessageContent::Parts((0..5).map(|_| image_part_from(&small)).collect());
 
     let mut too_much_turn_data = generation_request("gpt-4o");
     too_much_turn_data.messages[1].content =
-        MessageContent::Parts((0..4).map(|_| image_part(10 * 1024 * 1024)).collect());
+        MessageContent::Parts((0..4).map(|_| image_part_from(&full)).collect());
     too_much_turn_data.messages.push(ChatMessage {
         role: "user".into(),
-        content: MessageContent::Parts(vec![image_part(1)]),
+        content: MessageContent::Parts(vec![image_part_from(&full)]),
         ..Default::default()
     });
 
-    let registry = registry_with_media(
+    let registry = registry_with_media_at(
         ProviderId::OpenAI,
         OPENAI_KEY,
         "http://127.0.0.1:1/v1".to_string(),
+        root.clone(),
     );
     let route = CloudRoute {
         provider: ProviderId::OpenAI,
@@ -366,6 +426,92 @@ async fn openai_rejects_attachment_budget_violations_before_any_request() {
             "{tag}"
         );
     }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn openai_rejects_attachment_metadata_that_understates_stored_bytes() {
+    let root = media_root("openai-attachment-mismatch");
+    let store = MediaStore::new(root.clone());
+    let stored = store
+        .put(&attachment_bytes(64), "image/png", "synthetic.png")
+        .await
+        .expect("stored object");
+
+    let mut request = generation_request("gpt-4o");
+    request.messages[1].content = MessageContent::Parts(vec![ContentPart::Image {
+        media_hash: stored.media_hash,
+        mime_type: stored.mime_type,
+        file_name: stored.file_name,
+        byte_count: stored.byte_count.saturating_sub(1),
+    }]);
+
+    let registry = registry_with_media_at(
+        ProviderId::OpenAI,
+        OPENAI_KEY,
+        "http://127.0.0.1:1/v1".to_string(),
+        root.clone(),
+    );
+    let route = CloudRoute {
+        provider: ProviderId::OpenAI,
+        model: "gpt-4o".to_string(),
+    };
+    let outcomes: Vec<Result<GenerationChunk, String>> =
+        registry.stream(&route, request).collect::<Vec<_>>().await;
+
+    assert_eq!(outcomes.len(), 1, "only the metadata error is expected");
+    assert_eq!(
+        outcomes[0].as_ref().expect_err("mismatch must fail"),
+        "invalid_image_attachment"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn openai_accepts_correctly_sized_stored_attachment() {
+    let root = media_root("openai-attachment-valid");
+    let store = MediaStore::new(root.clone());
+    let bytes = attachment_bytes(64);
+    let stored = store
+        .put(&bytes, "image/png", "synthetic.png")
+        .await
+        .expect("stored object");
+
+    let mut request = generation_request("gpt-4o");
+    request.messages[1].content = MessageContent::Parts(vec![image_part_from(&stored)]);
+
+    let captured = Arc::new(Mutex::new(None));
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(captured.clone(), OPENAI_SSE)).await;
+    let registry = registry_with_media_at(
+        ProviderId::OpenAI,
+        OPENAI_KEY,
+        format!("{base_url}/v1"),
+        root.clone(),
+    );
+    let route = CloudRoute {
+        provider: ProviderId::OpenAI,
+        model: "gpt-4o".to_string(),
+    };
+    let outcomes: Vec<Result<GenerationChunk, String>> =
+        registry.stream(&route, request).collect::<Vec<_>>().await;
+    handle.abort();
+
+    assert!(
+        outcomes.iter().all(|outcome| outcome.is_ok()),
+        "a correctly sized attachment must remain valid"
+    );
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
+    let expected = format!("data:image/png;base64,{}", STANDARD.encode(&bytes));
+    assert_eq!(
+        seen.body["messages"][1]["content"][0]["image_url"]["url"],
+        json!(expected)
+    );
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]

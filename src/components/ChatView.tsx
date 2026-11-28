@@ -296,6 +296,7 @@ export function ChatView() {
     sessionRequestRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
+    setBusy(false);
     const nextId = crypto.randomUUID();
     sessionIdRef.current = nextId;
     setSessionId(nextId);

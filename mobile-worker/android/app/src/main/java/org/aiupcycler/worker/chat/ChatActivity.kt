@@ -52,8 +52,9 @@ import org.aiupcycler.worker.preferences.UiPreferencesStore
  * and keeps the existing control/pairing screen one overflow tap away.
  *
  * No pairing work happens here: `onNewIntent` deliberately ignores enrollment
- * extras. Only a LAN discovery callback extra is consumed, so the desktop
- * app's explicit `am start .../.MainActivity` path remains untouched.
+ * extras and no unauthenticated endpoint extra. The master endpoint comes only
+ * from the fingerprint-checked discovery path, so the desktop app's explicit
+ * `am start .../.MainActivity` path remains untouched.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 class ChatActivity : ComponentActivity() {
@@ -86,10 +87,6 @@ class ChatActivity : ComponentActivity() {
         ) {
             return
         }
-        val endpoint = intent.getStringExtra(EXTRA_LAN_ENDPOINT) ?: return
-        runCatching { LanEndpoint.parse(endpoint) }
-            .getOrNull()
-            ?.let(viewModel::onDiscoveryEndpoint)
     }
 
     @Composable
@@ -259,9 +256,6 @@ class ChatActivity : ComponentActivity() {
     }
 
     companion object {
-        /** LAN discovery callback: a validated `host:port`, never a token. */
-        const val EXTRA_LAN_ENDPOINT = "org.aiupcycler.worker.chat.LAN_ENDPOINT"
-
         const val OVERFLOW_ITEM_TAG = "chat-overflow-item"
         const val PAIRING_BANNER_TAG = "chat-pairing-banner"
 

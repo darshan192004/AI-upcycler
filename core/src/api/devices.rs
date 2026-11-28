@@ -104,20 +104,34 @@ pub async fn revoke(
 ) -> Result<Json<RevokeResponse>, ApiError> {
     let onboarding = state.onboarding.clone();
     let security = state.security.clone();
+    let registry = state.registry.clone();
 
     let revoked = tokio::task::spawn_blocking(move || {
+        // Pairing takes this same lock around enrollment + token installation;
+        // holding it here prevents a re-enroll from undoing this revocation.
+        let _enrollment_guard = security
+            .enrollment_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(service) = onboarding {
             // Best effort: the device may already be gone from ADB, and that
             // must not stop the enrollment from being removed.
             let _ = service.disconnect(&id);
         }
-        let revoked = security.enrollments.revoke(&id);
+        // Re-pairing can rotate one alias while an older token stays live
+        // under another, so revoke the whole linked identity, not just the id
+        // in the request path.
+        let linked_ids = registry.aliases_for(&id);
+        let mut revoked = false;
+        for linked in &linked_ids {
+            revoked |= security.enrollments.revoke(linked);
+        }
         // The LAN bearer token is the other credential for this device: both
         // must die in the same blocking step, or a revoked phone could still
         // reach the LAN API with a token it kept from pairing.
         security
             .enrollments
-            .revoke_lan_token(&id)
+            .revoke_lan_token_ids(&linked_ids)
             .map_err(|error| {
                 tracing::warn!("could not persist the LAN token revocation: {error}");
                 (

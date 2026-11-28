@@ -16,8 +16,8 @@ function deriveRunStatus(steps: WorkflowStepRow[]): WorkflowRunRow['status'] {
   return 'running';
 }
 
-/** Only the newest selection may write `selected`. */
-let latestRequestedRunId: string | null = null;
+/** Only the newest selection may write `selected`, including repeat clicks on one run. */
+let selectionGeneration = 0;
 
 interface WorkflowState {
   runs: WorkflowRunRow[];
@@ -44,13 +44,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   selectRun: async (runId) => {
-    latestRequestedRunId = runId;
+    const generation = ++selectionGeneration;
     try {
       const selected = await getWorkflow(runId);
-      if (latestRequestedRunId !== runId) return;
+      if (generation !== selectionGeneration) return;
       set({ selected, error: null });
     } catch (error) {
-      if (latestRequestedRunId !== runId) return;
+      if (generation !== selectionGeneration) return;
       set({ error: error instanceof Error ? error.message : String(error) });
     }
   },

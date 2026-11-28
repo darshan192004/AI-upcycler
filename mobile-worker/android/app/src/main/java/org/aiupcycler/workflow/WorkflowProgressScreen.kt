@@ -58,6 +58,7 @@ fun WorkflowProgressScreen(api: WorkflowApi, modifier: Modifier = Modifier) {
     }
 
     LaunchedEffect(api, selectedRunId, detailKey) {
+        detail = null
         val runId = selectedRunId ?: return@LaunchedEffect
         try {
             detail = api.getRun(runId)

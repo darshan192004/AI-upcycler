@@ -542,24 +542,31 @@ impl EnrollmentRegistry {
         bool::from(matched)
     }
 
-    /// Forgets the token hash for one id (and every alias sharing it), then
-    /// persists the removal.
+    /// Forgets the token hashes for the given ids and any aliases still sharing
+    /// those hashes, then persists the removal.
     ///
-    /// A device is enrolled under its mDNS name and its `adb:<serial>` alias
-    /// with the *same* token. Verification checks all hashes, so removing only
-    /// the named id would leave the credential live under the other alias.
-    /// A failed write-through is reported and rolled back: memory must keep
-    /// matching what a restart will load.
-    pub fn revoke_lan_token(&self, node_id: &str) -> Result<bool, TrustError> {
+    /// Callers pass every id known to belong to the device, so a re-pair that
+    /// rotated only one alias cannot leave an older token live under another
+    /// id. The same-hash fallback preserves the behavior for aliases enrolled
+    /// together. A failed write-through is reported and rolled back: memory
+    /// must keep matching what a restart will load.
+    pub fn revoke_lan_token_ids(&self, node_ids: &[String]) -> Result<bool, TrustError> {
         let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
-        let Some(target) = tokens.get(node_id).copied() else {
-            return Ok(false);
-        };
-        let aliases: Vec<(String, [u8; 32])> = tokens
+        let snapshot: Vec<(String, [u8; 32])> = tokens
             .iter()
-            .filter(|(_, hash)| **hash == target)
             .map(|(id, hash)| (id.clone(), *hash))
             .collect();
+        let targets: Vec<[u8; 32]> = node_ids
+            .iter()
+            .filter_map(|id| tokens.get(id).copied())
+            .collect();
+        let aliases: Vec<(String, [u8; 32])> = snapshot
+            .into_iter()
+            .filter(|(id, hash)| node_ids.contains(id) || targets.contains(hash))
+            .collect();
+        if aliases.is_empty() {
+            return Ok(false);
+        }
         for (id, _) in &aliases {
             tokens.remove(id);
         }
@@ -572,6 +579,11 @@ impl EnrollmentRegistry {
             }
         }
         Ok(true)
+    }
+
+    /// Forgets the token hash for one id (and every alias sharing it).
+    pub fn revoke_lan_token(&self, node_id: &str) -> Result<bool, TrustError> {
+        self.revoke_lan_token_ids(&[node_id.to_string()])
     }
 
     /// Loads the persisted hashes after the CA has been resolved. Hashes from
@@ -693,6 +705,9 @@ pub struct SecurityState {
     pub ca: NodeCa,
     pub pairing: PairingManager,
     pub enrollments: EnrollmentRegistry,
+    /// Serializes enrollment against revocation: both touch the enrollment
+    /// record and the LAN token, which otherwise have separate locks.
+    pub enrollment_lock: Arc<Mutex<()>>,
 }
 
 impl Default for SecurityState {
@@ -703,6 +718,7 @@ impl Default for SecurityState {
             ca: NodeCa::generate().expect("ephemeral CA generation"),
             pairing: PairingManager::new(PAIRING_TTL),
             enrollments: EnrollmentRegistry::new(),
+            enrollment_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -716,9 +732,9 @@ impl SecurityState {
     /// start before the CA was persisted.
     pub fn load_or_generate(trust_dir: impl Into<PathBuf>) -> Self {
         let store = Arc::new(TrustStore::new(trust_dir));
-        let ca = match store.load_ca() {
+        let (ca, reused_ca) = match store.load_ca() {
             Some((cert, key)) => match NodeCa::from_parts(&cert, &key) {
-                Ok(ca) => ca,
+                Ok(ca) => (ca, true),
                 Err(error) => {
                     tracing::warn!(
                         "persisted CA in {} is unusable ({error}); generating a new one",
@@ -726,7 +742,7 @@ impl SecurityState {
                     );
                     store.clear_enrollments();
                     store.clear_lan_tokens();
-                    generate_and_persist(&store)
+                    (generate_and_persist(&store), false)
                 }
             },
             None => {
@@ -734,7 +750,7 @@ impl SecurityState {
                 // longer exists, so keeping it would authorize nothing.
                 store.clear_enrollments();
                 store.clear_lan_tokens();
-                generate_and_persist(&store)
+                (generate_and_persist(&store), false)
             }
         };
         tracing::info!(
@@ -743,11 +759,16 @@ impl SecurityState {
             store.dir().display()
         );
         let enrollments = EnrollmentRegistry::with_store(store);
-        enrollments.load_lan_tokens();
+        // A newly generated CA invalidates tokens from the previous trust root,
+        // even if the cleanup write failed on a read-only trust directory.
+        if reused_ca {
+            enrollments.load_lan_tokens();
+        }
         Self {
             ca,
             pairing: PairingManager::new(PAIRING_TTL),
             enrollments,
+            enrollment_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -1032,6 +1053,30 @@ mod tests {
             "the same hash under another alias would keep the token live"
         );
         assert_eq!(registry.get_lan_token("phone.local."), None);
+    }
+
+    #[test]
+    fn revoking_linked_ids_revokes_divergent_token_hashes() {
+        let registry = EnrollmentRegistry::new();
+        let usb_token = generate_lan_token();
+        let wifi_token = generate_lan_token();
+        registry
+            .set_lan_token("adb:16284c49", &usb_token)
+            .expect("set USB token");
+        registry
+            .set_lan_token("phone.local.", &wifi_token)
+            .expect("set Wi-Fi token");
+        assert!(registry.verify_lan_token(&usb_token));
+        assert!(registry.verify_lan_token(&wifi_token));
+
+        assert!(registry
+            .revoke_lan_token_ids(&["adb:16284c49".to_string(), "phone.local.".to_string(),])
+            .expect("revoke linked ids"));
+        assert!(
+            !registry.verify_lan_token(&usb_token),
+            "an older USB token must not survive revoking the linked device"
+        );
+        assert!(!registry.verify_lan_token(&wifi_token));
     }
 
     fn temp_trust_dir() -> PathBuf {

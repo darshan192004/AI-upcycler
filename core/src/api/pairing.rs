@@ -155,6 +155,13 @@ pub async fn enroll(
     // there an enrollment worth handing a LAN credential for.
     let lan_token = generate_lan_token();
     let ids = enrollment_ids(node_id, serial.as_deref());
+    // Hold one lock across the complete enrollment: devices::revoke takes the
+    // same lock around enrollment + LAN-token removal, so the two cannot race.
+    let _enrollment_guard = state
+        .security
+        .enrollment_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     for id in &ids {
         state
             .security

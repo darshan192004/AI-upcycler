@@ -85,10 +85,13 @@ const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE: usize = 4;
 const MAX_TURN_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
 
-/// Enforces the recorded attachment budget before any bytes are read. Counts
-/// come from the API's metadata, so an oversized image cannot force a large
-/// read or a large provider request.
-fn check_attachment_budget(messages: &[ChatMessage]) -> Result<(), MediaError> {
+/// Enforces the attachment budget against the stored objects before any bytes
+/// are read. Request-provided `byte_count` is checked for drift, so metadata
+/// cannot understate the size that `data_url()` would encode.
+async fn check_attachment_budget(
+    media: Option<&Arc<MediaStore>>,
+    messages: &[ChatMessage],
+) -> Result<(), MediaError> {
     let mut turn_bytes = 0u64;
     for message in messages {
         let MessageContent::Parts(parts) = &message.content else {
@@ -96,14 +99,24 @@ fn check_attachment_budget(messages: &[ChatMessage]) -> Result<(), MediaError> {
         };
         let mut images = 0usize;
         for part in parts {
-            let ContentPart::Image { byte_count, .. } = part else {
+            let ContentPart::Image {
+                media_hash,
+                byte_count,
+                ..
+            } = part
+            else {
                 continue;
             };
             images += 1;
-            if *byte_count > MAX_IMAGE_BYTES {
+            let store = media.ok_or(MediaError::Io)?;
+            let actual = store.size(media_hash).await?;
+            if *byte_count != actual {
+                return Err(MediaError::MetadataMismatch);
+            }
+            if actual > MAX_IMAGE_BYTES {
                 return Err(MediaError::TooLarge);
             }
-            turn_bytes = turn_bytes.saturating_add(*byte_count);
+            turn_bytes = turn_bytes.saturating_add(actual);
             if turn_bytes > MAX_TURN_IMAGE_BYTES {
                 return Err(MediaError::TooLarge);
             }
@@ -122,7 +135,7 @@ async fn messages_payload(
     media: Option<&Arc<MediaStore>>,
     messages: &[ChatMessage],
 ) -> Result<Vec<Value>, MediaError> {
-    check_attachment_budget(messages)?;
+    check_attachment_budget(media, messages).await?;
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
         if !message.content.has_images() {

@@ -37,6 +37,7 @@ pub enum MediaError {
     InvalidMagic,
     TooLarge,
     BadHash,
+    MetadataMismatch,
     Io,
 }
 
@@ -47,6 +48,7 @@ impl fmt::Display for MediaError {
             MediaError::InvalidMagic => "invalid_magic",
             MediaError::TooLarge => "too_large",
             MediaError::BadHash => "bad_hash",
+            MediaError::MetadataMismatch => "metadata_mismatch",
             MediaError::Io => "io_error",
         };
         f.write_str(message)
@@ -146,6 +148,21 @@ impl MediaStore {
             return Err(MediaError::BadHash);
         }
         Ok(bytes)
+    }
+
+    /// Authoritative byte length of a stored object, without reading its bytes.
+    ///
+    /// The full hash is still verified when the bytes are later read; this is
+    /// only the pre-encoding budget guard for request-provided metadata.
+    pub async fn size(&self, media_hash: &str) -> Result<u64, MediaError> {
+        let path = self.path_for(media_hash)?;
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|_| MediaError::Io)?;
+        if !metadata.is_file() {
+            return Err(MediaError::Io);
+        }
+        Ok(metadata.len())
     }
 
     /// Builds a standard-base64 `data:` URL for stored bytes.
