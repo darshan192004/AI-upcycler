@@ -139,6 +139,10 @@ class ChatActivity : ComponentActivity() {
                 onDraftChange = viewModel::onDraftChange,
                 onSend = viewModel::send,
                 onStop = viewModel::stop,
+                onAttachImage = { fileName, mimeType, bytes ->
+                    viewModel.attachImage(fileName, mimeType, bytes)
+                },
+                onRemoveAttachment = viewModel::removeAttachment,
                 onProviderSelected = viewModel::selectProvider,
                 onModelSelected = viewModel::selectModel,
                 provisioningClient = client,

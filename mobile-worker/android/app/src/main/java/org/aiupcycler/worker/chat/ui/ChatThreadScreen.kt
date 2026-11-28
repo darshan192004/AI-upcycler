@@ -1,7 +1,17 @@
 package org.aiupcycler.worker.chat.ui
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,18 +26,24 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -35,6 +51,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import org.aiupcycler.worker.R
 import org.aiupcycler.worker.chat.ChatMessage
+import org.aiupcycler.worker.chat.MediaRef
 
 /**
  * Streaming thread. Every row is keyed by [ChatMessage.stableId], so a delta
@@ -49,9 +66,20 @@ fun ChatThreadScreen(
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    attachments: List<MediaRef> = emptyList(),
+    multimodalEnabled: Boolean = false,
+    onAttachImage: (fileName: String, mimeType: String, bytes: ByteArray) -> Unit = { _, _, _ -> },
+    onRemoveAttachment: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    val canSend = draft.isNotBlank() && !busy
+    val canSend = (draft.isNotBlank() || attachments.isNotEmpty()) && !busy
+    val context = LocalContext.current
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val mime = context.contentResolver.getType(uri) ?: "image/png"
+        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        if (bytes != null) onAttachImage(displayName(context, uri), mime, bytes)
+    }
     // The skeleton belongs only to the placeholder before the first delta.
     // Once an assistant row exists it owns its own skeleton (empty content) or
     // renders streamed text directly, so no second skeleton is ever added.
@@ -75,12 +103,42 @@ fun ChatThreadScreen(
             }
         }
 
+        if (attachments.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                attachments.forEach { ref ->
+                    AttachmentChip(
+                        data = ref,
+                        onRemove = { onRemoveAttachment(ref.mediaHash) },
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+            }
+        }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            if (multimodalEnabled) {
+                Button(
+                    onClick = { imagePicker.launch("image/*") },
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .semantics { contentDescription = "Attach image" },
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text(text = "Attach")
+                }
+                Spacer(Modifier.width(8.dp))
+            }
             OutlinedTextField(
                 value = draft,
                 onValueChange = onDraftChange,
@@ -127,6 +185,85 @@ fun ChatThreadScreen(
             }
         }
     }
+}
+
+/**
+ * One image attachment. The file name is its own text node so accessibility
+ * assertions and screen readers can name it exactly; MIME and byte count share
+ * a second caption. Focus is the accent token; destructive hover is tokenised
+ * too, and reduced motion keeps the chip static.
+ */
+@Composable
+fun AttachmentChip(data: MediaRef, onRemove: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val hovered by interaction.collectIsHoveredAsState()
+    val reducedMotion = LocalChatReducedMotion.current
+    val focusColor = MaterialTheme.colorScheme.primary
+    val destructive = MaterialTheme.colorScheme.error
+
+    Row(
+        modifier = Modifier
+            .heightIn(min = 48.dp)
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+            .padding(start = 8.dp, end = 4.dp)
+            .semantics { contentDescription = "image attachment, ${data.fileName}, remove button" },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = data.fileName,
+            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FiraSans),
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "${data.mimeType} · ${data.byteCount} B",
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FiraSans),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.width(8.dp))
+        IconButton(
+            onClick = onRemove,
+            interactionSource = interaction,
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .background(
+                    color = if (hovered && !reducedMotion) {
+                        destructive.copy(alpha = 0.16f)
+                    } else {
+                        Color.Transparent
+                    },
+                    shape = RoundedCornerShape(8.dp),
+                )
+                .border(
+                    width = if (focused) 2.dp else 0.dp,
+                    color = focusColor,
+                    shape = RoundedCornerShape(8.dp),
+                )
+                .semantics { contentDescription = "Remove ${data.fileName}" },
+        ) {
+            Text(
+                text = "×",
+                style = MaterialTheme.typography.titleMedium,
+                color = destructive,
+            )
+        }
+    }
+}
+
+private fun displayName(context: Context, uri: Uri): String {
+    val cursor = context.contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME),
+        null,
+        null,
+        null,
+    )
+    return cursor?.use { rows ->
+        val column = rows.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (column >= 0 && rows.moveToFirst()) rows.getString(column) else null
+    }?.takeIf { it.isNotBlank() } ?: "image"
 }
 
 @Composable

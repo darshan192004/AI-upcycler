@@ -47,6 +47,8 @@ fun ChatScreen(
     onDraftChange: (String) -> Unit = {},
     onSend: () -> Unit = {},
     onStop: () -> Unit = {},
+    onAttachImage: (fileName: String, mimeType: String, bytes: ByteArray) -> Unit = { _, _, _ -> },
+    onRemoveAttachment: (String) -> Unit = {},
     onProviderSelected: (ProviderChoice) -> Unit = {},
     onModelSelected: (String) -> Unit = {},
     provisioningClient: LanClient? = null,
@@ -136,9 +138,13 @@ fun ChatScreen(
                     messages = state.messages,
                     draft = state.draft,
                     busy = state.busy,
+                    attachments = state.attachments,
+                    multimodalEnabled = state.multimodalEnabled,
                     onDraftChange = onDraftChange,
                     onSend = onSend,
                     onStop = onStop,
+                    onAttachImage = onAttachImage,
+                    onRemoveAttachment = onRemoveAttachment,
                     modifier = Modifier.weight(1f),
                 )
             }

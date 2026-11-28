@@ -134,6 +134,7 @@ class ChatViewModel(
         _uiState.update { it.copy(endpoint = endpoint) }
         refreshCatalog()
         refreshSessions()
+        refreshMultimodalGate()
         openProvisioning()
     }
 
@@ -153,6 +154,28 @@ class ChatViewModel(
         _uiState.update { it.copy(draft = value) }
     }
 
+    /**
+     * Uploads one picked image through the existing LAN client. The bearer
+     * token stays in [SecretStore]; neither the token nor image bytes are
+     * logged. Only the returned [MediaRef] is put into composer state.
+     */
+    fun attachImage(fileName: String, mimeType: String, bytes: ByteArray) {
+        val client = _lanClient.value
+        if (client == null || !_uiState.value.multimodalEnabled) {
+            _errorBanner.value = Banner.InvalidAttachment()
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { client.uploadImage(fileName, mimeType, bytes) }
+                .onSuccess { dispatch(ChatEvent.AttachmentAdded(it)) }
+                .onFailure { _errorBanner.value = Banner.InvalidAttachment() }
+        }
+    }
+
+    fun removeAttachment(mediaHash: String) {
+        dispatch(ChatEvent.AttachmentRemoved(mediaHash))
+    }
+
     fun newSession() {
         activeCall.getAndSet(null)?.cancel()
         streamActive.set(false)
@@ -163,6 +186,7 @@ class ChatViewModel(
                 activeSessionId = UUID.randomUUID().toString(),
                 messages = emptyList(),
                 draft = "",
+                attachments = emptyList(),
                 busy = false,
                 source = null,
                 banner = null,
@@ -188,7 +212,7 @@ class ChatViewModel(
     fun send() {
         val current = _uiState.value
         val text = current.draft.trim()
-        if (text.isBlank() || current.busy) return
+        if ((text.isBlank() && current.attachments.isEmpty()) || current.busy) return
 
         val client = _lanClient.value
         if (client == null || nodeIdValue.isBlank()) {
@@ -213,6 +237,7 @@ class ChatViewModel(
             history = (priorMessages + userMessage).map {
                 ChatMessage(role = it.role, content = it.content)
             },
+            attachments = current.attachments,
         )
 
         _uiState.update {
@@ -220,6 +245,7 @@ class ChatViewModel(
                 activeSessionId = sessionId,
                 messages = priorMessages + userMessage + assistantMessage,
                 draft = "",
+                attachments = emptyList(),
                 busy = true,
                 banner = null,
             )
@@ -280,6 +306,15 @@ class ChatViewModel(
             runCatching { client.listSessions() }
                 .onSuccess { dispatch(ChatEvent.SessionListLoaded(it)) }
                 .onFailure { reportThrowable(it) }
+        }
+    }
+
+    /** The attach control stays hidden until the host proves its gate is on. */
+    private fun refreshMultimodalGate() {
+        val client = _lanClient.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val enabled = runCatching { client.mediaGateEnabled() }.getOrDefault(false)
+            dispatch(ChatEvent.MultimodalGateUpdated(enabled))
         }
     }
 

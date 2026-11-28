@@ -24,6 +24,7 @@ object LanRequestBuilder {
         model: String,
         provider: ProviderChoice,
         history: List<ChatMessage>,
+        attachments: List<MediaRef> = emptyList(),
     ): String {
         val body = JSONObject()
         body.put("model", model)
@@ -31,11 +32,15 @@ object LanRequestBuilder {
         body.put("session_id", sessionId)
 
         val messages = JSONArray()
-        history.forEach { message ->
+        history.forEachIndexed { index, message ->
+            val outgoing = index == history.lastIndex &&
+                message.role.equals("user", ignoreCase = true) &&
+                attachments.isNotEmpty()
+            val content: Any = if (outgoing) contentParts(message.content, attachments) else message.content
             messages.put(
                 JSONObject()
                     .put("role", message.role)
-                    .put("content", message.content),
+                    .put("content", content),
             )
         }
         body.put("messages", messages)
@@ -46,6 +51,27 @@ object LanRequestBuilder {
             is ProviderChoice.Cloud -> body.put("provider", provider.providerId)
         }
         return body.toString()
+    }
+
+    /**
+     * Desktop parity: text-only turns keep a plain string. With attachments,
+     * the outgoing user turn becomes `[text part, image parts...]`; no image
+     * bytes are ever included, only the hash returned by `/api/media`.
+     */
+    fun contentParts(text: String, attachments: List<MediaRef>): JSONArray {
+        val parts = JSONArray()
+        parts.put(JSONObject().put("type", "text").put("text", text))
+        attachments.forEach { ref ->
+            parts.put(
+                JSONObject()
+                    .put("type", "image")
+                    .put("media_hash", ref.mediaHash)
+                    .put("mime_type", ref.mimeType)
+                    .put("file_name", ref.fileName)
+                    .put("byte_count", ref.byteCount),
+            )
+        }
+        return parts
     }
 
     fun errorFor(code: Int): LanError = when (code) {

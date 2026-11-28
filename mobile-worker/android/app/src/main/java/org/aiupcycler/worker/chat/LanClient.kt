@@ -6,8 +6,10 @@ import java.util.concurrent.TimeUnit
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.aiupcycler.worker.chat.secrets.SecretStore
@@ -53,11 +55,49 @@ class LanClient(
     /** Writes the value to the host's secret store; it is never echoed back. */
     fun putProviderKey(id: String, value: String) {
         val body = JSONObject().put("value", value).toString()
-        executeJson("PUT", "/api/settings/secrets/$id", body)
+        executeJson("PUT", "/api/settings/secrets/$id", jsonBody(body))
     }
 
     fun deleteProviderKey(id: String) {
         executeJson("DELETE", "/api/settings/secrets/$id")
+    }
+
+    /**
+     * Multipart `POST /api/media` with the documented `file` field. The bearer
+     * token is added by [request] from the secure store and never logged or
+     * written into the body; only the server's content hash is returned.
+     */
+    fun uploadImage(fileName: String, mimeType: String, bytes: ByteArray): MediaRef {
+        val file = bytes.toRequestBody(mimeType.toMediaType())
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", fileName, file)
+            .build()
+        return executeJson("POST", "/api/media", body).toMediaRef()
+    }
+
+    /**
+     * Fail-closed gate check. `/api/config` is authoritative when it provides
+     * a boolean `multimodal_enabled`. If that call fails for any reason —
+     * transport, non-2xx, malformed JSON, missing or non-boolean field — fall
+     * back to the `/api/media` route probe: a present route answers 405 to
+     * OPTIONS, an absent one answers 404. Everything else keeps the gate off.
+     * No token or response body is logged.
+     */
+    fun mediaGateEnabled(): Boolean {
+        try {
+            val enabled = getJson("/api/config").opt("multimodal_enabled") as? Boolean
+            if (enabled != null) return enabled
+        } catch (_: Exception) {
+            // Config is unavailable or invalid; fall through to the route probe.
+        }
+        val call = callFactory.newCall(request("OPTIONS", "/api/media"))
+        val response = try {
+            call.execute()
+        } catch (_: IOException) {
+            return false
+        }
+        return response.use { it.code == 405 }
     }
 
     fun provisionState(deviceId: String): ProvisionState =
@@ -78,9 +118,10 @@ class LanClient(
             model = request.model,
             provider = request.provider,
             history = request.history,
+            attachments = request.attachments,
         )
         val call = callFactory.newCall(
-            request("POST", "/v1/chat/completions", body),
+            request("POST", "/v1/chat/completions", jsonBody(body)),
         )
         val parser = SseParser()
 
@@ -123,20 +164,22 @@ class LanClient(
         return call
     }
 
-    private fun request(method: String, path: String, body: String? = null): Request {
+    private fun request(method: String, path: String, body: RequestBody? = null): Request {
         val builder = Request.Builder()
             .url(endpoint.baseUrl() + path)
             .header("Authorization", LanRequestBuilder.authHeader(secrets.read(SecretStore.LAN_TOKEN_KEY)))
             .header("Accept", "application/json")
         if (body != null) {
-            builder.method(method, body.toRequestBody(LAN_JSON))
+            builder.method(method, body)
         } else {
             builder.method(method, null)
         }
         return builder.build()
     }
 
-    private fun executeJson(method: String, path: String, body: String? = null): JSONObject {
+    private fun jsonBody(text: String): RequestBody = text.toRequestBody(LAN_JSON)
+
+    private fun executeJson(method: String, path: String, body: RequestBody? = null): JSONObject {
         val call = callFactory.newCall(request(method, path, body))
         val response = try {
             call.execute()
@@ -196,6 +239,17 @@ private fun JSONObject.toChatSession(): ChatSession = ChatSession(
     modelId = optString("model_id"),
     createdAt = optString("created_at"),
 )
+
+private fun JSONObject.toMediaRef(): MediaRef {
+    val hash = optString("media_hash")
+    val mime = optString("mime_type")
+    val name = optString("file_name")
+    val bytes = optLong("byte_count", 0L)
+    if (hash.isBlank() || mime.isBlank() || name.isBlank() || bytes <= 0L) {
+        throw LanException(LanError.MalformedResponse)
+    }
+    return MediaRef(mediaHash = hash, mimeType = mime, fileName = name, byteCount = bytes)
+}
 
 private fun JSONObject.toChatMessage(): ChatMessage = ChatMessage(
     role = optString("role"),

@@ -86,12 +86,27 @@ sealed interface ProvisionState {
     data class Failed(val message: String) : ProvisionState
 }
 
+/**
+ * One content-addressed image returned by `POST /api/media`.
+ *
+ * Wire field names are snake_case; this value type stays Android/JSON free so
+ * the payload contract can be checked by a JVM test.
+ */
+data class MediaRef(
+    val mediaHash: String,
+    val mimeType: String,
+    val fileName: String,
+    val byteCount: Long,
+)
+
 /** The request the LAN client sends to `/v1/chat/completions`. */
 data class ChatRequest(
     val sessionId: String,
     val model: String,
     val provider: ProviderChoice = ProviderChoice.Auto,
     val history: List<ChatMessage> = emptyList(),
+    /** Attached to the outgoing user turn only; prior history stays text. */
+    val attachments: List<MediaRef> = emptyList(),
 )
 
 /** Where a completed turn actually ran. */

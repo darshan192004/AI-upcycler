@@ -18,6 +18,10 @@ data class ChatUiState(
     val activeSessionId: String = "",
     val messages: List<ChatMessage> = emptyList(),
     val draft: String = "",
+    /** Composer chips; cleared on send/new session, never sent as image bytes. */
+    val attachments: List<MediaRef> = emptyList(),
+    /** Host multimodal gate. Fail-closed: off until the host proves it is on. */
+    val multimodalEnabled: Boolean = false,
     val busy: Boolean = false,
     val source: Source? = null,
     val models: List<ModelEntry> = emptyList(),
@@ -47,6 +51,11 @@ sealed interface ChatEvent {
 
     /** A model chosen from the merged local/virtual id list. */
     data class ModelSelected(val modelId: String) : ChatEvent
+
+    data class AttachmentAdded(val ref: MediaRef) : ChatEvent
+    data class AttachmentRemoved(val mediaHash: String) : ChatEvent
+    object AttachmentsCleared : ChatEvent
+    data class MultimodalGateUpdated(val enabled: Boolean) : ChatEvent
 }
 
 /** User-facing notices; [blocking] marks a notice that must stop interaction. */
@@ -77,6 +86,10 @@ sealed interface Banner {
     ) : Banner {
         override val blocking: Boolean = true
     }
+
+    data class InvalidAttachment(
+        override val message: String = "Invalid image attachment",
+    ) : Banner
 }
 
 /**
@@ -104,6 +117,18 @@ fun reduce(state: ChatUiState, event: ChatEvent): ChatUiState = when (event) {
         in state.models.map { it.id } -> state.copy(selectedModel = event.modelId)
         else -> state
     }
+
+    is ChatEvent.AttachmentAdded -> state.copy(
+        attachments = state.attachments + event.ref,
+    )
+
+    is ChatEvent.AttachmentRemoved -> state.copy(
+        attachments = state.attachments.filterNot { it.mediaHash == event.mediaHash },
+    )
+
+    ChatEvent.AttachmentsCleared -> state.copy(attachments = emptyList())
+
+    is ChatEvent.MultimodalGateUpdated -> state.copy(multimodalEnabled = event.enabled)
 }
 
 /** Appends to the latest assistant message with an id, not to the last row. */
