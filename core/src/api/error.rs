@@ -15,6 +15,8 @@ pub enum ApiError {
     #[error("{0}")]
     Forbidden(String),
     #[error("{0}")]
+    BadGateway(String),
+    #[error("{0}")]
     Unauthorized(String),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
@@ -29,6 +31,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Store(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

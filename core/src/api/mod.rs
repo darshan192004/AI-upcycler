@@ -11,6 +11,7 @@ pub mod devices;
 pub mod distributed;
 pub mod downloads;
 mod error;
+pub mod images;
 pub mod lan;
 pub mod llama;
 pub mod models;
@@ -629,6 +630,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices/:id", delete(devices::revoke))
         .route("/api/providers", get(providers::list))
         .route("/api/providers/:id/test", post(providers::test))
+        .route("/api/images/generate", post(images::generate_image))
+        .route("/api/images/:id/metadata", get(images::get_image_metadata))
+        .route("/api/images/:id", get(images::get_image_bytes))
+        .route("/api/images", get(images::list_images))
         .route(
             "/api/media",
             post(upload_media).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
