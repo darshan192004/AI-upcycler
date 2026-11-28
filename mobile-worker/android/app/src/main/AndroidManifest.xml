@@ -16,13 +16,18 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AiUpcyclerWorker">
         <activity
-            android:name=".MainActivity"
+            android:name=".chat.ChatActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Explicit-intent control/pairing surface; no launcher filter. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true" />
 
         <service
             android:name=".WorkerForegroundService"
