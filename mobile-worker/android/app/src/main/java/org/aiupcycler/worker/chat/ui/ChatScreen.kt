@@ -2,6 +2,7 @@ package org.aiupcycler.worker.chat.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -30,6 +31,7 @@ import org.aiupcycler.worker.chat.ProviderChoice
 import org.aiupcycler.worker.chat.ProvisionState
 import org.aiupcycler.worker.preferences.UiPreferences
 import org.aiupcycler.worker.preferences.UiPreferencesStore
+import org.aiupcycler.worker.images.ImageApi
 import org.aiupcycler.workflow.LanWorkflowApi
 import org.aiupcycler.workflow.WorkflowApi
 
@@ -47,6 +49,10 @@ import org.aiupcycler.workflow.WorkflowApi
  * Preferences surface. Its non-secret flags hide the source badge, tighten
  * thread spacing, and (once per new session) apply host recommendations via
  * [onApplyRecommendations]. Chat history stays on the B LAN client.
+ *
+ * [imageApi] is the single image client built by the host from B's LAN
+ * endpoint and token provider. It backs the one `Images` slot below; when it
+ * is absent the slot explains that pairing is required.
  */
 @Composable
 fun ChatScreen(
@@ -68,6 +74,7 @@ fun ChatScreen(
     preferencesStore: UiPreferencesStore? = null,
     onOpenPreferences: () -> Unit = {},
     onApplyRecommendations: (String) -> Unit = {},
+    imageApi: ImageApi? = null,
 ) {
     val derivedWorkflowApi = remember(provisioningClient) {
         provisioningClient?.let { LanWorkflowApi(it) }
@@ -92,7 +99,7 @@ fun ChatScreen(
     }
 
     ChatTheme {
-        var tasksTabSelected by remember { mutableStateOf(false) }
+        var selectedTab by remember { mutableStateOf(ChatTab.Chat) }
         Column(
             modifier = modifier
                 .fillMaxSize()
@@ -108,7 +115,7 @@ fun ChatScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Button(
-                    onClick = { tasksTabSelected = false },
+                    onClick = { selectedTab = ChatTab.Chat },
                     modifier = Modifier
                         .heightIn(min = 48.dp)
                         .testTag("chat-tab"),
@@ -116,12 +123,20 @@ fun ChatScreen(
                     Text(text = "Chat")
                 }
                 Button(
-                    onClick = { tasksTabSelected = true },
+                    onClick = { selectedTab = ChatTab.Tasks },
                     modifier = Modifier
                         .heightIn(min = 48.dp)
                         .testTag("tasks-tab"),
                 ) {
                     Text(text = "Tasks")
+                }
+                Button(
+                    onClick = { selectedTab = ChatTab.Images },
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("images-tab"),
+                ) {
+                    Text(text = "Images")
                 }
                 Button(
                     onClick = onOpenPreferences,
@@ -132,11 +147,34 @@ fun ChatScreen(
                     Text(text = "Preferences")
                 }
             }
-            if (api != null && tasksTabSelected) {
+            if (api != null && selectedTab == ChatTab.Tasks) {
                 org.aiupcycler.workflow.WorkflowProgressScreen(
                     api = api,
                     modifier = Modifier.weight(1f),
                 )
+            } else if (selectedTab == ChatTab.Images) {
+                if (imageApi != null) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        imageGalleryScreen(
+                            api = imageApi,
+                            onClose = { selectedTab = ChatTab.Chat },
+                        )
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .padding(16.dp),
+                    ) {
+                        Text(
+                            text = "Pair with a host to view generated images",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.testTag("image-gallery-unavailable"),
+                        )
+                    }
+                }
             } else {
                 Row(
                     modifier = Modifier
@@ -193,3 +231,6 @@ fun ChatScreen(
         }
     }
 }
+
+/** The one host-owned tab row: chat, workflows, generated images, preferences. */
+private enum class ChatTab { Chat, Tasks, Images }

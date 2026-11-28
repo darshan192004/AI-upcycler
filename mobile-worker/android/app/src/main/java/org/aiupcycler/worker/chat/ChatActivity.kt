@@ -43,6 +43,7 @@ import org.aiupcycler.worker.WorkerForegroundService
 import org.aiupcycler.worker.chat.ui.ChatScreen
 import org.aiupcycler.worker.chat.ui.ChatTheme
 import org.aiupcycler.worker.chat.ui.PreferencesScreen
+import org.aiupcycler.worker.images.ImageApi
 import org.aiupcycler.worker.pairing.AutoEnrollExtras
 import org.aiupcycler.worker.preferences.UiPreferencesStore
 
@@ -93,6 +94,18 @@ class ChatActivity : ComponentActivity() {
         val preferencesStore = remember(context) { UiPreferencesStore(context) }
         var preferencesVisible by remember { mutableStateOf(false) }
         var aboutVisible by remember { mutableStateOf(false) }
+
+        // One image client from B's existing LAN endpoint, call factory, and
+        // secret store. No second OkHttpClient, token store, or host is built.
+        val imageApi = remember(state.endpoint, client) {
+            val endpoint = state.endpoint
+            val tokenProvider = client?.let { current -> { current.lanToken() } }
+            if (endpoint != null && tokenProvider != null) {
+                ImageApi(endpoint.baseUrl(), LanClient.defaultCallFactory(), tokenProvider)
+            } else {
+                null
+            }
+        }
 
         LaunchedEffect(client) {
             if (client != null) viewModel.openProvisioning()
@@ -162,6 +175,7 @@ class ChatActivity : ComponentActivity() {
                     preferencesStore = preferencesStore,
                     onOpenPreferences = { preferencesVisible = true },
                     onApplyRecommendations = viewModel::applyRecommendationsOnce,
+                    imageApi = imageApi,
                     modifier = Modifier.weight(1f),
                 )
             }

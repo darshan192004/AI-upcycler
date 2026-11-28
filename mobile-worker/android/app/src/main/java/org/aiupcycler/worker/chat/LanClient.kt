@@ -115,6 +115,12 @@ class LanClient(
 
     fun getJson(path: String): JSONObject = executeJson("GET", path)
 
+    /**
+     * Reads the one LAN bearer token from the existing [SecretStore] for the
+     * image client. The value is never logged, displayed, or copied elsewhere.
+     */
+    fun lanToken(): String? = secrets.read(SecretStore.LAN_TOKEN_KEY)
+
     /** Non-secret host settings; no key, token, or secret field is ever built. */
     fun getSettings(): SettingsDto = getJson("/api/settings").toSettingsDto()
 
