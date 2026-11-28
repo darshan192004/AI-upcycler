@@ -685,3 +685,54 @@ Missing/null content is treated as "".
 - no_vision_capable_model_loaded — no vision-capable route
 - invalid_image_attachment — MIME/magic/size/hash failure
 No image bytes appear in logs or error responses.
+
+## 2.6 Settings and recommendations
+
+```text
+GET /api/settings → 200
+
+{
+  "provider": null | "openai" | "anthropic" | "gemini" | "kimi",
+  "model": null | string,
+  "context_tokens": 1024..65536,
+  "max_tokens": 1..32768,
+  "show_source_badges": true | false,
+  "compact_mode": true | false
+}
+
+PUT /api/settings ← the same object → 200 with the stored object.
+Unknown fields, including api_key, token, secret, and password, return 400.
+
+GET /api/settings/recommendations → 200
+
+{
+  "context_tokens": 2048..32768,
+  "max_tokens": 256..8192,
+  "reasons": [string]
+}
+```
+
+Provider secrets are handled only by the write-only
+`PUT /api/settings/secrets/{provider}` route and never appear in settings
+responses. Settings responses carry only the non-secret fields shown above;
+unknown fields such as `api_key`, `token`, `secret`, and `password` are
+rejected with 400.
+
+`GET /api/config → 200 {"multimodal_enabled": bool}` is a public
+(unauthenticated loopback) endpoint added to close the desktop/Android gate
+gap. It contains exactly that one boolean and no settings, paths, keys, or
+tokens.
+
+## 2.7 Sessions
+
+```text
+GET /api/sessions → 200 { "sessions": [ChatSessionRow] }
+GET /api/sessions/{id}/messages → 200 { "messages": [ChatMessageRow] }
+PUT /api/sessions/{id} ← { "title": "1..=120 characters" } → 200 ChatSessionRow
+DELETE /api/sessions/{id} → 204
+Missing session → 404 with the existing error envelope.
+```
+
+The 404 uses the API's shared error envelope
+`{"error":{"message":...,"type":"not_found","code":404}}`. The loopback router
+also serves `GET /api/sessions/{id}` for a single session row.
