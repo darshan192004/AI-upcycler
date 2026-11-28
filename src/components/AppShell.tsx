@@ -8,18 +8,20 @@ import {
   MessageSquare,
   Recycle,
   Smartphone,
+  Workflow,
 } from 'lucide-react';
 import { useClusterStore } from '../store/cluster';
 import { AuroraBackground } from './ui/AuroraBackground';
 import { SegmentedTabs, type TabItem } from './ui/SegmentedTabs';
 import { StatusDot } from './ui/StatusDot';
 
-export type AppTab = 'dashboard' | 'models' | 'chat';
+export type AppTab = 'dashboard' | 'models' | 'chat' | 'workflows';
 
 const NAV: TabItem<AppTab>[] = [
   { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard className="h-4 w-4" /> },
   { id: 'models', label: 'Models', icon: <HardDrive className="h-4 w-4" /> },
   { id: 'chat', label: 'Chat', icon: <MessageSquare className="h-4 w-4" /> },
+  { id: 'workflows', label: 'Tasks', icon: <Workflow className="h-4 w-4" /> },
 ];
 
 interface AppShellProps {
