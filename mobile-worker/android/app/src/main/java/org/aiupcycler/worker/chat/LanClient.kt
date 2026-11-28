@@ -20,6 +20,69 @@ import org.json.JSONObject
 private val LAN_JSON = "application/json; charset=utf-8".toMediaType()
 
 /**
+ * The six non-secret settings fields accepted by `PUT /api/settings`. There is
+ * deliberately no key/token/secret property: provider credentials stay behind
+ * `/api/settings/secrets/:id` and are never serialised here.
+ */
+data class SettingsDto(
+    val provider: String?,
+    val model: String?,
+    val context_tokens: Int,
+    val max_tokens: Int,
+    val show_source_badges: Boolean,
+    val compact_mode: Boolean,
+)
+
+/** Host-derived limits plus the human-readable reasons behind them. */
+data class SettingsRecommendationDto(
+    val context_tokens: Int,
+    val max_tokens: Int,
+    val reasons: List<String>,
+)
+
+internal fun SettingsDto.toJsonObject(): JSONObject = JSONObject().apply {
+    put("provider", provider ?: JSONObject.NULL)
+    put("model", model ?: JSONObject.NULL)
+    put("context_tokens", context_tokens)
+    put("max_tokens", max_tokens)
+    put("show_source_badges", show_source_badges)
+    put("compact_mode", compact_mode)
+}
+
+internal fun JSONObject.toSettingsDto(): SettingsDto = SettingsDto(
+    provider = optNullableString("provider"),
+    model = optNullableString("model"),
+    context_tokens = getInt("context_tokens"),
+    max_tokens = getInt("max_tokens"),
+    show_source_badges = getBoolean("show_source_badges"),
+    compact_mode = getBoolean("compact_mode"),
+)
+
+internal fun JSONObject.toSettingsRecommendationDto(): SettingsRecommendationDto {
+    val values = optJSONArray("reasons")
+    return SettingsRecommendationDto(
+        context_tokens = getInt("context_tokens"),
+        max_tokens = getInt("max_tokens"),
+        reasons = if (values == null) {
+            emptyList()
+        } else {
+            (0 until values.length()).map { values.optString(it) }
+        },
+    )
+}
+
+/** Applies a recommendation by replacing only the two limit fields. */
+internal fun SettingsDto.withLimitsFrom(
+    recommendation: SettingsRecommendationDto,
+): SettingsDto = copy(
+    context_tokens = recommendation.context_tokens,
+    max_tokens = recommendation.max_tokens,
+)
+
+private fun JSONObject.optNullableString(key: String): String? =
+    if (isNull(key)) null else optString(key).takeIf { it.isNotBlank() }
+
+/**
  * Bearer-authenticated LAN client. The [Call.Factory] is injected so every
  * route can be exercised on the JVM with a scripted call; production uses
  * [defaultCallFactory]. No token or response body is ever logged.
@@ -51,6 +114,17 @@ class LanClient(
         executeJsonArray("GET", "/api/providers").toProviders()
 
     fun getJson(path: String): JSONObject = executeJson("GET", path)
+
+    /** Non-secret host settings; no key, token, or secret field is ever built. */
+    fun getSettings(): SettingsDto = getJson("/api/settings").toSettingsDto()
+
+    /** Carries the full value object through; only the caller's changed fields differ. */
+    fun putSettings(settings: SettingsDto): SettingsDto =
+        executeJson("PUT", "/api/settings", jsonBody(settings.toJsonObject().toString()))
+            .toSettingsDto()
+
+    fun getSettingsRecommendations(): SettingsRecommendationDto =
+        getJson("/api/settings/recommendations").toSettingsRecommendationDto()
 
     /** Writes the value to the host's secret store; it is never echoed back. */
     fun putProviderKey(id: String, value: String) {

@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import java.io.File
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
@@ -70,6 +71,9 @@ class ChatViewModel(
     private var nodeIdValue = ""
     private var fingerprint: String? = null
     private var hasCompletedTurn = false
+
+    /** A new session gets a fresh id, so each session is recommended at most once. */
+    private val recommendedSessions = ConcurrentHashMap.newKeySet<String>()
 
     /** Non-secret worker id used by `GET /api/devices/:id/provision`. */
     val nodeId: String get() = nodeIdValue
@@ -306,6 +310,25 @@ class ChatViewModel(
             runCatching { client.listSessions() }
                 .onSuccess { dispatch(ChatEvent.SessionListLoaded(it)) }
                 .onFailure { reportThrowable(it) }
+        }
+    }
+
+    /**
+     * One recommendation pass per session, used by the auto-apply preference.
+     * Order is fixed: get settings, get recommendations, then put settings with
+     * only `context_tokens`/`max_tokens` replaced. Provider, model, and UI
+     * flags pass through untouched and no secret field is constructed.
+     */
+    fun applyRecommendationsOnce(sessionId: String) {
+        if (sessionId.isBlank()) return
+        val client = _lanClient.value ?: return
+        if (!recommendedSessions.add(sessionId)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val current = client.getSettings()
+                val recommended = client.getSettingsRecommendations()
+                client.putSettings(current.withLimitsFrom(recommended))
+            }.onFailure { reportThrowable(it) }
         }
     }
 

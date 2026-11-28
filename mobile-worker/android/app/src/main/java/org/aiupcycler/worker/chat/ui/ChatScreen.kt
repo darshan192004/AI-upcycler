@@ -12,6 +12,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -20,13 +22,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import org.aiupcycler.workflow.LanWorkflowApi
-import org.aiupcycler.workflow.WorkflowApi
+import kotlinx.coroutines.flow.flowOf
 import org.aiupcycler.worker.chat.ChatEvent
 import org.aiupcycler.worker.chat.ChatUiState
 import org.aiupcycler.worker.chat.LanClient
 import org.aiupcycler.worker.chat.ProviderChoice
 import org.aiupcycler.worker.chat.ProvisionState
+import org.aiupcycler.worker.preferences.UiPreferences
+import org.aiupcycler.worker.preferences.UiPreferencesStore
+import org.aiupcycler.workflow.LanWorkflowApi
+import org.aiupcycler.workflow.WorkflowApi
 
 /**
  * Chat composition root. Task 12 wires this to `ChatActivity` with state from
@@ -37,6 +42,11 @@ import org.aiupcycler.worker.chat.ProvisionState
  * model's send/stop, session, provider, and model methods. The optional
  * [provisioningClient] and [nodeId] enable polling when Task 12 wires the
  * view model; without them the screen still renders the reducer's progress.
+ *
+ * [preferencesStore] is constructed once by the host and shared with the
+ * Preferences surface. Its non-secret flags hide the source badge, tighten
+ * thread spacing, and (once per new session) apply host recommendations via
+ * [onApplyRecommendations]. Chat history stays on the B LAN client.
  */
 @Composable
 fun ChatScreen(
@@ -55,11 +65,32 @@ fun ChatScreen(
     nodeId: String = "",
     modifier: Modifier = Modifier,
     workflowApi: WorkflowApi? = null,
+    preferencesStore: UiPreferencesStore? = null,
+    onOpenPreferences: () -> Unit = {},
+    onApplyRecommendations: (String) -> Unit = {},
 ) {
     val derivedWorkflowApi = remember(provisioningClient) {
         provisioningClient?.let { LanWorkflowApi(it) }
     }
     val api = workflowApi ?: derivedWorkflowApi
+    val prefsFlow = remember(preferencesStore) {
+        preferencesStore?.flow ?: flowOf(UiPreferences())
+    }
+    val prefs by prefsFlow.collectAsState(initial = UiPreferences())
+    val renderedState = if (prefs.compactMode || state.compact) {
+        state.copy(compact = true)
+    } else {
+        state
+    }
+
+    LaunchedEffect(prefs.autoApplyRecommendations, renderedState.activeSessionId, provisioningClient) {
+        if (!prefs.autoApplyRecommendations) return@LaunchedEffect
+        val sessionId = renderedState.activeSessionId
+        if (sessionId.isNotBlank() && provisioningClient != null) {
+            onApplyRecommendations(sessionId)
+        }
+    }
+
     ChatTheme {
         var tasksTabSelected by remember { mutableStateOf(false) }
         Column(
@@ -92,6 +123,14 @@ fun ChatScreen(
                 ) {
                     Text(text = "Tasks")
                 }
+                Button(
+                    onClick = onOpenPreferences,
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("preferences-tab"),
+                ) {
+                    Text(text = "Preferences")
+                }
             }
             if (api != null && tasksTabSelected) {
                 org.aiupcycler.workflow.WorkflowProgressScreen(
@@ -107,44 +146,47 @@ fun ChatScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     ProviderPicker(
-                        models = state.models,
-                        selectedProvider = state.selectedProvider,
-                        selectedModel = state.selectedModel,
+                        models = renderedState.models,
+                        selectedProvider = renderedState.selectedProvider,
+                        selectedModel = renderedState.selectedModel,
                         onProviderSelected = onProviderSelected,
                         onModelSelected = onModelSelected,
                         modifier = Modifier.weight(1f),
                     )
-                    SourceBadge(
-                        source = state.source,
-                        providers = state.providers,
-                    )
+                    if (prefs.showSourceBadges) {
+                        SourceBadge(
+                            source = renderedState.source,
+                            providers = renderedState.providers,
+                        )
+                    }
                 }
-                if (state.provisioning !is ProvisionState.Idle) {
+                if (renderedState.provisioning !is ProvisionState.Idle) {
                     ProvisioningProgressScreen(
                         client = provisioningClient,
                         nodeId = nodeId,
-                        provisioning = state.provisioning,
+                        provisioning = renderedState.provisioning,
                         onProvisioningChange = { onEvent(ChatEvent.ProvisioningUpdated(it)) },
                     )
                 }
                 SessionListScreen(
-                    sessions = state.sessions,
-                    activeSessionId = state.activeSessionId,
+                    sessions = renderedState.sessions,
+                    activeSessionId = renderedState.activeSessionId,
                     onNewSession = onNewSession,
                     onSelectSession = onSelectSession,
                     modifier = Modifier.weight(1f),
                 )
                 ChatThreadScreen(
-                    messages = state.messages,
-                    draft = state.draft,
-                    busy = state.busy,
-                    attachments = state.attachments,
-                    multimodalEnabled = state.multimodalEnabled,
+                    messages = renderedState.messages,
+                    draft = renderedState.draft,
+                    busy = renderedState.busy,
+                    attachments = renderedState.attachments,
+                    multimodalEnabled = renderedState.multimodalEnabled,
                     onDraftChange = onDraftChange,
                     onSend = onSend,
                     onStop = onStop,
                     onAttachImage = onAttachImage,
                     onRemoveAttachment = onRemoveAttachment,
+                    compact = renderedState.compact,
                     modifier = Modifier.weight(1f),
                 )
             }

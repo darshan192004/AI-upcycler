@@ -29,6 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -41,7 +42,9 @@ import org.aiupcycler.worker.R
 import org.aiupcycler.worker.WorkerForegroundService
 import org.aiupcycler.worker.chat.ui.ChatScreen
 import org.aiupcycler.worker.chat.ui.ChatTheme
+import org.aiupcycler.worker.chat.ui.PreferencesScreen
 import org.aiupcycler.worker.pairing.AutoEnrollExtras
+import org.aiupcycler.worker.preferences.UiPreferencesStore
 
 /**
  * The B launcher. It starts the one foreground service, hosts the chat tree,
@@ -86,6 +89,9 @@ class ChatActivity : ComponentActivity() {
         val state by viewModel.uiState.collectAsStateWithLifecycle()
         val banner by viewModel.banner.collectAsStateWithLifecycle()
         val client by viewModel.lanClient.collectAsStateWithLifecycle()
+        val context = LocalContext.current
+        val preferencesStore = remember(context) { UiPreferencesStore(context) }
+        var preferencesVisible by remember { mutableStateOf(false) }
         var aboutVisible by remember { mutableStateOf(false) }
 
         LaunchedEffect(client) {
@@ -131,24 +137,34 @@ class ChatActivity : ComponentActivity() {
             }
 
             // ChatScreen installs ChatTheme itself; it is not wrapped again here.
-            ChatScreen(
-                state = state,
-                onEvent = viewModel::onEvent,
-                onNewSession = viewModel::newSession,
-                onSelectSession = viewModel::selectSession,
-                onDraftChange = viewModel::onDraftChange,
-                onSend = viewModel::send,
-                onStop = viewModel::stop,
-                onAttachImage = { fileName, mimeType, bytes ->
-                    viewModel.attachImage(fileName, mimeType, bytes)
-                },
-                onRemoveAttachment = viewModel::removeAttachment,
-                onProviderSelected = viewModel::selectProvider,
-                onModelSelected = viewModel::selectModel,
-                provisioningClient = client,
-                nodeId = viewModel.nodeId,
-                modifier = Modifier.weight(1f),
-            )
+            if (preferencesVisible) {
+                PreferencesScreen(
+                    store = preferencesStore,
+                    onClose = { preferencesVisible = false },
+                )
+            } else {
+                ChatScreen(
+                    state = state,
+                    onEvent = viewModel::onEvent,
+                    onNewSession = viewModel::newSession,
+                    onSelectSession = viewModel::selectSession,
+                    onDraftChange = viewModel::onDraftChange,
+                    onSend = viewModel::send,
+                    onStop = viewModel::stop,
+                    onAttachImage = { fileName, mimeType, bytes ->
+                        viewModel.attachImage(fileName, mimeType, bytes)
+                    },
+                    onRemoveAttachment = viewModel::removeAttachment,
+                    onProviderSelected = viewModel::selectProvider,
+                    onModelSelected = viewModel::selectModel,
+                    provisioningClient = client,
+                    nodeId = viewModel.nodeId,
+                    preferencesStore = preferencesStore,
+                    onOpenPreferences = { preferencesVisible = true },
+                    onApplyRecommendations = viewModel::applyRecommendationsOnce,
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
 
         if (aboutVisible) {

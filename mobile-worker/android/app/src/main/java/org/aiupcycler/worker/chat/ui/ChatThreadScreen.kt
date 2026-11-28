@@ -70,6 +70,7 @@ fun ChatThreadScreen(
     multimodalEnabled: Boolean = false,
     onAttachImage: (fileName: String, mimeType: String, bytes: ByteArray) -> Unit = { _, _, _ -> },
     onRemoveAttachment: (String) -> Unit = {},
+    compact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val canSend = (draft.isNotBlank() || attachments.isNotEmpty()) && !busy
@@ -94,7 +95,7 @@ fun ChatThreadScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(items = messages, key = { it.stableId }) { message ->
-                MessageRow(message = message, busy = busy)
+                MessageRow(message = message, busy = busy, compact = compact)
             }
             if (busy && !hasAssistantRow) {
                 item(key = "assistant-placeholder") {
@@ -270,6 +271,7 @@ private fun displayName(context: Context, uri: Uri): String {
 private fun MessageRow(
     message: ChatMessage,
     busy: Boolean,
+    compact: Boolean,
 ) {
     val isUser = message.role.equals("user", ignoreCase = true)
     val label = stringResource(if (isUser) R.string.chat_role_you else R.string.chat_role_assistant)
@@ -311,7 +313,10 @@ private fun MessageRow(
             ) {
                 Text(
                     text = message.content,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(
+                        horizontal = 8.dp,
+                        vertical = if (compact) 4.dp else 8.dp,
+                    ),
                     style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FiraSans),
                     color = MaterialTheme.colorScheme.onSurface,
                 )
