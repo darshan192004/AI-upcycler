@@ -736,3 +736,39 @@ Missing session → 404 with the existing error envelope.
 The 404 uses the API's shared error envelope
 `{"error":{"message":...,"type":"not_found","code":404}}`. The loopback router
 also serves `GET /api/sessions/{id}` for a single session row.
+
+---
+
+## 2.8 Image generation (sub-project F)
+
+Base URL: `http://localhost:8080/api`. On loopback these endpoints are
+unauthenticated (§5), with the browser-origin boundary described there.
+Provider credentials are read only from the OS secret store (§2.5); none is
+accepted in an image request body.
+
+### Endpoints
+
+```text
+POST /api/images/generate ← { "prompt": "1..4000 chars", "provider": "openai|gemini|local", "size": "square1024|portrait1024x1536|landscape1536x1024" } → 201 ImageMetadata
+GET /api/images → 200 { "images": [ImageMetadata] }, default limit 60, max 200, default offset 0
+GET /api/images/{id}/metadata → 200 ImageMetadata; missing id → 404
+GET /api/images/{id} → 200 raw image bytes with Content-Type, ETag, Cache-Control; missing id → 404
+```
+
+### Exact error messages
+
+```text
+prompt must be 1..=4000 non-whitespace characters
+local image generation is disabled; set AI_UPCYCLER_IMAGEGEN_LOCAL=1 after adding a local image engine
+local image generation requires a new engine (for example stable-diffusion.cpp); sub-project F does not provide one
+openai image provider is not configured
+gemini image provider is not configured
+```
+
+### Environment variables
+
+```text
+AI_UPCYCLER_OPENAI_IMAGES_URL  default https://api.openai.com/v1/images/generations
+AI_UPCYCLER_GEMINI_IMAGES_URL  default https://generativelanguage.googleapis.com/v1beta/openai/images/generations
+AI_UPCYCLER_IMAGEGEN_LOCAL     "1" only enables the refusal path; no local engine in sub-project F
+```
