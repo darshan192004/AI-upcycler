@@ -16,6 +16,7 @@ pub mod models;
 pub mod pairing;
 pub mod providers;
 pub mod provisioning;
+pub mod sessions;
 pub mod ws;
 
 pub use error::{ApiError, ApiResult};
@@ -431,6 +432,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/devices/:id", delete(devices::revoke))
         .route("/api/providers", get(providers::list))
         .route("/api/providers/:id/test", post(providers::test))
+        .route("/api/sessions", get(sessions::list))
+        .route("/api/sessions/:id", get(sessions::get))
+        .route("/api/sessions/:id/messages", get(sessions::messages))
         .route(
             "/api/settings/secrets/:provider",
             put(providers::put_secret).delete(providers::delete_secret),
