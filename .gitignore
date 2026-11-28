@@ -10,6 +10,11 @@ src-tauri/gen/
 # Tooling
 .playwright-mcp/
 
+# Android platform-tools fetched at build time (issue #125). The directory is
+# kept so the Tauri bundler always finds its resource source.
+src-tauri/resources/platform-tools/*
+!src-tauri/resources/platform-tools/.gitkeep
+
 # Env / local config
 .env
 .env.*

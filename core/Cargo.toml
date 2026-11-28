@@ -16,7 +16,7 @@ mdns-sd = "0.11"
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 tracing = "0.1"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2.0"
@@ -25,9 +25,19 @@ futures = "0.3"
 async-stream = "0.3"
 memmap2 = "0.9"
 bytes = "1"
-rcgen = "0.14.10"
-sha2 = "0.10"
+# `x509-parser` lets a CA loaded from disk sign the same way a generated one
+# does (`Issuer::from_ca_cert_pem`); without it only fresh CAs can issue certs.
+rcgen = { version = "0.14.10", features = ["x509-parser"] }
+sha2 = "0.11"
 sysinfo = "0.39"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI for the persisted CA key (`CryptProtectData`/`CryptUnprotectData`).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [build-dependencies]
 tonic-build = "0.13"

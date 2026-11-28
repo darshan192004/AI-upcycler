@@ -60,7 +60,7 @@ graph TB
    - Lightweight wrapper handling device auto-discovery registration, background execution prevention, and battery/thermal telemetry.
 2. **Embedded Native Worker Engine (`llama.cpp` RPC C++)**:
    - Compiled for ARM64-v8a with NEON / NPU hardware acceleration.
-   - Listens on TCP port `50052` for binary tensor execution payloads.
+   - Listens on TCP port `50062` for binary tensor execution payloads.
    - Allocates contiguous RAM buffers for assigned layer weights and KV-cache blocks.
 
 ---
@@ -335,12 +335,12 @@ Limits the driver applies to every call: 5 s to establish the connection
 ## 4. Communication & Transport Layer
 
 ### 4.1 Discovery Protocol (mDNS / Zeroconf)
-- Worker nodes broadcast service type `_aiupcycler-worker._tcp.local.` on port `50052`.
+- Worker nodes broadcast service type `_aiupcycler-worker._tcp.local.` on port `50062`.
 - TXT records include: `ram_free_mb`, `cpu_cores`, `os_type`, `api_version`.
 
 ### 4.2 USB Transport Adapter (ADB / USB Tethering)
 - When Wi-Fi latency exceeds $15\text{ ms}$, the Master app prompts the user to connect via USB cable.
-- Automatically executes `adb forward tcp:50052 tcp:50052` to achieve low latency ($\approx 1\text{ ms}$) and higher bandwidth ($480\text{ Mbps} - 5\text{ Gbps}$).
+- Automatically executes `adb forward tcp:50062 tcp:50062` to achieve low latency ($\approx 1\text{ ms}$) and higher bandwidth ($480\text{ Mbps} - 5\text{ Gbps}$).
 
 ### 4.3 RPC Serialization Format
 - High-efficiency binary serialization using Protocol Buffers (`cluster_rpc.proto`) with custom flat buffer tensor views to eliminate serialization copying overhead.

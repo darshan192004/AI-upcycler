@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { motion } from 'motion/react';
-import { Activity, Cpu, HardDrive, Zap } from 'lucide-react';
+import { Activity, Cpu, HardDrive, Terminal, Zap } from 'lucide-react';
+import { API_BASE } from '../lib/api';
 import { useClusterStore } from '../store/cluster';
 import type { TopologyThermal } from '../lib/types';
 import { GlowCard } from './ui/GlowCard';
@@ -8,6 +9,7 @@ import { NumberTicker } from './ui/NumberTicker';
 import { Sparkline } from './ui/Sparkline';
 import { StatusDot } from './ui/StatusDot';
 import { NodeCard } from './NodeCard';
+import { AvailableDevices } from './AvailableDevices';
 import { PairingPanel } from './PairingPanel';
 
 const container = {
@@ -44,6 +46,14 @@ export function DashboardView() {
   }, [topology?.thermal]);
   const totalGb = topology ? topology.total_pooled_ram_mb / 1024 : 0;
   const usedGb = topology ? topology.used_pooled_ram_mb / 1024 : 0;
+  const availableGb =
+    topology?.available_pooled_ram_mb != null
+      ? topology.available_pooled_ram_mb / 1024
+      : 0;
+  const unpairedDevices = workerNodes.filter(
+    (node) => node.worker_state === 'usb_detected' || node.worker_state === 'discovered',
+  );
+  const readyDevices = workerNodes.filter((node) => node.worker_state === 'ready');
   const tokS = latestMetrics?.tokens_per_second ?? 0;
   // One source of truth: the store keeps the freshest master RAM reading
   // from whichever event arrived last (the poll publishes it every cycle,
@@ -85,12 +95,13 @@ export function DashboardView() {
             <span className="ml-1 text-base font-normal text-slate-400">GB</span>
           </div>
           <div className="mt-1.5 flex items-center justify-between text-xs text-slate-400">
-            <span>
-              {usedGb.toFixed(1)} GB in use
-            </span>
+            <span>{usedGb.toFixed(1)} GB in use</span>
             <span className="font-mono text-emerald-400">
               {topology ? topology.nodes.length : 0} nodes
             </span>
+          </div>
+          <div className="mt-1 text-[11px] text-slate-500">
+            {availableGb.toFixed(1)} GB available
           </div>
         </GlowCard>
 
@@ -151,6 +162,51 @@ export function DashboardView() {
         <GlowCard className="p-5" hover={false}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
+              <Terminal className="h-4 w-4 text-cyan-400" />
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                Agent endpoint
+              </h2>
+            </div>
+            <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-cyan-300">
+              OpenAI-compatible
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">
+                Base URL
+              </div>
+              <code className="mt-1 block truncate rounded bg-white/5 px-2 py-1.5 font-mono text-xs text-emerald-300">
+                {API_BASE}/v1
+              </code>
+            </div>
+            <div>
+              <div
+                className="text-[11px] uppercase tracking-wider text-slate-500"
+                title="The host engine serves the GGUF named by AI_UPCYCLER_MODEL; use its id from /v1/models."
+              >
+                Active model id
+              </div>
+              <code className="mt-1 block truncate rounded bg-white/5 px-2 py-1.5 font-mono text-xs text-slate-200">
+                {topology?.active_model ?? 'see /v1/models'}
+              </code>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-slate-400">
+            Point opencode or Kilo Code at this base URL. Tool calls are served by the host
+            engine only; the cluster route stays plain chat. See{' '}
+            <code className="rounded bg-white/10 px-1 py-0.5 font-mono text-[11px] text-slate-300">
+              docs/agents.md
+            </code>
+            .
+          </p>
+        </GlowCard>
+      </motion.div>
+
+      <motion.div variants={item}>
+        <GlowCard className="p-5" hover={false}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
                 Live generation throughput
               </h2>
@@ -201,7 +257,8 @@ export function DashboardView() {
             )}
           </div>
           <span className="text-xs text-slate-500">
-            {workerNodes.length} worker{workerNodes.length === 1 ? '' : 's'} connected
+            {workerNodes.length} device{workerNodes.length === 1 ? '' : 's'} visible
+            {readyDevices.length > 0 ? ` · ${readyDevices.length} ready` : ''}
           </span>
         </div>
 
@@ -243,6 +300,25 @@ export function DashboardView() {
             pool its memory.
           </p>
         )}
+
+        {workerNodes.length > 0 && readyDevices.length === 0 && unpairedDevices.length > 0 && (
+          <p className="mt-3 text-xs text-slate-500">
+            {unpairedDevices.length} device{unpairedDevices.length === 1 ? '' : 's'} detected
+            but not ready — open the AI Upcycler worker app on the phone and pair it to run
+            layers.
+          </p>
+        )}
+
+        {workerNodes.length > 0 && readyDevices.length === 0 && unpairedDevices.length === 0 && (
+          <p className="mt-3 text-xs text-slate-500">
+            Worker paired, but no model engine is open yet — load a model on the worker to
+            receive layers.
+          </p>
+        )}
+      </motion.div>
+
+      <motion.div variants={item}>
+        <AvailableDevices />
       </motion.div>
 
       <motion.div variants={item}>

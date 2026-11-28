@@ -4,7 +4,7 @@ On-device half of the pooled cluster. The Android worker:
 
 1. **Advertises itself** over mDNS/DNS-SD as `_aiupcycler-worker._tcp` with the
    RAM/version TXT records the master parses (`core/src/discovery/mdns.rs`).
-2. **Serves** the `aiupcycler.rpc.WorkerService` gRPC contract on port `50052`
+2. **Serves** the `aiupcycler.rpc.WorkerService` gRPC contract on port `50062`
    — the same port the master's `adb forward` and mDNS client dial.
 
 The wire contract lives in the repository's canonical `proto/cluster_rpc.proto`;
@@ -37,7 +37,7 @@ cd mobile-worker/android
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 # the master bridges the worker with:
-adb forward tcp:50052 tcp:50052
+adb forward tcp:50062 tcp:50062
 ```
 
 `adb` and a physical device are only required to *run* the worker — building and

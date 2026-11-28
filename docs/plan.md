@@ -35,7 +35,7 @@ gantt
 ### Phase 2: Worker Mobile Agents & Auto-Discovery
 - Create Android Kotlin worker application wrapping native C++ `llama.cpp` RPC binaries.
 - Implement mDNS / DNS-SD service broadcasting (`_aiupcycler-worker._tcp.local.`).
-- Implement ADB USB port forwarding bridge (`adb forward tcp:50052 tcp:50052`).
+- Implement ADB USB port forwarding bridge (`adb forward tcp:50062 tcp:50062`).
 
 ### Phase 3: Master Desktop UI & OpenAI-Compatible REST API
 - Build React + Tailwind glassmorphic dashboard with live telemetry canvas.

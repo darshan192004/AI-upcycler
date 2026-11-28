@@ -109,11 +109,33 @@ impl TelemetryCache {
     }
 }
 
+/// One live memory reading for the host.
+///
+/// `used_bytes` is derived from `available_bytes`, not from `free_bytes`: the
+/// operating system can reclaim cache, so free-only readings overstate what is
+/// actually in use. The topology and the master utilization percentage share
+/// this reading so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemoryUsage {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
 /// Reads the master's own memory. A trait so tests can inject a reading
 /// without depending on the machine they run on (D-E6).
 pub trait HostMemorySource: Send + Sync {
     /// RAM utilization in percent, or `None` when it cannot be read.
     fn utilization_pct(&self) -> Option<f64>;
+
+    /// Live total/used/available bytes, or `None` when it cannot be read.
+    ///
+    /// Defaults to unknown so existing fakes that only model utilization keep
+    /// compiling; the topology then reports the master's RAM as `null` rather
+    /// than inventing a number.
+    fn usage(&self) -> Option<HostMemoryUsage> {
+        None
+    }
 }
 
 /// Reads the master's memory through `sysinfo` — the same crate and version
@@ -122,14 +144,29 @@ pub struct SysinfoHostMemory;
 
 impl HostMemorySource for SysinfoHostMemory {
     fn utilization_pct(&self) -> Option<f64> {
+        self.usage()
+            .map(|usage| (usage.used_bytes as f64 / usage.total_bytes as f64) * 100.0)
+    }
+
+    fn usage(&self) -> Option<HostMemoryUsage> {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         let total = system.total_memory();
         if total == 0 {
             return None;
         }
-        let used = total.saturating_sub(system.free_memory());
-        Some((used as f64 / total as f64) * 100.0)
+        let reported = system.available_memory();
+        let available = if reported > 0 {
+            reported
+        } else {
+            system.free_memory()
+        }
+        .min(total);
+        Some(HostMemoryUsage {
+            total_bytes: total,
+            used_bytes: total - available,
+            available_bytes: available,
+        })
     }
 }
 
@@ -172,6 +209,12 @@ pub async fn poll_once(
 
     for node in nodes {
         live.insert(node.node_id.clone());
+        // An ADB-discovered phone whose worker app has not answered the
+        // handshake has no dialable port yet. Its live capacity is still shown
+        // in topology; there is nothing to poll until the app comes up.
+        if node.port == 0 {
+            continue;
+        }
         match tokio::time::timeout(HEALTH_TIMEOUT, fetch_health(transports, &node)).await {
             Ok(Ok(health)) => cache.record_worker(health),
             Ok(Err(reason)) => {

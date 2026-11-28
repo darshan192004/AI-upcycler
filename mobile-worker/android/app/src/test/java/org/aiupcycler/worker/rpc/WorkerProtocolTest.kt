@@ -11,7 +11,7 @@ class WorkerProtocolTest {
 
     @Test
     fun rpcPortMatchesMasterAdbForwardPort() {
-        assertEquals(50052, WorkerProtocol.RPC_PORT)
+        assertEquals(50062, WorkerProtocol.RPC_PORT)
     }
 
     @Test

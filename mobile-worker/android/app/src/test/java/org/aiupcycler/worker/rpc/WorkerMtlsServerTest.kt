@@ -214,6 +214,55 @@ class WorkerMtlsServerTest {
     }
 
     @Test
+    fun anUnreadablePairingNamesTheParseFailureThatCausedIt() {
+        // Regression: `serverContext` swallowed netty's exception and returned
+        // `null`, so the throw it produced carried no cause. The only text that
+        // ever reached the screen was "stored pairing credentials cannot be
+        // read" - a message that names nothing. That is precisely what made a
+        // real on-device pairing failure undiagnosable, so the cause has to
+        // survive the throw.
+        val broken = fixtureCredentials().copy(serverKeyPem = "not a private key")
+
+        val failure = runCatching { WorkerTls.serverContext(broken) }.exceptionOrNull()
+        assertNotNull("unparseable credentials must throw rather than return null", failure)
+
+        val cause = failure!!.cause
+        assertNotNull("netty's parse failure must be chained as the cause", cause)
+        assertTrue(
+            "the message must name the cause; got: ${failure.message}",
+            failure.message.orEmpty().contains(cause!!.toString()),
+        )
+    }
+
+    @Test
+    fun anUnreadablePairingNamesThePieceThatFailed() {
+        // The certificate, the key and the trust anchor all fail with text that
+        // reads alike ("cannot be read"). Naming the piece is what makes the
+        // message actionable from logcat alone - the real on-device failure was
+        // reported as a certificate problem while the certificate was in fact
+        // valid, which is exactly the ambiguity this rules out.
+        val badCert = runCatching {
+            WorkerTls.serverContext(fixtureCredentials().copy(serverCertPem = "not a certificate"))
+        }.exceptionOrNull()
+
+        assertNotNull("a broken certificate must throw", badCert)
+        assertTrue(
+            "the message must name the certificate; got: ${badCert!!.message}",
+            badCert.message.orEmpty().contains("server certificate"),
+        )
+
+        val badKey = runCatching {
+            WorkerTls.serverContext(fixtureCredentials().copy(serverKeyPem = "not a private key"))
+        }.exceptionOrNull()
+
+        assertNotNull("a broken key must throw", badKey)
+        assertTrue(
+            "the message must name the key; got: ${badKey!!.message}",
+            badKey.message.orEmpty().contains("server key"),
+        )
+    }
+
+    @Test
     fun theFixtureServerContextBuildsAndPinsTls13() {
         // Asserted on the built context's own engine, not on a constant: this
         // is the artifact the server hands to netty, so a context configured to
@@ -225,7 +274,7 @@ class WorkerMtlsServerTest {
         val context = WorkerTls.serverContext(fixtureCredentials())
         assertNotNull("the committed fixtures must build a context", context)
 
-        val engine = context!!.newEngine(io.netty.buffer.ByteBufAllocator.DEFAULT)
+        val engine = context.newEngine(io.netty.buffer.ByteBufAllocator.DEFAULT)
         assertEquals(
             "the server must enable only TLS 1.3",
             listOf("TLSv1.3"),

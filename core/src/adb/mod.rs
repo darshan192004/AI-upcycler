@@ -1,22 +1,38 @@
 //! ADB USB tunnel manager.
 //!
 //! Bridges Android worker devices into the master node's localhost namespace via
-//! `adb forward tcp:50052 tcp:50052`, then probes each tunneled worker over RPC
+//! `adb forward tcp:50062 tcp:50062`, then probes each tunneled worker over RPC
 //! so its real RAM/device metadata is known before scheduling. Workers reached
-//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50052`.
+//! this way are registered as `USB_ADB` nodes bound to `127.0.0.1:50062`.
+
+pub mod binary;
+pub mod wireless;
 
 use crate::discovery::mdns::{DiscoveredNode, NodeRegistry};
-use crate::rpc::client::{WorkerRpcClient, MASTER_ID, PROTOCOL_VERSION};
-use crate::rpc::engine::http_endpoint;
+use crate::rpc::client::{MASTER_ID, PROTOCOL_VERSION};
+use crate::rpc::engine::{dial_worker, WorkerTransportSource};
 use crate::rpc::proto::aiupcycler::rpc::HandshakeResponse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Local TCP port bridged to the worker RPC port on each USB-attached device.
-pub const ADB_FORWARD_PORT: u16 = 50052;
+pub const ADB_FORWARD_PORT: u16 = 50062;
+
+/// How often the USB device list and each phone's live memory are refreshed.
+///
+/// The worker health poll already runs at 5 s; matching it keeps the dashboard
+/// on one cadence. `adb shell cat /proc/meminfo` is read-only and does not wake
+/// or launch the worker app.
+pub const ADB_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemInfo {
+    total_bytes: u64,
+    available_bytes: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdbDevice {
@@ -71,20 +87,44 @@ impl AdbTunnelManager {
         Ok(parse_devices(&String::from_utf8_lossy(&output.stdout)))
     }
 
-    /// Establishes a port forward for a single device serial.
+    /// Establishes a port forward for a single device serial and reports it.
     ///
     /// `local_port` is the loopback port the master connects to; the worker's
     /// own RPC port is always [`ADB_FORWARD_PORT`] on the device side.
+    ///
+    /// This is the first-time path. [`Self::ensure_forward`] is the same
+    /// command without the log line, because the USB poll loop re-issues it on
+    /// every tick and a live binding is the expected result of each one.
     pub fn forward(&self, serial: &str, local_port: u16) -> Result<(), String> {
-        let remote = format!("tcp:{ADB_FORWARD_PORT}");
-        let local = format!("tcp:{local_port}");
+        self.ensure_forward(serial, local_port)?;
+        info!("ADB: forwarded {serial} -> 127.0.0.1:{local_port}");
+        Ok(())
+    }
+
+    /// Re-asserts a port forward for a single device serial.
+    ///
+    /// `adb forward <serial> tcp:P tcp:Q` is idempotent — re-issuing a binding
+    /// that already exists succeeds and leaves the carried traffic alone — so
+    /// the USB poll loop can run it every tick. It has to: `adb` drops every
+    /// forward when its server restarts or when a device re-enumerates, while
+    /// this process's own record of the bindings stays put. A loop that
+    /// trusted that record would keep dialing a tunnel that no longer exists,
+    /// and would never repair it either, because the node already carries a
+    /// port and so never gets re-probed — worker health then stays dead until
+    /// the phone is unplugged. Re-issuing costs one subprocess per device per
+    /// tick, the same as reading `adb forward --list` would, and needs no
+    /// parsing of what that command returned.
+    ///
+    /// Silent on success: a live binding is news only the first time. Failures
+    /// are still reported, so a loopback port taken by something else surfaces
+    /// as an error instead of a silently dead tunnel.
+    pub fn ensure_forward(&self, serial: &str, local_port: u16) -> Result<(), String> {
         let output = Command::new("adb")
-            .args(["-s", serial, "forward", &local, &remote])
+            .args(forward_args(serial, local_port))
             .output()
             .map_err(|e| format!("failed to run 'adb forward' for {serial}: {e}"))?;
 
         if output.status.success() {
-            info!("ADB: forwarded {serial} -> 127.0.0.1:{local_port}");
             Ok(())
         } else {
             Err(format!(
@@ -117,18 +157,43 @@ impl AdbTunnelManager {
     /// (`adb -s <serial> reverse tcp:8081 tcp:8081`), so the worker app can
     /// POST `/api/pairing/enroll` at `127.0.0.1:8081` without the API leaving
     /// host loopback (spec 2026-10-20, D-B2; docs/security.md §3).
+    ///
+    /// Reports the tunnel it opened; [`Self::ensure_reverse_pairing`] is the
+    /// quiet re-assert the cleanup task repeats while a session is pending.
     pub fn reverse_pairing(&self, serial: &str) -> Result<(), String> {
-        let args = reverse_pairing_args(serial);
+        self.ensure_reverse_pairing(serial)?;
+        info!(
+            "ADB: pairing reverse tunnel up for {serial} -> 127.0.0.1:{}",
+            crate::api::PAIRING_PORT
+        );
+        Ok(())
+    }
+
+    /// Re-asserts the pairing reverse tunnel for `serial`.
+    ///
+    /// The binding dies exactly when [`Self::ensure_forward`] does — an `adb`
+    /// server restart or a USB re-enumeration clears every reverse along with
+    /// every forward — and nothing else in this process recreates one: the
+    /// tunnel is opened once when the dashboard prepares a session, and after
+    /// that the cleanup task only ever *removes* it. A reverse dropped mid
+    /// session is therefore invisible from both ends — the worker's enroll
+    /// POST is simply refused at its own loopback, while the master still
+    /// shows a live PIN — so the cleanup task re-issues this for every session
+    /// still awaiting enrollment.
+    ///
+    /// Note that `adb reverse --list` keys a reverse by the device *transport*
+    /// (`UsbFfs`) rather than by the serial the command was issued with, so
+    /// presence cannot be checked against that listing by serial; re-issuing
+    /// the idempotent command avoids the question entirely.
+    ///
+    /// Silent on success, for the same reason as [`Self::ensure_forward`].
+    pub fn ensure_reverse_pairing(&self, serial: &str) -> Result<(), String> {
         let output = Command::new("adb")
-            .args(&args)
+            .args(reverse_pairing_args(serial))
             .output()
             .map_err(|e| format!("failed to run 'adb reverse' for {serial}: {e}"))?;
 
         if output.status.success() {
-            info!(
-                "ADB: pairing reverse tunnel up for {serial} -> 127.0.0.1:{}",
-                crate::api::PAIRING_PORT
-            );
             Ok(())
         } else {
             Err(format!(
@@ -180,15 +245,18 @@ impl AdbTunnelManager {
         Ok(forwarded)
     }
 
-    /// USB bootstrap: forwards every authorized device, probes each tunneled
-    /// worker over RPC so only nodes with known RAM capacity are registered,
-    /// then stays alive until `shutdown` flips to `true`, at which point every
-    /// forward this task established is removed again.
+    /// USB bootstrap: polls every authorized device, keeps a forward per
+    /// device, and registers a node as soon as ADB can read its memory — even
+    /// before the worker app answers. The node is upgraded with worker-reported
+    /// capacity when the handshake succeeds.
     ///
-    /// Devices that fail to handshake are skipped rather than registered with
-    /// unknown capacity; their forwards are removed immediately.
+    /// Polling (rather than a one-shot startup pass) is what makes a phone
+    /// attached after launch appear, and what keeps its live RAM current. The
+    /// only device-side work is read-only `adb shell cat /proc/meminfo`; the
+    /// worker app is never launched here.
     pub async fn start(
         registry: Arc<NodeRegistry>,
+        transports: Arc<dyn WorkerTransportSource>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         if !Self::is_available() {
@@ -196,59 +264,119 @@ impl AdbTunnelManager {
             return;
         }
 
-        let devices = match Self::new().forward_all() {
-            Ok(devices) => devices,
-            Err(e) => {
-                warn!("ADB: {e}");
-                return;
-            }
-        };
-
-        if devices.is_empty() {
-            info!("ADB: no authorized USB devices attached");
-            return;
-        }
-
-        let mut registered = 0;
         let manager = Self::new();
-        let mut established: Vec<(AdbDevice, u16)> = Vec::new();
-        for (device, local_port) in devices {
-            match probe_device(local_port).await {
-                Some(handshake) => {
-                    registry
-                        .register_or_update(node_from_handshake(&device, local_port, handshake));
-                    registered += 1;
-                    established.push((device, local_port));
+        let mut forwards: HashMap<String, u16> = HashMap::new();
+        info!(
+            "ADB: polling USB devices every {}s; unpaired phones are listed with live capacity",
+            ADB_POLL_INTERVAL.as_secs()
+        );
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            match Self::list_devices() {
+                Ok(devices) => {
+                    let devices: Vec<AdbDevice> = devices
+                        .into_iter()
+                        .filter(|device| device.state == "device")
+                        .collect();
+                    let present: HashSet<String> =
+                        devices.iter().map(|device| device.serial.clone()).collect();
+
+                    let departed: Vec<String> = forwards
+                        .keys()
+                        .filter(|serial| !present.contains(*serial))
+                        .cloned()
+                        .collect();
+                    for serial in departed {
+                        if let Some(local_port) = forwards.remove(&serial) {
+                            if let Err(e) = manager.remove_forward(&serial, local_port) {
+                                warn!("ADB: cleanup failed for {serial}: {e}");
+                            }
+                        }
+                        registry.remove(&format!("adb:{serial}"));
+                    }
+
+                    for device in devices {
+                        // Captured before the tick so a genuinely new binding
+                        // is reported once, not on every subsequent poll.
+                        let assigned = forwards.get(&device.serial).copied();
+                        let local_port = match assigned {
+                            Some(local_port) => local_port,
+                            None => next_free_port(&forwards),
+                        };
+
+                        // Re-assert on every tick, not just on first sight.
+                        // `adb` drops all forwards when its server restarts or
+                        // when the device re-enumerates, while this map keeps
+                        // the binding it recorded. Trusting that record would
+                        // leave the loop dialing a tunnel that no longer
+                        // exists — and would never repair it either, because
+                        // the node already carries a port and so is never
+                        // re-probed — which is how worker health dies until
+                        // the phone is unplugged.
+                        if let Err(e) = manager.ensure_forward(&device.serial, local_port) {
+                            warn!("ADB: {e}");
+                            continue;
+                        }
+                        if assigned.is_none() {
+                            info!("ADB: forwarded {} -> 127.0.0.1:{local_port}", device.serial);
+                        }
+                        forwards.insert(device.serial.clone(), local_port);
+
+                        let node_id = format!("adb:{}", device.serial);
+                        let existing = registry.get_node(&node_id);
+                        let node = merge_usb_node(
+                            existing.as_ref(),
+                            usb_detected_node(&device, read_meminfo(&device.serial)),
+                        );
+                        if existing.is_some() {
+                            registry.upsert(node);
+                        } else {
+                            registry.register_or_update(node);
+                        }
+
+                        // The phone is listed before its worker app runs. Probe
+                        // the RPC port until it answers; success upgrades this
+                        // same node with worker-reported capacity and a
+                        // dialable port, which puts it on the health-poll path.
+                        let needs_probe = registry
+                            .get_node(&node_id)
+                            .map(|node| node.port == 0)
+                            .unwrap_or(false);
+                        if needs_probe {
+                            if let Some(handshake) =
+                                probe_device(transports.as_ref(), &device.serial, local_port).await
+                            {
+                                registry.register_or_update(node_from_handshake(
+                                    &device, local_port, handshake,
+                                ));
+                            }
+                        }
+                    }
                 }
-                None => {
-                    warn!(
-                        "ADB: no handshake from {}; leaving device unregistered",
-                        device.serial
-                    );
-                    if let Err(e) = manager.remove_forward(&device.serial, local_port) {
-                        warn!("ADB: cleanup failed for {}: {e}", device.serial);
+                Err(e) => warn!("ADB: {e}"),
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(ADB_POLL_INTERVAL) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() {
+                        break;
                     }
                 }
             }
         }
 
-        info!(
-            "ADB: registered {registered} USB device(s); waiting for shutdown to tear down {} tunnel(s)",
-            established.len()
-        );
-
-        while !*shutdown.borrow() {
-            if shutdown.changed().await.is_err() {
-                break;
+        for (serial, local_port) in forwards {
+            if let Err(e) = manager.remove_forward(&serial, local_port) {
+                warn!("ADB: shutdown cleanup failed for {serial}: {e}");
             }
+            registry.remove(&format!("adb:{serial}"));
         }
-
-        for (device, local_port) in &established {
-            if let Err(e) = manager.remove_forward(&device.serial, *local_port) {
-                warn!("ADB: shutdown cleanup failed for {}: {e}", device.serial);
-            }
-        }
-        info!("ADB: removed {} tunnel(s) on shutdown", established.len());
+        info!("ADB: USB polling stopped");
     }
 }
 
@@ -290,32 +418,92 @@ impl PairingTunnelRegistry {
             .expect("pairing tunnel lock")
             .contains_key(serial)
     }
+
+    /// The serials whose session is still redeemable: the tunnels that must
+    /// keep accepting `POST /api/pairing/enroll`, as opposed to
+    /// [`Self::purge_inactive`], which returns the ones to tear down.
+    ///
+    /// Read by the cleanup task to re-assert a tunnel `adb` has dropped behind
+    /// its back while the session it serves is still live.
+    pub fn active(&self, pairing: &crate::security::PairingManager) -> Vec<String> {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .iter()
+            .filter(|(_, pin)| pairing.session_usable(pin))
+            .map(|(serial, _)| serial.clone())
+            .collect()
+    }
+
+    /// The ADB serial whose pairing tunnel currently backs `pin`, if any.
+    ///
+    /// The enrollment handler uses this to record the `adb:<serial>` alias, so
+    /// a phone that enrolled under its mDNS fullname is also reachable by the
+    /// USB discovery identity.
+    pub fn serial_for_pin(&self, pin: &str) -> Option<String> {
+        self.tunnels
+            .lock()
+            .expect("pairing tunnel lock")
+            .iter()
+            .find_map(|(serial, tracked)| (tracked == pin).then(|| serial.clone()))
+    }
 }
 
-/// Polls the registry and removes pairing reverse tunnels whose session has
-/// completed or expired (spec 2026-10-20, D-B8). Removal is best-effort: a
-/// failed `adb reverse --remove` is logged and the entry dropped so the poll
-/// does not retry a device that is gone forever; the device-side entry itself
-/// only ever reaches a listener that refuses every redemption (the session
-/// behind it is already dead).
+/// Polls the registry, retires pairing reverse tunnels whose session has
+/// completed or expired (spec 2026-10-20, D-B8), and re-asserts the ones still
+/// awaiting enrollment.
+///
+/// Removal is best-effort: a failed `adb reverse --remove` is logged and the
+/// entry dropped so the poll does not retry a device that is gone forever; the
+/// device-side entry itself only ever reaches a listener that refuses every
+/// redemption (the session behind it is already dead).
+///
+/// Re-asserting matters just as much: `adb` clears every reverse when its
+/// server restarts or a device re-enumerates, and nothing else in this process
+/// opens one — the tunnel is created once when a session is prepared, after
+/// which this task only ever removed it. A reverse dropped mid-session is
+/// invisible from both ends: the worker's enroll POST is refused at its own
+/// loopback while the master still shows a live PIN, so pairing fails with no
+/// error on either side. The task therefore runs every 2 s for as long as a
+/// session is redeemable.
 pub async fn pairing_tunnel_cleanup(
     security: Arc<crate::security::SecurityState>,
     tunnels: Arc<PairingTunnelRegistry>,
 ) {
+    let manager = AdbTunnelManager::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         tick.tick().await;
         for serial in tunnels.purge_inactive(&security.pairing) {
-            if let Err(e) = AdbTunnelManager::new().remove_reverse_pairing(&serial) {
+            if let Err(e) = manager.remove_reverse_pairing(&serial) {
                 warn!("ADB: pairing tunnel cleanup for {serial}: {e}");
+            }
+        }
+        for serial in tunnels.active(&security.pairing) {
+            if let Err(e) = manager.ensure_reverse_pairing(&serial) {
+                warn!("ADB: pairing tunnel re-assert failed for {serial}: {e}");
             }
         }
     }
 }
 
-async fn probe_device(local_port: u16) -> Option<HandshakeResponse> {
-    let endpoint = http_endpoint("127.0.0.1", local_port);
-    let mut client = WorkerRpcClient::connect(&endpoint).await.ok()?;
+async fn probe_device(
+    transports: &dyn WorkerTransportSource,
+    serial: &str,
+    local_port: u16,
+) -> Option<HandshakeResponse> {
+    let node = DiscoveredNode {
+        node_id: format!("adb:{serial}"),
+        device_name: String::new(),
+        ip_address: "127.0.0.1".to_string(),
+        port: local_port,
+        total_ram_bytes: 0,
+        free_ram_bytes: 0,
+        connection_type: "USB_ADB".to_string(),
+        latency_ms: 0.0,
+        last_seen_epoch_ms: now_epoch_ms(),
+    };
+    let mut client = dial_worker(transports, &node).await.ok()?;
     client.handshake(MASTER_ID, PROTOCOL_VERSION).await.ok()
 }
 
@@ -341,6 +529,109 @@ fn node_from_handshake(
         latency_ms: 0.0,
         last_seen_epoch_ms: now_epoch_ms(),
     }
+}
+
+/// A phone ADB can see, but whose worker app has not answered the RPC
+/// handshake yet. Port 0 means "not dialable": the health poll skips it, and
+/// the topology still shows its real total/available memory.
+fn usb_detected_node(device: &AdbDevice, mem: Option<MemInfo>) -> DiscoveredNode {
+    DiscoveredNode {
+        node_id: format!("adb:{}", device.serial),
+        device_name: device.label(),
+        ip_address: "127.0.0.1".to_string(),
+        port: 0,
+        total_ram_bytes: mem.map(|mem| mem.total_bytes).unwrap_or(0),
+        free_ram_bytes: mem.map(|mem| mem.available_bytes).unwrap_or(0),
+        connection_type: "USB_ADB".to_string(),
+        latency_ms: 0.0,
+        last_seen_epoch_ms: now_epoch_ms(),
+    }
+}
+
+/// Keeps the worker handshake's dialable port and name while refreshing the
+/// phone's live memory from `/proc/meminfo`. Without this, every ADB poll
+/// would reset the port to 0 and knock the worker off the health-poll path.
+fn merge_usb_node(existing: Option<&DiscoveredNode>, fresh: DiscoveredNode) -> DiscoveredNode {
+    let Some(existing) = existing else {
+        return fresh;
+    };
+    let mut node = fresh;
+    node.port = existing.port;
+    node.latency_ms = existing.latency_ms;
+    if node.total_ram_bytes == 0 {
+        node.total_ram_bytes = existing.total_ram_bytes;
+        node.free_ram_bytes = existing.free_ram_bytes;
+    }
+    if !existing.device_name.is_empty() {
+        node.device_name = existing.device_name.clone();
+    }
+    node
+}
+
+/// Reads the phone's live memory without touching the worker app.
+fn read_meminfo(serial: &str) -> Option<MemInfo> {
+    let output = Command::new("adb")
+        .args(["-s", serial, "shell", "cat", "/proc/meminfo"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_meminfo(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses the `MemTotal`/`MemAvailable` lines from Android's `/proc/meminfo`.
+/// Older devices may omit `MemAvailable`; `MemFree` is the honest fallback.
+fn parse_meminfo(output: &str) -> Option<MemInfo> {
+    let mut total_kb = None;
+    let mut available_kb = None;
+    let mut free_kb = None;
+    for line in output.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(value) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(value) = value.parse::<u64>() else {
+            continue;
+        };
+        match key.trim() {
+            "MemTotal" => total_kb = Some(value),
+            "MemAvailable" => available_kb = Some(value),
+            "MemFree" => free_kb = Some(value),
+            _ => {}
+        }
+    }
+    let total_kb = total_kb.filter(|total| *total > 0)?;
+    let available_kb = available_kb.or(free_kb).unwrap_or(0).min(total_kb);
+    Some(MemInfo {
+        total_bytes: total_kb.saturating_mul(1024),
+        available_bytes: available_kb.saturating_mul(1024),
+    })
+}
+
+/// Lowest loopback port not already assigned to another attached device.
+fn next_free_port(forwards: &HashMap<String, u16>) -> u16 {
+    let mut port = ADB_FORWARD_PORT;
+    while forwards.values().any(|used| *used == port) {
+        port = port.saturating_add(1);
+    }
+    port
+}
+
+/// Argument vector for establishing one forward, factored out so unit tests
+/// pin the exact `adb` invocation without a device. Both ends are pinned: the
+/// host side is `local_port` (one per attached device), the device side is
+/// always the worker's RPC port.
+fn forward_args(serial: &str, local_port: u16) -> Vec<String> {
+    vec![
+        "-s".into(),
+        serial.into(),
+        "forward".into(),
+        format!("tcp:{local_port}"),
+        format!("tcp:{ADB_FORWARD_PORT}"),
+    ]
 }
 
 /// Argument vector for the pairing reverse tunnel, factored out so unit tests
@@ -427,7 +718,7 @@ mod tests {
 
     #[test]
     fn forward_port_matches_worker_rpc_port() {
-        assert_eq!(ADB_FORWARD_PORT, 50052);
+        assert_eq!(ADB_FORWARD_PORT, 50062);
     }
 
     use crate::security::{PairingManager, PAIRING_TTL};
@@ -458,6 +749,91 @@ mod tests {
 
         registry.track("emulator-5554", &pin);
         assert_eq!(registry.purge_inactive(&pairing), vec!["emulator-5554"]);
+    }
+
+    #[test]
+    fn serial_for_pin_finds_the_tracked_device() {
+        let tunnels = PairingTunnelRegistry::default();
+        tunnels.track("16284c49", "815896");
+
+        assert_eq!(
+            tunnels.serial_for_pin("815896"),
+            Some("16284c49".to_string())
+        );
+        assert_eq!(tunnels.serial_for_pin("000000"), None);
+    }
+
+    #[test]
+    fn forward_args_pin_the_host_port_to_the_worker_rpc_port() {
+        // `adb -s <serial> forward tcp:<host> tcp:50062`: the host side walks
+        // upward per attached device, the device side never moves. Re-issuing
+        // this every poll is what repairs a binding `adb` dropped behind the
+        // poll loop's back, so the exact invocation is pinned here.
+        assert_eq!(
+            forward_args("16284c49", 50062),
+            vec!["-s", "16284c49", "forward", "tcp:50062", "tcp:50062"]
+        );
+        assert_eq!(
+            forward_args("emulator-5554", 50063),
+            vec!["-s", "emulator-5554", "forward", "tcp:50063", "tcp:50062"]
+        );
+    }
+
+    #[test]
+    fn active_lists_only_sessions_still_awaiting_enrollment() {
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (live, _, _) = pairing.create_session("fp");
+        let (done, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+        registry.track("16284c49", &live);
+        registry.track("emulator-5554", &done);
+        pairing.redeem(&done).expect("redeem");
+
+        // Both are tracked, but only the unredeemed session needs its reverse
+        // tunnel kept open; the redeemed one is handed to teardown instead.
+        assert_eq!(registry.active(&pairing), vec!["16284c49"]);
+        assert_eq!(registry.purge_inactive(&pairing), vec!["emulator-5554"]);
+        assert_eq!(registry.active(&pairing), vec!["16284c49"]);
+    }
+
+    #[test]
+    fn active_is_empty_once_every_session_is_spent() {
+        let pairing = PairingManager::new(PAIRING_TTL);
+        let (pin, _, _) = pairing.create_session("fp");
+        let registry = PairingTunnelRegistry::default();
+        registry.track("16284c49", &pin);
+
+        assert_eq!(registry.active(&pairing), vec!["16284c49"]);
+        pairing.redeem(&pin).expect("redeem");
+        assert!(registry.active(&pairing).is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_uses_the_adb_alias_for_transport_lookup() {
+        struct RecordingTransports {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl crate::rpc::engine::WorkerTransportSource for RecordingTransports {
+            fn transport_for(
+                &self,
+                node_id: &str,
+            ) -> Result<crate::rpc::engine::WorkerTransport, String> {
+                self.seen.lock().unwrap().push(node_id.to_string());
+                Err("stop before dialing".to_string())
+            }
+        }
+
+        let transports = RecordingTransports {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = probe_device(&transports, "16284c49", 50052).await;
+
+        assert!(result.is_none());
+        assert_eq!(
+            *transports.seen.lock().unwrap(),
+            vec!["adb:16284c49".to_string()]
+        );
     }
 
     #[test]
@@ -544,9 +920,85 @@ mod tests {
     }
 
     #[test]
-    fn distinct_devices_get_distinct_local_ports() {
-        let base = ADB_FORWARD_PORT;
-        assert_ne!(base, base + 1);
-        assert_eq!(base + 1, 50053);
+    fn parses_android_meminfo() {
+        let info = parse_meminfo(
+            "MemTotal:        5714584 kB\n\
+             MemFree:          164068 kB\n\
+             MemAvailable:    2527724 kB\n",
+        )
+        .expect("meminfo parsed");
+
+        assert_eq!(info.total_bytes, 5_714_584 * 1024);
+        assert_eq!(info.available_bytes, 2_527_724 * 1024);
+    }
+
+    #[test]
+    fn meminfo_falls_back_to_mem_free_and_rejects_unknown_total() {
+        let info = parse_meminfo("MemTotal: 1000 kB\nMemFree: 250 kB\n").expect("parsed");
+        assert_eq!(info.available_bytes, 250 * 1024);
+
+        assert!(parse_meminfo("MemFree: 250 kB\n").is_none());
+        assert!(parse_meminfo("MemTotal: 0 kB\n").is_none());
+    }
+
+    #[test]
+    fn a_usb_device_is_listed_before_its_worker_app_answers() {
+        let device = device("16284c49", "Redmi_Note_9_Pro_Max");
+        let node = usb_detected_node(
+            &device,
+            Some(MemInfo {
+                total_bytes: 5_714_584 * 1024,
+                available_bytes: 2_527_724 * 1024,
+            }),
+        );
+
+        assert_eq!(node.node_id, "adb:16284c49");
+        assert_eq!(node.device_name, "Redmi_Note_9_Pro_Max");
+        assert_eq!(node.port, 0, "not dialable until the handshake");
+        assert_eq!(node.total_ram_bytes, 5_714_584 * 1024);
+        assert_eq!(node.free_ram_bytes, 2_527_724 * 1024);
+        assert_eq!(node.connection_type, "USB_ADB");
+    }
+
+    #[test]
+    fn a_meminfo_refresh_keeps_the_handshake_port_and_name() {
+        let handshake = HandshakeResponse {
+            worker_id: "w1".to_string(),
+            device_name: "Redmi Note 9 Pro Max".to_string(),
+            total_ram_bytes: 6 * 1024 * 1024 * 1024,
+            free_ram_bytes: 3 * 1024 * 1024 * 1024,
+            cpu_cores: 8,
+            has_npu_acceleration: false,
+            supports_last_row_logits: false,
+        };
+        let existing = node_from_handshake(
+            &device("16284c49", "Redmi_Note_9_Pro_Max"),
+            50052,
+            handshake,
+        );
+        let fresh = usb_detected_node(
+            &device("16284c49", "Redmi_Note_9_Pro_Max"),
+            Some(MemInfo {
+                total_bytes: 5 * 1024 * 1024 * 1024,
+                available_bytes: 2 * 1024 * 1024 * 1024,
+            }),
+        );
+
+        let merged = merge_usb_node(Some(&existing), fresh);
+
+        assert_eq!(merged.port, 50052, "the handshake port survives polling");
+        assert_eq!(merged.device_name, "Redmi Note 9 Pro Max");
+        assert_eq!(merged.total_ram_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(merged.free_ram_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn next_free_port_skips_ports_already_in_use() {
+        let mut forwards = HashMap::new();
+        forwards.insert("a".to_string(), ADB_FORWARD_PORT);
+        assert_eq!(next_free_port(&forwards), ADB_FORWARD_PORT + 1);
+
+        forwards.insert("b".to_string(), ADB_FORWARD_PORT + 1);
+        assert_eq!(next_free_port(&forwards), ADB_FORWARD_PORT + 2);
     }
 }

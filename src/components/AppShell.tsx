@@ -54,7 +54,7 @@ export function AppShell({ activeTab, onTabChange, children }: AppShellProps) {
   }, [reduceMotion]);
 
   const pooledGb = topology ? topology.total_pooled_ram_mb / 1024 : 0;
-  const workers = topology?.nodes.filter((n) => n.role !== 'master').length ?? 0;
+  const devices = topology?.nodes.filter((n) => n.role !== 'master').length ?? 0;
 
   return (
     <div className="relative flex h-screen flex-col overflow-hidden">
@@ -79,7 +79,7 @@ export function AppShell({ activeTab, onTabChange, children }: AppShellProps) {
           <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 sm:flex">
             <Smartphone className="h-3.5 w-3.5 text-cyan-400" />
             <span className="font-mono">
-              {workers} worker{workers === 1 ? '' : 's'}
+              {devices} device{devices === 1 ? '' : 's'}
             </span>
           </div>
           <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 md:flex">

@@ -86,7 +86,7 @@ The mobile agent UI is designed to be lightweight, dark-mode, and low-power, ens
 |  ♻️ AI Upcycler Worker Node       |
 +-----------------------------------+
 | Status: CONNECTED (USB ADB)      |
-| IP: 192.168.1.104:50052           |
+| IP: 192.168.1.104:50062           |
 +-----------------------------------+
 |                                   |
 |   RAM Allocated: 3.2 GB / 4.0 GB  |

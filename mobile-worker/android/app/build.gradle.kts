@@ -84,6 +84,22 @@ protobuf {
 
 dependencies {
     implementation("io.grpc:grpc-netty:1.63.0")
+
+    // Not optional: gRPC over TLS on Android cannot work without this.
+    //
+    // grpc-netty needs an ALPN provider to negotiate HTTP/2, and on Android it
+    // looks for Conscrypt under the standalone `org.conscrypt` package. The
+    // platform's Conscrypt lives in `com.android.org.conscrypt`, so every
+    // provider check in `GrpcSslContexts.findJdkProvider` fails and it throws
+    // "Could not find TLS ALPN provider; no working netty-tcnative, Conscrypt,
+    // or Jetty NPN/ALPN available". netty is even more specific: its Android
+    // branch instantiates `org.conscrypt.OpenSSLProvider` by name.
+    //
+    // This artifact supplies that package (with arm64-v8a, armeabi-v7a, x86 and
+    // x86_64 native libraries), which is what makes the mTLS worker port able
+    // to speak HTTP/2 at all.
+    implementation("org.conscrypt:conscrypt-android:2.8.0")
+
     implementation("io.grpc:grpc-protobuf-lite:1.63.0")
     implementation("io.grpc:grpc-stub:1.63.0")
     implementation("com.google.protobuf:protobuf-javalite:3.25.3")

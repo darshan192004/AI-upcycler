@@ -12,9 +12,13 @@ import org.aiupcycler.worker.mdns.NodeIds
 object WorkerProtocol {
     /**
      * gRPC port the worker serves `aiupcycler.rpc.WorkerService` on. Matches the
-     * master's `ADB_FORWARD_PORT` so `adb forward tcp:50052 tcp:50052` reaches it.
+     * master's `ADB_FORWARD_PORT` so `adb forward tcp:50062 tcp:50062` reaches it.
+     *
+     * `50052` is deliberately avoided: MIUI system services on some devices
+     * already listen there (observed on the Redmi Note 9 Pro Max), which makes
+     * the worker's bind fail with `Address already in use`.
      */
-    const val RPC_PORT: Int = 50052
+    const val RPC_PORT: Int = 50062
 
     /** Version this build speaks during `Handshake`. */
     const val PROTOCOL_VERSION: String = "1.0"

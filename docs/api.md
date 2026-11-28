@@ -4,7 +4,7 @@
 
 **AI Upcycler** exposes two primary API surfaces:
 1. **Host Desktop External REST & WebSocket API**: Exposed on port `8080` of the Master Node (OpenAI-compatible) for consumption by frontend UIs, scripts, and local extensions.
-2. **Inter-Node RPC Protocol**: Protocol Buffer binary protocol over TCP port `50052` between the Master Node and Worker Nodes.
+2. **Inter-Node RPC Protocol**: Protocol Buffer binary protocol over TCP port `50062` between the Master Node and Worker Nodes.
 
 ---
 
@@ -84,6 +84,15 @@ expect `tool_calls` in the reply. Tool requests are served by the host
 `llama-server` only; when no host engine is configured the API returns `400`
 instead of a text answer, so the agent fails loudly rather than looping.
 
+Small models sometimes write a call as one JSON object in `content` instead of
+the native `tool_calls` field. When the request carries tools, the host backend
+promotes that object only if its `name` matches a requested tool and its
+`arguments` are a JSON object or a JSON string that parses. Prose, unknown
+names, and multiple calls stay text. Tool requests are buffered until the turn
+ends so the server can decide; requests without tools and
+`tool_choice: "none"` keep streaming unchanged. A promoted turn returns
+`finish_reason: "tool_calls"` and the usual `tool_calls` shape.
+
 The supported request/response subset and the exact streaming shape are
 specified in
 `docs/superpowers/specs/2026-10-24-agent-api-compatibility-design.md`.
@@ -104,6 +113,7 @@ specified in
   "active_model": "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
   "total_pooled_ram_mb": 16384,
   "used_pooled_ram_mb": 11200,
+  "available_pooled_ram_mb": 5184,
   "nodes": [
     {
       "node_id": "master-host-pc",
@@ -111,7 +121,10 @@ specified in
       "device_name": "Dell XPS 13 (8GB RAM)",
       "connection": "native",
       "ram_total_mb": 8192,
+      "ram_used_mb": 5000,
+      "ram_available_mb": 3192,
       "ram_assigned_mb": 0,
+      "worker_state": "master",
       "assigned_layers": [],
       "ping_ms": 0.0
     },
@@ -121,8 +134,11 @@ specified in
       "device_name": "Samsung Galaxy S10 (4GB RAM)",
       "connection": "usb_adb",
       "ram_total_mb": 4096,
+      "ram_used_mb": 3000,
+      "ram_available_mb": 1096,
       "ram_assigned_mb": 3200,
-      "assigned_layers": [0, 24],
+      "worker_state": "ready",
+      "assigned_layers": [[0, 24]],
       "ping_ms": 1.2
     },
     {
@@ -131,8 +147,11 @@ specified in
       "device_name": "Pixel 4a (4GB RAM)",
       "connection": "wifi_5g",
       "ram_total_mb": 4096,
+      "ram_used_mb": 3200,
+      "ram_available_mb": 896,
       "ram_assigned_mb": 3200,
-      "assigned_layers": [25, 48],
+      "worker_state": "ready",
+      "assigned_layers": [[25, 48]],
       "ping_ms": 8.4
     }
   ],
@@ -160,6 +179,21 @@ specified in
 }
 ```
 `discovery.mdns` is `"active"` when the mDNS browser daemon is running and `"unavailable"` when it failed to start (Wi-Fi discovery offline; USB/ADB workers unaffected).
+
+`used_pooled_ram_mb` and `available_pooled_ram_mb` are **live measured sums**,
+not scheduler reservations: each node contributes its current used/available
+reading, and a node whose reading is unavailable is omitted rather than counted
+as zero. `ram_used_mb` and `ram_available_mb` are `null` when the host or phone
+cannot be read. `ram_assigned_mb` remains the scheduler's plan and is
+legitimately `0` for the master, which coordinates but holds no layers.
+
+`worker_state` distinguishes the stages a phone goes through: `usb_detected`
+means ADB can see the device and its memory is listed, but the worker app has
+not answered the RPC handshake yet (such a node is not dialable); `discovered`
+is an unpaired mDNS node; `paired` means identity is established but no model
+engine is open; `ready` means paired and serving an open engine. The dashboard
+polls this endpoint every 5 seconds, so the RAM figures stay current while no
+generation is running.
 
 `assigned_layers` is the plan a real cluster request would use, not a
 hypothetical one: only **paired** workers receive layers, in the scheduler's
@@ -264,6 +298,49 @@ neither is the master (it is not a polled worker).
   an IP literal nor a DNS name (or more than 8 are given); `403` when the PIN is
   wrong or expired; `409` when the PIN was already redeemed. A rejected request
   does not consume the PIN.
+
+---
+
+### 3.5 Model Provisioning to a Device (spec 2026-11-03-model-provisioning)
+
+Pushes the host's registered GGUF to one enrolled worker over the mTLS data
+plane. The transfer never rides on the HTTP request — 1.9 GB over Wi-Fi takes
+minutes — so `POST` starts it and answers `202`, and `GET` reports progress
+(D-P5, D-P8). Progress lives in host memory only: a restart reports `idle`
+rather than a stale transfer.
+
+- **Endpoint**: `POST /api/devices/:id/provision`
+- **Request**:
+```json
+{
+  "model_id": "qwen2.5-coder-3b-instruct-q4_k_m"
+}
+```
+  - `model_id` is an id from `/v1/models`, never a file path (D-P10): the
+    server resolves the node from `:id` in its registry and the file from the
+    store row, so the body cannot name a path.
+  - `:id` resolves three forms — the mDNS node id, the bare ADB serial (or its
+    `adb:` alias), and the `ip:port` key discovery uses before a serial exists.
+- **Response**: `202 Accepted` — the push was claimed and spawned:
+```json
+{ "state": "running", "bytes_done": 0, "total_bytes": 2040000000 }
+```
+- **Endpoint**: `GET /api/devices/:id/provision`
+- **Response**: `200 OK` — the current state, one of:
+```json
+{ "state": "idle" }
+{ "state": "running", "bytes_done": 1048576, "total_bytes": 2040000000 }
+{ "state": "done", "bytes": 2040000000 }
+{ "state": "failed", "message": "provision tiny: ..." }
+```
+  `done` means the worker verified and installed the file; whether it
+  reopened its engine is reported separately over RPC (`engine_started`,
+  D-P7) — the worker reopens the file a moment after the transfer ends.
+- **Errors**: `404` when no registry node matches `:id`, or the `model_id` is
+  unknown; `409` when the device is not enrolled (D-P9 — provisioning rides
+  the mTLS data plane), when the model file is missing on disk, or when a push
+  to that device is already running. The checks run in that order, before a
+  byte moves.
 
 ---
 

@@ -4,6 +4,8 @@ import io.grpc.Server
 import io.grpc.netty.NettyServerBuilder
 import io.netty.handler.ssl.SslContext
 import java.util.concurrent.TimeUnit
+import org.aiupcycler.worker.model.ModelFile
+import org.aiupcycler.worker.model.ModelReceiver
 import org.aiupcycler.worker.pairing.WorkerCredentials
 
 /**
@@ -37,6 +39,9 @@ class WorkerRpcServer(
     /** Compute backend; `null` until a GGUF is side-loaded (spec D-A4). */
     private val engine: EngineSource? = null,
     private val port: Int = WorkerProtocol.RPC_PORT,
+    /** Model library a push writes into (spec 2026-11-03-model-provisioning). */
+    private val receiver: ModelReceiver? = null,
+    private val onProvisioned: ((ModelFile) -> Boolean)? = null,
 ) {
     private var server: Server? = null
     private var servingTls = false
@@ -47,7 +52,15 @@ class WorkerRpcServer(
     fun start(credentials: WorkerCredentials? = null) {
         if (server != null) return
         val builder = NettyServerBuilder.forPort(port)
-            .addService(WorkerRpcService(identity, metrics, engine))
+            .addService(
+                WorkerRpcService(
+                    identity = identity,
+                    metrics = metrics,
+                    engine = engine,
+                    receiver = receiver,
+                    onProvisioned = onProvisioned,
+                ),
+            )
         if (credentials != null) {
             builder.sslContext(tlsContext(credentials))
         }
@@ -66,15 +79,16 @@ class WorkerRpcServer(
     }
 
     /**
-     * The TLS context, or a throw. [WorkerTls.serverContext] returning `null`
-     * means the stored credentials cannot be parsed; that throws rather than
-     * degrading to plaintext, because a paired worker silently serving
-     * plaintext on the mTLS port is the failure this whole slice exists to
-     * prevent.
+     * The TLS context for [credentials].
+     *
+     * [WorkerTls.serverContext] throws - with netty's own parse failure chained
+     * as the cause - when the stored credentials cannot be read. That throw
+     * propagates out of [start] rather than degrading to plaintext, because a
+     * paired worker silently serving plaintext on the mTLS port is the failure
+     * this whole slice exists to prevent.
      */
     private fun tlsContext(credentials: WorkerCredentials): SslContext =
         WorkerTls.serverContext(credentials)
-            ?: throw IllegalStateException("stored pairing credentials cannot be read")
 
     private companion object {
         const val SHUTDOWN_SECONDS = 5L

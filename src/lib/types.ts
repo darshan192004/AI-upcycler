@@ -26,7 +26,14 @@ export interface TopologyNode {
   device_name: string;
   connection: string;
   ram_total_mb: number;
+  /** Live used memory; `null` when the reading is unavailable. */
+  ram_used_mb: number | null;
+  /** Live available memory; `null` when the reading is unavailable. */
+  ram_available_mb: number | null;
+  /** The scheduler's plan, which is legitimately 0 for the master. */
   ram_assigned_mb: number;
+  /** `master`, `usb_detected`, `discovered`, `paired`, or `ready`. */
+  worker_state: string;
   assigned_layers: [number, number][];
   ping_ms: number;
 }
@@ -37,6 +44,7 @@ export interface Topology {
   active_model: string | null;
   total_pooled_ram_mb: number;
   used_pooled_ram_mb: number;
+  available_pooled_ram_mb: number;
   nodes: TopologyNode[];
   storage_mmap: StorageMmap;
   discovery?: DiscoveryStatus;
@@ -150,3 +158,60 @@ export interface DownloadRequest {
   repo_id: string;
   file_name: string;
 }
+
+/** How a phone is reachable (spec 2026-11-03, slice A). */
+export type DeviceTransport = 'usb' | 'wireless_debugging' | 'wifi_adb';
+
+/**
+ * The onboarding state machine, as the server reports it.
+ *
+ * `needs_enrol` is deliberately not called "ready": the phone is reachable and
+ * running the right app, but it is not in the cluster until the PIN hand-off
+ * finishes.
+ */
+export type OnboardingState =
+  | { state: 'discovered' }
+  | { state: 'connecting' }
+  | { state: 'awaiting_consent' }
+  | { state: 'connected' }
+  | { state: 'needs_install'; installed: string | null; available: string }
+  | { state: 'installing' }
+  | { state: 'needs_enrol'; installed: string }
+  | { state: 'ready'; node_id: string }
+  | { state: 'failed'; reason: string; remedy: string };
+
+export interface AvailableDevice {
+  id: string;
+  display_name: string;
+  address: string;
+  transport: DeviceTransport;
+  state: OnboardingState;
+  updated_epoch_ms: number;
+}
+
+export interface AvailableDevicesResponse {
+  devices: AvailableDevice[];
+}
+
+export interface ScanResponse {
+  found: number;
+  devices: AvailableDevice[];
+}
+
+export interface RevokeResponse {
+  revoked: boolean;
+}
+
+/**
+ * A model push in progress, as the server reports it (spec 2026-11-03-model-
+ * provisioning, D-P8).
+ *
+ * `done` means the worker verified the bytes and installed the file, not that
+ * the engine is serving it: the worker reopens the model a moment later, so
+ * `supports_compute` flips on the next handshake rather than on this reply.
+ */
+export type ProvisionState =
+  | { state: 'idle' }
+  | { state: 'running'; bytes_done: number; total_bytes: number }
+  | { state: 'done'; bytes: number }
+  | { state: 'failed'; message: string };

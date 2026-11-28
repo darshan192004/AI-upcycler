@@ -8,13 +8,15 @@
 //! clients holding a cert signed by this CA.
 
 use crate::rpc::engine::{WorkerTlsConfig, WorkerTransport, WorkerTransportSource};
+use crate::trust::TrustStore;
 use rcgen::{
-    string::Ia5String, BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    string::Ia5String, BasicConstraints, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,15 +51,24 @@ pub struct ServerIdentity {
     pub key_pem: String,
 }
 
-/// Ephemeral certificate authority plus the identities the master holds.
+/// Certificate authority plus the identities the master holds.
 ///
 /// One CA signs all of them, so every certificate is pinned to a single role:
 /// the master's two identities (gRPC server, outbound mTLS client) and each
 /// worker's pair (server for master→worker, client for worker→master).
+///
+/// The CA outlives a restart when it is persisted, so a worker that paired once
+/// keeps authenticating. The master's own two identities are still re-issued on
+/// every start: they are cheap, and nothing pins them.
 pub struct NodeCa {
-    /// The CA certificate bundled with its signing key (`rcgen` 0.14's
-    /// `CertifiedIssuer`); every issued cert is signed through it.
-    ca: CertifiedIssuer<'static, KeyPair>,
+    /// Signing half of the CA. Held as a plain [`Issuer`] rather than
+    /// `CertifiedIssuer` so a CA loaded from disk — which has no in-memory
+    /// certificate object — has the same shape as a freshly generated one.
+    ca: Issuer<'static, KeyPair>,
+    ca_cert_pem: String,
+    /// Kept only so the CA can be persisted; the signing key itself lives
+    /// inside `ca`.
+    ca_key_pem: String,
     fingerprint: String,
     server_cert_pem: String,
     server_key_pem: String,
@@ -72,14 +83,47 @@ impl NodeCa {
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_key = KeyPair::generate().map_err(cred_err)?;
-        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).map_err(cred_err)?;
-        let fingerprint = hex(&Sha256::digest(ca.der()));
+        let ca_key_pem = ca_key.serialize_pem();
+        let certificate = ca_params.self_signed(&ca_key).map_err(cred_err)?;
+        let fingerprint = hex(&Sha256::digest(certificate.der()));
+        let ca_cert_pem = certificate.pem();
 
+        Self::assemble(
+            Issuer::new(ca_params, ca_key),
+            ca_cert_pem,
+            ca_key_pem,
+            fingerprint,
+        )
+    }
+
+    /// Rebuilds a CA from persisted PEM material, so certificates issued before
+    /// a restart keep authenticating after it.
+    pub fn from_parts(ca_cert_pem: &str, ca_key_pem: &str) -> Result<Self, PairingError> {
+        let key = KeyPair::from_pem(ca_key_pem).map_err(cred_err)?;
+        let ca = Issuer::from_ca_cert_pem(ca_cert_pem, key).map_err(cred_err)?;
+        let fingerprint = hex(&Sha256::digest(pem_der(ca_cert_pem)?));
+
+        Self::assemble(
+            ca,
+            ca_cert_pem.to_string(),
+            ca_key_pem.to_string(),
+            fingerprint,
+        )
+    }
+
+    fn assemble(
+        ca: Issuer<'static, KeyPair>,
+        ca_cert_pem: String,
+        ca_key_pem: String,
+        fingerprint: String,
+    ) -> Result<Self, PairingError> {
         let server = sign_server_cert(&ca, &["localhost".to_string(), "127.0.0.1".to_string()])?;
         let client = sign_client_cert(&ca, "master")?;
 
         Ok(Self {
             ca,
+            ca_cert_pem,
+            ca_key_pem,
             fingerprint,
             server_cert_pem: server.cert_pem,
             server_key_pem: server.key_pem,
@@ -94,7 +138,12 @@ impl NodeCa {
     }
 
     pub fn ca_pem(&self) -> String {
-        self.ca.pem()
+        self.ca_cert_pem.clone()
+    }
+
+    /// The CA's private key, for persisting it. Never sent to a worker.
+    pub fn ca_key_pem(&self) -> &str {
+        &self.ca_key_pem
     }
 
     pub fn server_cert_pem(&self) -> &str {
@@ -141,7 +190,7 @@ impl NodeCa {
 /// Each address is a subject alternative name: an IP literal becomes an IP SAN,
 /// anything else has to be a well-formed DNS name.
 fn sign_server_cert(
-    ca: &CertifiedIssuer<'static, KeyPair>,
+    ca: &Issuer<'static, KeyPair>,
     addresses: &[String],
 ) -> Result<ServerIdentity, PairingError> {
     let mut params = CertificateParams::default();
@@ -165,7 +214,7 @@ fn sign_server_cert(
 
 /// Signs a TLS **client** certificate (`ClientAuth`, non-CA) for `common_name`.
 fn sign_client_cert(
-    ca: &CertifiedIssuer<'static, KeyPair>,
+    ca: &Issuer<'static, KeyPair>,
     common_name: &str,
 ) -> Result<ClientIdentity, PairingError> {
     let mut params = CertificateParams::default();
@@ -293,13 +342,14 @@ impl PairingManager {
 /// Workers that completed pairing, keyed by the `node_id` the master dials them
 /// by (`DiscoveredNode::node_id` for mDNS, `adb:<serial>` for USB).
 ///
-/// Deliberately in-memory. The CA is ephemeral and regenerated on every master
-/// start, so certificates issued before a restart are already unusable and the
-/// worker has to pair again; persisting enrollments would keep rows that can
-/// never authenticate.
+/// With a [`TrustStore`] attached, records are written through so a pairing
+/// survives a restart — provided the CA did too, which is why
+/// [`SecurityState::load_or_generate`] drops them whenever it has to mint a new
+/// CA. Without a store the registry is in-memory, which is what tests use.
 #[derive(Default)]
 pub struct EnrollmentRegistry {
     workers: Mutex<HashMap<String, EnrolledWorker>>,
+    store: Option<Arc<TrustStore>>,
 }
 
 /// A paired worker: what it declared about itself while enrolling.
@@ -314,17 +364,54 @@ impl EnrollmentRegistry {
         Self::default()
     }
 
+    /// A registry seeded from `store` that writes every enrollment back to it.
+    pub fn with_store(store: Arc<TrustStore>) -> Self {
+        let workers = store
+            .load_enrollments()
+            .into_iter()
+            .map(|(node_id, device_name, addresses)| {
+                (
+                    node_id,
+                    EnrolledWorker {
+                        device_name,
+                        addresses,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            workers: Mutex::new(workers),
+            store: Some(store),
+        }
+    }
+
     /// Records a completed enrollment, replacing any earlier record for the
-    /// same node (the CA is the same for the master's lifetime, so a re-pair
-    /// only refreshes the declared details).
+    /// same node (re-pairing only refreshes the declared details).
     pub fn enroll(&self, node_id: &str, device_name: &str, addresses: Vec<String>) {
-        self.workers.lock().expect("enrollment lock").insert(
-            node_id.to_string(),
-            EnrolledWorker {
-                device_name: device_name.to_string(),
-                addresses,
-            },
-        );
+        let snapshot = {
+            let mut workers = self.workers.lock().expect("enrollment lock");
+            workers.insert(
+                node_id.to_string(),
+                EnrolledWorker {
+                    device_name: device_name.to_string(),
+                    addresses,
+                },
+            );
+            // Persist outside the lock: the file write is small but it is still
+            // I/O, and readers of the registry must not wait on the disk.
+            self.store.as_ref().map(|_| workers.clone())
+        };
+
+        let (Some(store), Some(workers)) = (self.store.as_ref(), snapshot) else {
+            return;
+        };
+        let entries: Vec<_> = workers
+            .into_iter()
+            .map(|(node_id, worker)| (node_id, worker.device_name, worker.addresses))
+            .collect();
+        if let Err(error) = store.save_enrollments(&entries) {
+            tracing::warn!("could not persist the enrollment ({error})");
+        }
     }
 
     pub fn get(&self, node_id: &str) -> Option<EnrolledWorker> {
@@ -348,6 +435,31 @@ impl EnrollmentRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.workers.lock().expect("enrollment lock").is_empty()
+    }
+
+    /// Forgets an enrollment and persists the removal.
+    ///
+    /// Returns whether a record was actually removed, so the caller can tell
+    /// "revoked" from "was never enrolled". Revoking is authoritative: a
+    /// revoked worker is dialed over plaintext no more than an unpaired one.
+    pub fn revoke(&self, node_id: &str) -> bool {
+        let (removed, snapshot) = {
+            let mut workers = self.workers.lock().expect("enrollment lock");
+            let removed = workers.remove(node_id).is_some();
+            (removed, self.store.as_ref().map(|_| workers.clone()))
+        };
+
+        let (Some(store), Some(workers)) = (self.store.as_ref(), snapshot) else {
+            return removed;
+        };
+        let entries: Vec<_> = workers
+            .into_iter()
+            .map(|(node_id, worker)| (node_id, worker.device_name, worker.addresses))
+            .collect();
+        if let Err(error) = store.save_enrollments(&entries) {
+            tracing::warn!("could not persist the revocation ({error})");
+        }
+        removed
     }
 }
 
@@ -428,6 +540,8 @@ pub struct SecurityState {
 }
 
 impl Default for SecurityState {
+    /// An in-memory CA that dies with the process. Used by tests and by any
+    /// caller that has no data directory to persist to.
     fn default() -> Self {
         Self {
             ca: NodeCa::generate().expect("ephemeral CA generation"),
@@ -435,6 +549,58 @@ impl Default for SecurityState {
             enrollments: EnrollmentRegistry::new(),
         }
     }
+}
+
+impl SecurityState {
+    /// Loads the master's CA from `trust_dir`, generating and persisting one
+    /// when the directory holds nothing usable.
+    ///
+    /// An unreadable store is replaced rather than fatal: the master has to
+    /// start, and the only cost is re-pairing, which is what happened on every
+    /// start before the CA was persisted.
+    pub fn load_or_generate(trust_dir: impl Into<PathBuf>) -> Self {
+        let store = Arc::new(TrustStore::new(trust_dir));
+        let ca = match store.load_ca() {
+            Some((cert, key)) => match NodeCa::from_parts(&cert, &key) {
+                Ok(ca) => ca,
+                Err(error) => {
+                    tracing::warn!(
+                        "persisted CA in {} is unusable ({error}); generating a new one",
+                        store.dir().display()
+                    );
+                    store.clear_enrollments();
+                    generate_and_persist(&store)
+                }
+            },
+            None => {
+                // No usable CA: any stored enrollment was signed by one that no
+                // longer exists, so keeping it would authorize nothing.
+                store.clear_enrollments();
+                generate_and_persist(&store)
+            }
+        };
+        tracing::info!(
+            "master CA {} ({})",
+            &ca.fingerprint()[..8],
+            store.dir().display()
+        );
+        Self {
+            ca,
+            pairing: PairingManager::new(PAIRING_TTL),
+            enrollments: EnrollmentRegistry::with_store(store),
+        }
+    }
+}
+
+fn generate_and_persist(store: &TrustStore) -> NodeCa {
+    let ca = NodeCa::generate().expect("CA generation");
+    match store.save_ca(&ca.ca_pem(), ca.ca_key_pem()) {
+        Ok(()) => tracing::info!("persisted the master CA in {}", store.dir().display()),
+        Err(error) => tracing::warn!(
+            "could not persist the master CA ({error}); workers will have to pair again after a restart"
+        ),
+    }
+    ca
 }
 
 fn cred_err(e: impl std::fmt::Display) -> PairingError {
@@ -449,6 +615,19 @@ fn six_digit_pin() -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// DER bytes of a PEM certificate, so a CA loaded from disk can be
+/// fingerprinted exactly like a generated one.
+fn pem_der(pem: &str) -> Result<Vec<u8>, PairingError> {
+    use base64::Engine as _;
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(cred_err)
 }
 
 #[cfg(test)]
@@ -614,6 +793,159 @@ mod tests {
             registry.get("phone-a").expect("enrolled").addresses,
             vec!["10.0.0.6".to_string()]
         );
+    }
+
+    #[test]
+    fn revoking_removes_the_enrollment_and_says_whether_there_was_one() {
+        let registry = EnrollmentRegistry::new();
+        registry.enroll("phone-a", "Pixel 8", vec!["10.0.0.5".into()]);
+
+        assert!(registry.revoke("phone-a"), "an enrolled device is revoked");
+        assert!(!registry.is_enrolled("phone-a"));
+        assert!(
+            !registry.revoke("phone-a"),
+            "revoking twice reports that the second did nothing"
+        );
+    }
+
+    #[test]
+    fn a_revoked_enrollment_does_not_come_back_after_a_restart() {
+        let dir = temp_trust_dir();
+        {
+            let state = SecurityState::load_or_generate(&dir);
+            state
+                .enrollments
+                .enroll("phone-a", "Pixel 8", vec!["10.0.0.5".into()]);
+            assert!(state.enrollments.revoke("phone-a"));
+        }
+
+        let restarted = SecurityState::load_or_generate(&dir);
+        assert!(
+            !restarted.enrollments.is_enrolled("phone-a"),
+            "a revocation that only lived in memory would let a revoked phone back in"
+        );
+    }
+
+    fn temp_trust_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-upcycler-ca-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn a_persisted_ca_reloads_with_the_same_fingerprint() {
+        let dir = temp_trust_dir();
+        let first = SecurityState::load_or_generate(&dir);
+        let second = SecurityState::load_or_generate(&dir);
+
+        assert_eq!(
+            first.ca.fingerprint(),
+            second.ca.fingerprint(),
+            "a restart must not rotate the CA, or every pairing is lost"
+        );
+        assert_eq!(first.ca.ca_pem(), second.ca.ca_pem());
+
+        // The reloaded CA still signs: a worker that paired before the restart
+        // keeps a certificate this master accepts.
+        let identity = second.ca.issue_client_cert("phone").expect("issue");
+        assert!(identity.cert_pem.contains("BEGIN CERTIFICATE"));
+
+        // The master's own identities are re-issued per start, which is fine —
+        // nothing pins them.
+        assert!(second.ca.server_cert_pem().contains("BEGIN CERTIFICATE"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_corrupt_ca_is_replaced_instead_of_blocking_startup() {
+        let dir = temp_trust_dir();
+        let original = SecurityState::load_or_generate(&dir);
+        std::fs::write(dir.join("ca-cert.pem"), "not a certificate").expect("corrupt the CA");
+
+        let recovered = SecurityState::load_or_generate(&dir);
+        assert_ne!(
+            original.ca.fingerprint(),
+            recovered.ca.fingerprint(),
+            "an unusable CA has to be replaced"
+        );
+
+        // The replacement is persisted, not regenerated on every start.
+        let again = SecurityState::load_or_generate(&dir);
+        assert_eq!(recovered.ca.fingerprint(), again.ca.fingerprint());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_fingerprint_of_a_loaded_ca_matches_its_certificate_bytes() {
+        let dir = temp_trust_dir();
+        let generated = SecurityState::load_or_generate(&dir);
+        let expected = hex(&Sha256::digest(
+            pem_der(&generated.ca.ca_pem()).expect("decode the CA"),
+        ));
+        assert_eq!(generated.ca.fingerprint(), expected);
+
+        let reloaded = SecurityState::load_or_generate(&dir);
+        assert_eq!(reloaded.ca.fingerprint(), expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enrollments_survive_a_restart() {
+        let dir = temp_trust_dir();
+        let first = SecurityState::load_or_generate(&dir);
+        first
+            .enrollments
+            .enroll("adb:16284c49", "Redmi", vec!["127.0.0.1".into()]);
+        first
+            .enrollments
+            .enroll("Redmi.local.", "Redmi", vec!["192.168.1.13".into()]);
+
+        let restarted = SecurityState::load_or_generate(&dir);
+        assert_eq!(
+            restarted.ca.fingerprint(),
+            first.ca.fingerprint(),
+            "the CA has to be the same one for the records to mean anything"
+        );
+        assert_eq!(restarted.enrollments.len(), 2);
+        let worker = restarted
+            .enrollments
+            .get("adb:16284c49")
+            .expect("still enrolled");
+        assert_eq!(worker.device_name, "Redmi");
+        assert_eq!(worker.addresses, vec!["127.0.0.1".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn regenerating_the_ca_drops_enrollments_it_never_signed() {
+        let dir = temp_trust_dir();
+        let first = SecurityState::load_or_generate(&dir);
+        first
+            .enrollments
+            .enroll("adb:16284c49", "Redmi", vec!["127.0.0.1".into()]);
+        std::fs::write(dir.join("ca-cert.pem"), "not a certificate").expect("corrupt the CA");
+
+        let recovered = SecurityState::load_or_generate(&dir);
+        assert_ne!(first.ca.fingerprint(), recovered.ca.fingerprint());
+        assert!(
+            recovered.enrollments.is_empty(),
+            "a new CA must not inherit workers enrolled against the old one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_enrollment_store_is_ignored() {
+        let dir = temp_trust_dir();
+        SecurityState::load_or_generate(&dir);
+        std::fs::write(dir.join("enrollments.json"), "{ not json").expect("corrupt the store");
+
+        let reloaded = SecurityState::load_or_generate(&dir);
+        assert!(
+            reloaded.enrollments.is_empty(),
+            "a garbage enrollment file must not stop the master starting"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

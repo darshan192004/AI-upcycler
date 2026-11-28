@@ -14,6 +14,8 @@ use crate::rpc::client::WorkerRpcClient;
 use crate::rpc::engine::WorkerTransportSource;
 use crate::scheduler::planner::{LayerScheduler, ModelSpec, ThermalHints};
 use crate::store::{NewBenchmark, NewNode};
+use crate::telemetry::WorkerHealth;
+use crate::worker_health::HostMemoryUsage;
 
 /// How the master sees a node in the topology graph.
 #[derive(Debug, Serialize)]
@@ -22,7 +24,11 @@ pub struct Topology {
     pub status: &'static str,
     pub active_model: Option<String>,
     pub total_pooled_ram_mb: u64,
+    /// Sum of the nodes' live used memory. Unknown readings are omitted, so
+    /// this is a measured total, not an estimate padded with zeros.
     pub used_pooled_ram_mb: u64,
+    /// Sum of the nodes' live available memory, with the same omission rule.
+    pub available_pooled_ram_mb: u64,
     pub nodes: Vec<TopologyNode>,
     pub storage_mmap: StorageMmap,
     pub discovery: DiscoveryStatus,
@@ -59,7 +65,16 @@ pub struct TopologyNode {
     pub device_name: String,
     pub connection: String,
     pub ram_total_mb: u64,
+    /// Live used memory, or `null` when the reading is unavailable.
+    pub ram_used_mb: Option<u64>,
+    /// Live available memory, or `null` when the reading is unavailable.
+    pub ram_available_mb: Option<u64>,
+    /// What the scheduler planned to place here. Kept separate from live
+    /// usage: the master coordinates and holds no layers, so its assignment
+    /// is legitimately zero even while it is using memory.
     pub ram_assigned_mb: u64,
+    /// `master`, `usb_detected`, `discovered`, `paired`, or `ready`.
+    pub worker_state: &'static str,
     pub assigned_layers: Vec<[usize; 2]>,
     pub ping_ms: f64,
 }
@@ -135,24 +150,32 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
         }
     }
 
+    let host_usage = state.host_memory.usage();
     let mut nodes = Vec::with_capacity(workers.len() + 1);
     nodes.push(build_topology_node(
         &master,
         "master",
         &assignments,
         &ram_assigned,
+        host_usage,
+        "master",
     ));
     for worker in &workers {
+        let health = state.telemetry_cache.worker(&worker.node_id);
+        let enrolled = state.security.enrollments.is_enrolled(&worker.node_id);
         nodes.push(build_topology_node(
             worker,
             "worker",
             &assignments,
             &ram_assigned,
+            worker_live_memory(worker, health.as_ref()),
+            worker_state(worker, enrolled, health.as_ref()),
         ));
     }
 
     let total_pooled_ram_mb = nodes.iter().map(|n| n.ram_total_mb).sum();
-    let used_pooled_ram_mb = nodes.iter().map(|n| n.ram_assigned_mb).sum();
+    let used_pooled_ram_mb = nodes.iter().filter_map(|n| n.ram_used_mb).sum();
+    let available_pooled_ram_mb = nodes.iter().filter_map(|n| n.ram_available_mb).sum();
 
     Ok(Json(Topology {
         cluster_id: state.cluster_id.clone(),
@@ -164,6 +187,7 @@ pub async fn topology(State(state): State<AppState>) -> ApiResult<Json<Topology>
         active_model,
         total_pooled_ram_mb,
         used_pooled_ram_mb,
+        available_pooled_ram_mb,
         nodes,
         storage_mmap: StorageMmap {
             enabled: false,
@@ -370,16 +394,69 @@ fn build_topology_node(
     role: &'static str,
     assignments: &HashMap<String, Vec<[usize; 2]>>,
     ram_assigned: &HashMap<String, u64>,
+    live: Option<HostMemoryUsage>,
+    worker_state: &'static str,
 ) -> TopologyNode {
+    let total_bytes = live
+        .map(|usage| usage.total_bytes)
+        .unwrap_or(node.total_ram_bytes);
     TopologyNode {
         node_id: node.node_id.clone(),
         role,
         device_name: node.device_name.clone(),
         connection: connection_label(&node.connection_type),
-        ram_total_mb: node.total_ram_bytes / (1024 * 1024),
+        ram_total_mb: total_bytes / (1024 * 1024),
+        ram_used_mb: live.map(|usage| usage.used_bytes / (1024 * 1024)),
+        ram_available_mb: live.map(|usage| usage.available_bytes / (1024 * 1024)),
         ram_assigned_mb: ram_assigned.get(&node.node_id).copied().unwrap_or(0) / (1024 * 1024),
+        worker_state,
         assigned_layers: assignments.get(&node.node_id).cloned().unwrap_or_default(),
         ping_ms: f64::from(node.latency_ms),
+    }
+}
+
+/// Live memory for a worker: total comes from the discovered device, available
+/// from the freshest health reading (or the device's own advertisement before
+/// the first health answer). Unknown total stays unknown rather than zero.
+fn worker_live_memory(
+    node: &DiscoveredNode,
+    health: Option<&WorkerHealth>,
+) -> Option<HostMemoryUsage> {
+    if node.total_ram_bytes == 0 {
+        return None;
+    }
+    let available = health
+        .map(|health| health.free_ram_bytes)
+        .unwrap_or(node.free_ram_bytes)
+        .min(node.total_ram_bytes);
+    Some(HostMemoryUsage {
+        total_bytes: node.total_ram_bytes,
+        used_bytes: node.total_ram_bytes - available,
+        available_bytes: available,
+    })
+}
+
+/// Pairing proves identity; health proves an engine is open. The dashboard
+/// distinguishes a phone that is merely on USB from one that is paired and
+/// ready to receive layers.
+fn worker_state(
+    node: &DiscoveredNode,
+    enrolled: bool,
+    health: Option<&WorkerHealth>,
+) -> &'static str {
+    if enrolled {
+        if health
+            .map(|health| health.supports_compute)
+            .unwrap_or(false)
+        {
+            "ready"
+        } else {
+            "paired"
+        }
+    } else if node.connection_type == "USB_ADB" {
+        "usb_detected"
+    } else {
+        "discovered"
     }
 }
 
@@ -414,6 +491,23 @@ mod tests {
         }
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    struct FakeHostMemory {
+        usage: Option<HostMemoryUsage>,
+    }
+
+    impl crate::worker_health::HostMemorySource for FakeHostMemory {
+        fn utilization_pct(&self) -> Option<f64> {
+            self.usage
+                .map(|usage| (usage.used_bytes as f64 / usage.total_bytes as f64) * 100.0)
+        }
+
+        fn usage(&self) -> Option<HostMemoryUsage> {
+            self.usage
+        }
+    }
+
     fn state(registry: Arc<NodeRegistry>, store: Arc<Store>) -> AppState {
         AppState::new(
             "cluster-1".into(),
@@ -428,6 +522,13 @@ mod tests {
                 cpu_cores: 4,
             },
         )
+        .with_host_memory(Arc::new(FakeHostMemory {
+            usage: Some(HostMemoryUsage {
+                total_bytes: 2 * GIB,
+                used_bytes: GIB,
+                available_bytes: GIB,
+            }),
+        }))
     }
 
     async fn topology_of(state: AppState) -> Topology {
@@ -447,11 +548,101 @@ mod tests {
         assert_eq!(topology.cluster_id, "cluster-1");
         assert_eq!(topology.nodes.len(), 2);
         assert_eq!(topology.nodes[0].role, "master");
+        assert_eq!(topology.nodes[0].worker_state, "master");
+        assert_eq!(topology.nodes[0].ram_used_mb, Some(1024));
+        assert_eq!(topology.nodes[0].ram_available_mb, Some(1024));
+        assert_eq!(topology.nodes[0].ram_assigned_mb, 0);
         assert_eq!(topology.nodes[1].role, "worker");
         assert_eq!(topology.nodes[1].connection, "usb_adb");
+        assert_eq!(topology.nodes[1].worker_state, "usb_detected");
+        assert_eq!(topology.nodes[1].ram_used_mb, Some(0));
+        assert_eq!(topology.nodes[1].ram_available_mb, Some(4096));
         assert_eq!(topology.status, "idle");
         assert_eq!(topology.total_pooled_ram_mb, 2048 + 4096);
+        assert_eq!(topology.used_pooled_ram_mb, 1024);
+        assert_eq!(topology.available_pooled_ram_mb, 1024 + 4096);
         assert_eq!(topology.discovery.mdns, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn topology_uses_live_memory_not_scheduler_assignment() {
+        let registry = Arc::new(NodeRegistry::new());
+        let mut worker = node("w1", 4 * GIB);
+        worker.free_ram_bytes = GIB;
+        registry.register_or_update(worker);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let state = state(registry, store);
+
+        let topology = topology_of(state).await;
+        let master = topology.nodes.iter().find(|n| n.role == "master").unwrap();
+        let worker = topology.nodes.iter().find(|n| n.role == "worker").unwrap();
+
+        assert_eq!(master.ram_used_mb, Some(1024));
+        assert_eq!(worker.ram_used_mb, Some(3 * 1024));
+        assert_eq!(worker.ram_available_mb, Some(1024));
+        assert_eq!(
+            worker.ram_assigned_mb, 0,
+            "no model plan means no assignment"
+        );
+        assert_eq!(topology.used_pooled_ram_mb, 1024 + 3 * 1024);
+        assert_eq!(topology.available_pooled_ram_mb, 1024 + 1024);
+    }
+
+    #[tokio::test]
+    async fn topology_marks_an_enrolled_worker_without_an_engine_as_paired() {
+        let registry = Arc::new(NodeRegistry::new());
+        registry.register_or_update(node("w1", 4 * GIB));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let state = state(registry, store);
+        state.security.enrollments.enroll("w1", "w1", vec![]);
+
+        let topology = topology_of(state).await;
+        let worker = topology.nodes.iter().find(|n| n.role == "worker").unwrap();
+
+        assert_eq!(worker.worker_state, "paired");
+    }
+
+    #[tokio::test]
+    async fn topology_marks_a_usb_phone_before_pairing() {
+        let registry = Arc::new(NodeRegistry::new());
+        let mut phone = node("adb:16284c49", 5 * GIB);
+        phone.device_name = "Redmi_Note_9_Pro_Max".into();
+        phone.free_ram_bytes = 2 * GIB;
+        phone.port = 0;
+        registry.register_or_update(phone);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let state = state(registry, store);
+
+        let topology = topology_of(state).await;
+        let phone = topology
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "adb:16284c49")
+            .expect("USB phone listed");
+
+        assert_eq!(phone.worker_state, "usb_detected");
+        assert_eq!(phone.ram_total_mb, 5 * 1024);
+        assert_eq!(phone.ram_used_mb, Some(3 * 1024));
+        assert_eq!(phone.ram_available_mb, Some(2 * 1024));
+        assert_eq!(phone.ram_assigned_mb, 0);
+    }
+
+    #[tokio::test]
+    async fn topology_marks_a_wifi_node_as_discovered() {
+        let registry = Arc::new(NodeRegistry::new());
+        let mut wifi = node("wifi-1", 4 * GIB);
+        wifi.connection_type = "WIFI_MDNS".into();
+        registry.register_or_update(wifi);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let state = state(registry, store);
+
+        let topology = topology_of(state).await;
+        let wifi = topology
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "wifi-1")
+            .unwrap();
+        assert_eq!(wifi.worker_state, "discovered");
     }
 
     #[tokio::test]

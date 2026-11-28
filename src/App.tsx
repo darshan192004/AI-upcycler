@@ -15,8 +15,17 @@ export const App: React.FC = () => {
   useEffect(() => {
     void refreshTopology();
     void refreshModels();
+    // The topology endpoint reads live host/phone memory at request time. The
+    // telemetry socket carries health/temperature; this timer is what keeps the
+    // RAM figures current even when no generation is running.
+    const topologyTimer = window.setInterval(() => {
+      void refreshTopology();
+    }, 5000);
     const disconnect = connectTelemetry(applyTelemetry);
-    return disconnect;
+    return () => {
+      window.clearInterval(topologyTimer);
+      disconnect();
+    };
   }, [refreshTopology, refreshModels, applyTelemetry]);
 
   return (

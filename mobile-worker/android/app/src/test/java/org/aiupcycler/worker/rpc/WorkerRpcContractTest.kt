@@ -1,9 +1,13 @@
 package org.aiupcycler.worker.rpc
 
+import aiupcycler.rpc.ClusterRpc.BeginModelPushRequest
 import aiupcycler.rpc.ClusterRpc.ExecuteForwardRequest
+import aiupcycler.rpc.ClusterRpc.FinishModelPushRequest
 import aiupcycler.rpc.ClusterRpc.HandshakeRequest
 import aiupcycler.rpc.ClusterRpc.HealthRequest
 import aiupcycler.rpc.ClusterRpc.LoadLayersRequest
+import aiupcycler.rpc.ClusterRpc.ModelChunk
+import aiupcycler.rpc.ClusterRpc.PushModelChunksResponse
 import aiupcycler.rpc.ClusterRpc.TensorBuffer
 import aiupcycler.rpc.ClusterRpc.UnloadLayersRequest
 import aiupcycler.rpc.WorkerServiceGrpc
@@ -14,8 +18,12 @@ import io.grpc.Status
 import io.grpc.StatusRuntimeException
 import io.grpc.inprocess.InProcessChannelBuilder
 import io.grpc.inprocess.InProcessServerBuilder
+import io.grpc.stub.StreamObserver
 import org.aiupcycler.worker.engine.WorkerEngine
 import org.aiupcycler.worker.metrics.DeviceMetrics
+import org.aiupcycler.worker.model.ModelFile
+import org.aiupcycler.worker.model.ModelReceiver
+import org.aiupcycler.worker.model.ReceiveStart
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -26,6 +34,8 @@ import org.junit.Test
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Runs the real [WorkerRpcService] over an in-process gRPC transport and calls
@@ -252,6 +262,70 @@ class WorkerRpcContractTest {
         }
     }
 
+    /**
+     * The async stub, which is the only one that can drive a client-streaming
+     * call: grpc-java does not put `PushModelChunks` on the blocking stub.
+     */
+    private fun withAsyncService(
+        service: WorkerRpcService,
+        block: (WorkerServiceGrpc.WorkerServiceStub) -> Unit,
+    ) {
+        val name = InProcessServerBuilder.generateName()
+        val disposableServer = InProcessServerBuilder.forName(name)
+            .directExecutor()
+            .addService(service)
+            .build()
+            .start()
+        val disposableChannel = InProcessChannelBuilder.forName(name).directExecutor().build()
+        try {
+            block(WorkerServiceGrpc.newStub(disposableChannel))
+        } finally {
+            disposableChannel.shutdownNow()
+            disposableServer.shutdownNow()
+        }
+    }
+
+    /** Drives a client-streaming push to completion and returns its reply. */
+    private fun push(
+        stub: WorkerServiceGrpc.WorkerServiceStub,
+        chunks: List<ModelChunk>,
+    ): PushModelChunksResponse {
+        val done = CountDownLatch(1)
+        var response: PushModelChunksResponse? = null
+        var failure: Throwable? = null
+        val request = stub.pushModelChunks(
+            object : StreamObserver<PushModelChunksResponse> {
+                override fun onNext(value: PushModelChunksResponse) {
+                    response = value
+                }
+
+                override fun onError(t: Throwable) {
+                    failure = t
+                    done.countDown()
+                }
+
+                override fun onCompleted() {
+                    done.countDown()
+                }
+            },
+        )
+        for (chunk in chunks) {
+            if (failure != null) break
+            try {
+                request.onNext(chunk)
+            } catch (e: Throwable) {
+                failure = e
+                break
+            }
+        }
+        if (failure == null) {
+            runCatching { request.onCompleted() }
+        }
+        assertTrue("push did not complete", done.await(10, TimeUnit.SECONDS))
+        failure?.let { throw it }
+        return response ?: throw AssertionError("push returned no response")
+    }
+
     private fun loadRequest(start: Int, end: Int) = LoadLayersRequest.newBuilder()
         .setModelId("tiny-untied-f32")
         .setStartLayer(start)
@@ -304,4 +378,173 @@ class WorkerRpcContractTest {
         } catch (e: StatusRuntimeException) {
             e.status
         }
+
+    // --- model push (spec 2026-11-03-model-provisioning) ---------------------
+
+    private class FakeReceiver(
+        private val resumeFrom: Long = 0,
+        private val failFinish: Boolean = false,
+    ) : ModelReceiver {
+        var written = resumeFrom
+        val appended = mutableListOf<ByteArray>()
+        var finishedWith: String? = null
+
+        override fun beginReceive(
+            fileName: String,
+            totalBytes: Long,
+            sha256Hex: String,
+        ): ReceiveStart = ReceiveStart.Accepted(resumeFrom)
+
+        override fun appendReceive(offset: Long, data: ByteArray): Long {
+            require(offset == written) { "chunk offset $offset does not match $written written" }
+            written += data.size
+            appended += data
+            return written
+        }
+
+        override fun finishReceive(sha256Hex: String): ModelFile {
+            if (failFinish) throw java.io.IOException("sha256 mismatch")
+            finishedWith = sha256Hex
+            return ModelFile(File("m.gguf"), "m.gguf", written)
+        }
+    }
+
+    private fun beginRequest() = BeginModelPushRequest.newBuilder()
+        .setModelId("m")
+        .setFileName("m.gguf")
+        .setTotalBytes(8)
+        .setSha256Hex("a".repeat(64))
+        .build()
+
+    private fun chunk(offset: Long, bytes: ByteArray) = ModelChunk.newBuilder()
+        .setOffset(offset)
+        .setData(ByteString.copyFrom(bytes))
+        .build()
+
+    @Test
+    fun beginModelPushReportsTheResumeOffset() {
+        val receiver = FakeReceiver(resumeFrom = 3)
+        withService(WorkerRpcService(identity, metrics, receiver = receiver)) { worker ->
+            val reply = worker.beginModelPush(beginRequest())
+
+            assertTrue(reply.accepted)
+            assertEquals(3L, reply.resumeFromBytes)
+        }
+    }
+
+    @Test
+    fun beginModelPushIsUnimplementedWithoutAReceiver() {
+        assertEquals(
+            Status.Code.UNIMPLEMENTED,
+            statusOf { stub.beginModelPush(beginRequest()) }.code,
+        )
+    }
+
+    @Test
+    fun chunksAreAppendedInOrder() {
+        val receiver = FakeReceiver()
+        withAsyncService(WorkerRpcService(identity, metrics, receiver = receiver)) { worker ->
+            val reply = push(
+                worker,
+                listOf(
+                    chunk(0, ByteArray(3) { 1 }),
+                    chunk(3, ByteArray(5) { 2 }),
+                ),
+            )
+
+            assertTrue(reply.errorMessage, reply.success)
+            assertEquals(8L, reply.receivedBytes)
+            assertEquals(8, receiver.appended.sumOf { it.size })
+        }
+    }
+
+    @Test
+    fun anOutOfOrderChunkFailsTheStream() {
+        val receiver = FakeReceiver()
+        withAsyncService(WorkerRpcService(identity, metrics, receiver = receiver)) { worker ->
+            val error = try {
+                push(
+                    worker,
+                    listOf(
+                        chunk(0, ByteArray(4)),
+                        chunk(0, ByteArray(4)),
+                    ),
+                )
+                null
+            } catch (e: StatusRuntimeException) {
+                e
+            }
+
+            assertEquals(Status.Code.INVALID_ARGUMENT, error?.status?.code)
+        }
+    }
+
+    @Test
+    fun finishReportsAVerificationFailureAsUnsuccessful() {
+        val receiver = FakeReceiver(failFinish = true)
+        withService(WorkerRpcService(identity, metrics, receiver = receiver)) { worker ->
+            val reply = worker.finishModelPush(
+                FinishModelPushRequest.newBuilder()
+                    .setModelId("m")
+                    .setSha256Hex("a".repeat(64))
+                    .build(),
+            )
+
+            assertFalse(reply.success)
+            assertTrue(reply.errorMessage.contains("sha256 mismatch"))
+        }
+    }
+
+    @Test
+    fun finishCallsBackWithTheInstalledFile() {
+        val receiver = FakeReceiver()
+        val provisioned = mutableListOf<ModelFile>()
+        withService(
+            WorkerRpcService(
+                identity,
+                metrics,
+                receiver = receiver,
+                onProvisioned = {
+                    provisioned += it
+                    true
+                },
+            ),
+        ) { worker ->
+            val reply = worker.finishModelPush(
+                FinishModelPushRequest.newBuilder()
+                    .setModelId("m")
+                    .setSha256Hex("a".repeat(64))
+                    .build(),
+            )
+
+            assertTrue(reply.errorMessage, reply.success)
+            assertEquals(listOf("m.gguf"), provisioned.map { it.displayName })
+            assertTrue(reply.engineStarted)
+            assertEquals("m.gguf", File(reply.modelPath).name)
+        }
+    }
+
+    @Test
+    fun finishWarnsWhenTheEngineWasNotReopened() {
+        val receiver = FakeReceiver()
+        withService(
+            WorkerRpcService(
+                identity,
+                metrics,
+                receiver = receiver,
+                onProvisioned = { false },
+            ),
+        ) { worker ->
+            val reply = worker.finishModelPush(
+                FinishModelPushRequest.newBuilder()
+                    .setModelId("m")
+                    .setSha256Hex("a".repeat(64))
+                    .build(),
+            )
+
+            assertTrue(reply.success)
+            assertFalse(reply.engineStarted)
+            assertTrue(reply.errorMessage.contains("reopens it"))
+        }
+    }
 }
