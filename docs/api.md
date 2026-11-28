@@ -665,3 +665,23 @@ rotated token returns `401` with the fixed body
 `{"error":{"message":"unauthorized","type":"unauthorized","code":401}}` — no
 model, session, or provider detail. Token format, storage, rotation, and
 revocation are specified in `docs/security.md` §5.
+
+### POST /api/media
+Requires AI_UPCYCLER_MULTIMODAL=1 (otherwise 404). Multipart field `file`, MIME one of
+image/png, image/jpeg, image/webp, image/gif; max 10 MiB; max 4 per message.
+Returns 200 {"media_hash","mime_type","file_name","byte_count"}.
+Invalid input: 400 {"error":"invalid_image_attachment"}.
+
+### ChatMessage.content union
+Text-only: "content": "hello" (unchanged).
+Multipart turn: "content": [{"type":"text","text":"look"},
+{"type":"image","media_hash":"<64 hex>","mime_type":"image/png","file_name":"a.png","byte_count":9}].
+Missing/null content is treated as "".
+
+### Image error bodies (all 400)
+- multimodal_disabled — gate off
+- image_attachments_require_vision_provider — local/cluster/tool turn
+- provider_lacks_vision_support — resolved model has supports_vision=false
+- no_vision_capable_model_loaded — no vision-capable route
+- invalid_image_attachment — MIME/magic/size/hash failure
+No image bytes appear in logs or error responses.
