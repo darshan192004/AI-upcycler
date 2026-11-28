@@ -89,6 +89,9 @@ pub struct AppState {
     /// Cloud provider registry. Rebuilt whenever the secret store is swapped
     /// so `configured` statuses cannot go stale.
     pub providers: Arc<ProviderRegistry>,
+    /// Whether this server accepts image parts in chat requests. Defaults to
+    /// `false` so legacy deployments stay text-only until explicitly enabled.
+    pub multimodal_enabled: bool,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -144,6 +147,7 @@ impl AppState {
             provisioning: Arc::new(provisioning::ProvisioningRegistry::default()),
             secrets,
             providers,
+            multimodal_enabled: false,
         }
     }
 
@@ -225,6 +229,12 @@ impl AppState {
     /// registry between [`AppState`] and the adaptive chat backend).
     pub fn with_security(mut self, security: Arc<SecurityState>) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Enables or disables image attachments on the local `/v1` chat surface.
+    pub fn with_multimodal(mut self, multimodal_enabled: bool) -> Self {
+        self.multimodal_enabled = multimodal_enabled;
         self
     }
 

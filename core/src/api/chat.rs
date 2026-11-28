@@ -8,6 +8,7 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -18,8 +19,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::backend::{
-    ChatMessage, FunctionCall, GenerationChunk, GenerationRequest, Stop, ToolCall, ToolCallDelta,
-    ToolDef,
+    ChatMessage, ContentPart, FunctionCall, GenerationChunk, GenerationRequest, MessageContent,
+    Stop, ToolCall, ToolCallDelta, ToolDef,
 };
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::discovery::mdns::NodeRegistry;
@@ -75,6 +76,21 @@ fn default_max_tokens() -> u32 {
     1024
 }
 
+/// Text used for token counting, titles and metrics. Image parts carry no
+/// inline bytes, so they contribute no text here.
+fn content_text(c: &MessageContent) -> &str {
+    match c {
+        MessageContent::Text(t) => t,
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .find_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or(""),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionResponse {
     id: String,
@@ -105,6 +121,16 @@ pub async fn chat_completions(
 ) -> ApiResult<Response> {
     if request.messages.is_empty() {
         return Err(ApiError::BadRequest("messages must not be empty".into()));
+    }
+
+    // Phase 1 has no vision provider. Refuse before resolving a route or
+    // creating a session so a rejected attachment leaves no stored turns.
+    if request.messages.iter().any(|m| m.content.has_images()) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "image_attachments_require_vision_provider" })),
+        )
+            .into_response());
     }
 
     let policy = RoutePolicy::parse(request.provider.as_deref()).map_err(ApiError::BadRequest)?;
@@ -201,13 +227,14 @@ pub async fn chat_completions(
             session_id: session_id.clone(),
             role: user.role.clone(),
             content: user.content.clone(),
-            token_count: approx_tokens(&user.content),
+            token_count: approx_tokens(content_text(&user.content)),
             generation_time_sec: 0.0,
         })?;
     }
 
     let generation = GenerationRequest {
         model: model_id,
+        provider: request.provider.clone(),
         messages: request.messages.clone(),
         temperature: request.temperature,
         max_tokens: request.max_tokens,
@@ -316,7 +343,7 @@ async fn buffered_response(
     persist_assistant(
         &state.store,
         &session_id,
-        &content,
+        MessageContent::Text(content.clone()),
         completion_tokens,
         elapsed,
     );
@@ -333,7 +360,7 @@ async fn buffered_response(
         generation
             .messages
             .iter()
-            .map(|m| approx_tokens(&m.content))
+            .map(|m| approx_tokens(content_text(&m.content)))
             .sum::<i64>() as u64
     });
 
@@ -346,7 +373,7 @@ async fn buffered_response(
             index: 0,
             message: ChatMessage {
                 role: ROLE_ASSISTANT.into(),
-                content,
+                content: MessageContent::Text(content),
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -445,7 +472,7 @@ fn stream_response(
         yield Ok(sse_event(chunk_value(&id, &model, json!({}), Some(&reason))));
         yield Ok(Event::default().data("[DONE]"));
 
-        persist_assistant(&store, &session_id, &content, completion_tokens, started.elapsed().as_secs_f64());
+        persist_assistant(&store, &session_id, MessageContent::Text(content.clone()), completion_tokens, started.elapsed().as_secs_f64());
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -456,7 +483,7 @@ fn resolve_session(state: &AppState, request: &ChatCompletionRequest) -> ApiResu
         .messages
         .iter()
         .find(|m| m.role == "user")
-        .map(|m| truncate(&m.content, 48))
+        .map(|m| truncate(content_text(&m.content), 48))
         .unwrap_or_else(|| "New chat".to_string());
 
     match &request.session_id {
@@ -521,14 +548,14 @@ fn merge_tool_calls(deltas: Vec<ToolCallDelta>) -> Vec<ToolCall> {
 fn persist_assistant(
     store: &Store,
     session_id: &str,
-    content: &str,
+    content: MessageContent,
     tokens: u64,
     elapsed_secs: f64,
 ) {
     if let Err(error) = store.append_message(&NewChatMessage {
         session_id: session_id.to_string(),
         role: ROLE_ASSISTANT.to_string(),
-        content: content.to_string(),
+        content,
         token_count: tokens as i64,
         generation_time_sec: elapsed_secs,
     }) {
@@ -608,7 +635,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::backend::{FunctionCallDelta, GenerationBackend};
+    use crate::api::backend::FunctionCallDelta;
     use crate::discovery::mdns::DiscoveredNode;
     use crate::store::{NewModel, Store};
     use std::sync::Arc;
@@ -848,6 +875,7 @@ mod tests {
         assert!(response.choices[0]
             .message
             .content
+            .as_str()
             .contains("[stub:llama-8b]"));
         assert!(response.usage.completion_tokens > 0);
 

@@ -454,7 +454,7 @@ impl ProviderRegistry {
             model: model.to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
-                content: "Reply with one token.".to_string(),
+                content: "Reply with one token.".into(),
                 ..Default::default()
             }],
             max_tokens: 1,

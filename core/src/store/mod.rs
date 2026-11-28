@@ -4,6 +4,7 @@
 //! shared across async handlers (SQLite is single-writer). The schema mirrors
 //! `docs/database.md` and is applied idempotently on open.
 
+use crate::api::backend::MessageContent;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -103,7 +104,7 @@ pub struct ChatMessageRow {
     pub message_id: i64,
     pub session_id: String,
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
     pub token_count: i64,
     pub generation_time_sec: f64,
     pub created_at: String,
@@ -113,7 +114,7 @@ pub struct ChatMessageRow {
 pub struct NewChatMessage {
     pub session_id: String,
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
     pub token_count: i64,
     pub generation_time_sec: f64,
 }
@@ -345,13 +346,18 @@ impl Store {
 
     pub fn append_message(&self, message: &NewChatMessage) -> Result<i64, StoreError> {
         let conn = self.lock()?;
+        // Text content still serializes to a JSON string, so existing rows and
+        // readers that treat the column as plain text keep working.
+        let content = serde_json::to_string(&message.content).map_err(|error| {
+            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
         conn.execute(
             "INSERT INTO chat_messages (session_id, role, content, token_count, generation_time_sec)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 message.session_id,
                 message.role,
-                message.content,
+                content,
                 message.token_count,
                 message.generation_time_sec,
             ],
@@ -407,11 +413,18 @@ fn map_benchmark(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRow> {
 }
 
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessageRow> {
+    let raw: String = row.get(3)?;
+    // New rows hold serialized `MessageContent`; legacy rows held the raw text
+    // without JSON quotes. Falling back keeps old databases readable.
+    let content = match serde_json::from_str::<MessageContent>(&raw) {
+        Ok(content) => content,
+        Err(_) => MessageContent::Text(raw),
+    };
     Ok(ChatMessageRow {
         message_id: row.get(0)?,
         session_id: row.get(1)?,
         role: row.get(2)?,
-        content: row.get(3)?,
+        content,
         token_count: row.get(4)?,
         generation_time_sec: row.get(5)?,
         created_at: row.get(6)?,
@@ -559,7 +572,7 @@ mod tests {
 
         let messages = store.list_messages("s1").unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content, "hello!");
+        assert_eq!(messages[1].content, MessageContent::Text("hello!".into()));
         assert_eq!(messages[1].generation_time_sec, 0.25);
         assert_eq!(store.list_sessions().unwrap().len(), 1);
     }

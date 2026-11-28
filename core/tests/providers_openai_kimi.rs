@@ -93,12 +93,12 @@ fn generation_request(model: &str) -> GenerationRequest {
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "Be brief.".to_string(),
+                content: "Be brief.".into(),
                 ..Default::default()
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "Say hello.".to_string(),
+                content: "Say hello.".into(),
                 ..Default::default()
             },
         ],

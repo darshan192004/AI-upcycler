@@ -70,22 +70,22 @@ fn generation_request() -> GenerationRequest {
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "Be brief.".to_string(),
+                content: "Be brief.".into(),
                 ..Default::default()
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "Say hello.".to_string(),
+                content: "Say hello.".into(),
                 ..Default::default()
             },
             ChatMessage {
                 role: "assistant".to_string(),
-                content: "Earlier reply.".to_string(),
+                content: "Earlier reply.".into(),
                 ..Default::default()
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "Now.".to_string(),
+                content: "Now.".into(),
                 ..Default::default()
             },
         ],

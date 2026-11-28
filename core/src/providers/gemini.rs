@@ -72,7 +72,7 @@ fn payload(request: &GenerationRequest) -> Value {
         };
         let mut text = message.content.clone();
         if index == 0 && role == "user" && !system.is_empty() {
-            text = format!("{system}\n{text}");
+            text = format!("{system}\n{text}").into();
         }
         contents.push(json!({
             "role": role,

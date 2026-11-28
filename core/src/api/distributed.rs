@@ -345,11 +345,16 @@ impl DistributedBackend {
         &self,
         messages: &[crate::api::backend::ChatMessage],
     ) -> Result<Vec<u32>, String> {
+        // Cluster workers have no vision path; refuse before rendering ChatML
+        // so an image part can never reach a worker as a text prompt.
+        if messages.iter().any(|m| m.content.has_images()) {
+            return Err("image_attachments_require_vision_provider".into());
+        }
         let template: Vec<TemplateMessage> = messages
             .iter()
             .map(|m| TemplateMessage {
                 role: &m.role,
-                content: &m.content,
+                content: m.content.as_str(),
             })
             .collect();
         let prompt = self
@@ -859,7 +864,7 @@ fn withheld_tail(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::backend::{ChatMessage, FunctionDef, ToolDef};
+    use crate::api::backend::{ChatMessage, FunctionDef, MessageContent, ToolDef};
     use ai_upcycler_model_io::fixture::{
         default_merges, write_tiny_model, TinyModelConfig, TokenizerFixture,
     };
@@ -1482,7 +1487,7 @@ mod tests {
             model: "tiny".into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
-                content,
+                content: MessageContent::Text(content),
                 ..Default::default()
             }],
             temperature: 0.0,
