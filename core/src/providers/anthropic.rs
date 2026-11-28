@@ -228,7 +228,14 @@ fn anthropic_stream(
                     return;
                 }
             };
-            for line in take_complete_lines(&mut buffer, &chunk) {
+            let lines = match take_complete_lines(&mut buffer, &chunk) {
+                Ok(lines) => lines,
+                Err(_) => {
+                    yield Err(format!("{provider_name} returned an oversized response line"));
+                    return;
+                }
+            };
+            for line in lines {
                 if let Some(name) = line.strip_prefix("event:") {
                     event = Some(name.trim().to_string());
                     continue;
@@ -254,6 +261,10 @@ fn anthropic_stream(
                     .unwrap_or_default();
 
                 match kind {
+                    "error" => {
+                        yield Err(format!("{provider_name} stream reported an error"));
+                        return;
+                    }
                     "message_start" => {
                         let prompt_tokens = parsed
                             .get("message")

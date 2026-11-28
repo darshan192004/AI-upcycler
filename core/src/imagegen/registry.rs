@@ -51,6 +51,43 @@ impl ImageBackendRegistry {
         }
     }
 
+    /// Builds a registry with an explicit HTTP client. Tests use this to inject
+    /// a `.no_proxy()` client for loopback mocks; production uses [`Self::new`],
+    /// whose backends are HTTPS-only and do not follow redirects.
+    pub fn new_with_client(
+        secrets: Arc<dyn SecretStore>,
+        openai_endpoint: impl Into<String>,
+        gemini_endpoint: impl Into<String>,
+        local_flag: bool,
+        client: reqwest::Client,
+    ) -> Self {
+        let backends: Vec<(ImageProviderId, Arc<dyn ImageBackend>)> = vec![
+            (
+                ImageProviderId::OpenAI,
+                Arc::new(B64JsonImageBackend::with_client(
+                    ImageProviderId::OpenAI,
+                    DEFAULT_OPENAI_IMAGE_MODEL,
+                    openai_endpoint,
+                    client.clone(),
+                )),
+            ),
+            (
+                ImageProviderId::Gemini,
+                Arc::new(B64JsonImageBackend::with_client(
+                    ImageProviderId::Gemini,
+                    DEFAULT_GEMINI_IMAGE_MODEL,
+                    gemini_endpoint,
+                    client,
+                )),
+            ),
+        ];
+        Self {
+            backends,
+            secrets,
+            local_flag,
+        }
+    }
+
     pub fn from_env(secrets: Arc<dyn SecretStore>) -> Self {
         let openai_endpoint = std::env::var("AI_UPCYCLER_OPENAI_IMAGES_URL")
             .ok()

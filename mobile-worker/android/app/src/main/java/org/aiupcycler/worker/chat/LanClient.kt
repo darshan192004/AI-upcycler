@@ -200,27 +200,38 @@ class LanClient(
             history = request.history,
             attachments = request.attachments,
         )
-        val call = callFactory.newCall(
-            request("POST", "/v1/chat/completions", jsonBody(body)),
-        )
         val parser = SseParser()
+        var terminalReported = false
 
         fun dispatch(events: List<SseEvent>) {
             events.forEach { event ->
                 event.content?.let(onDelta)
-                if (event.done) onDone(event.source ?: Source.Local)
+                if (event.done && !terminalReported) {
+                    terminalReported = true
+                    onDone(event.source ?: Source.Local)
+                }
             }
         }
 
+        fun reportError(error: LanError) {
+            if (!terminalReported) {
+                terminalReported = true
+                onError(error)
+            }
+        }
+
+        val call = sseCallFactory().newCall(
+            request("POST", "/v1/chat/completions", jsonBody(body)),
+        )
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                onError(LanRequestBuilder.errorFor(e))
+                reportError(LanRequestBuilder.errorFor(e))
             }
 
             override fun onResponse(call: Call, response: Response) {
                 response.use {
                     if (!it.isSuccessful) {
-                        onError(LanRequestBuilder.errorFor(it.code))
+                        reportError(LanRequestBuilder.errorFor(it.code))
                         return@use
                     }
                     try {
@@ -233,16 +244,28 @@ class LanClient(
                             }
                         }
                         dispatch(parser.finish())
+                        // EOF without a terminal frame must still end the turn.
+                        if (!terminalReported) reportError(LanError.MalformedResponse)
                     } catch (error: LanException) {
-                        onError(error.error)
+                        reportError(error.error)
                     } catch (error: IOException) {
-                        onError(LanRequestBuilder.errorFor(error))
+                        reportError(LanRequestBuilder.errorFor(error))
                     }
                 }
             }
         })
         return call
     }
+
+    /**
+     * SSE turns are long-lived. The injected production client has finite REST
+     * deadlines, so streaming reuses its transport with those deadlines lifted;
+     * injected test call factories pass through unchanged.
+     */
+    private fun sseCallFactory(): Call.Factory = (callFactory as? OkHttpClient)?.newBuilder()
+        ?.readTimeout(0L, TimeUnit.MILLISECONDS)
+        ?.callTimeout(0L, TimeUnit.MILLISECONDS)
+        ?.build() ?: callFactory
 
     private fun request(method: String, path: String, body: RequestBody? = null): Request {
         val builder = Request.Builder()
@@ -301,14 +324,16 @@ class LanClient(
 
     companion object {
         const val CONNECT_TIMEOUT_MS = 5_000L
-        const val READ_TIMEOUT_MS = 0L
-        const val CALL_TIMEOUT_MS = 0L
 
-        /** Read timeout zero is deliberate: SSE turns are long-lived. */
+        /** Ordinary REST requests (catalog, settings, upload, provisioning). */
+        const val REST_READ_TIMEOUT_MS = 15_000L
+        const val REST_CALL_TIMEOUT_MS = 30_000L
+
+        /** Only SSE turns lift these deadlines; see [sseCallFactory]. */
         fun defaultCallFactory(): Call.Factory = OkHttpClient.Builder()
             .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .readTimeout(READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .callTimeout(CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .readTimeout(REST_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .callTimeout(REST_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .build()
     }
 }

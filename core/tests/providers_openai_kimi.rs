@@ -7,8 +7,10 @@
 mod common;
 
 use ai_upcycler_core::api::backend::{
-    ChatMessage, FunctionDef, GenerationChunk, GenerationRequest, Stop, ToolDef,
+    ChatMessage, ContentPart, FunctionDef, GenerationChunk, GenerationRequest, MessageContent,
+    Stop, ToolDef,
 };
+use ai_upcycler_core::media::MediaStore;
 use ai_upcycler_core::providers::{descriptor_for, CloudRoute, ProviderId, ProviderRegistry};
 use ai_upcycler_core::secrets::{SecretScope, SecretStore};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -17,6 +19,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -31,6 +34,10 @@ const OPENAI_SSE: &str = concat!(
     "data: {\"choices\":[{\"delta\":{\"content\":\"from OpenAI\"},\"finish_reason\":null}]}\n\n",
     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
     "data: [DONE]\n\n",
+);
+
+const OPENAI_UNTERMINATED_SSE: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
 );
 
 const KIMI_SSE: &str = concat!(
@@ -83,6 +90,23 @@ fn registry(provider: ProviderId, key: &str, base_url: String) -> ProviderRegist
                 .build()
                 .expect("no-proxy test client"),
         )
+}
+
+/// Installs a media store so the adapter under test is the media-aware path.
+/// The D:-only root is synthetic; no file is read by the budget checks.
+fn registry_with_media(provider: ProviderId, key: &str, base_url: String) -> ProviderRegistry {
+    registry(provider, key, base_url).with_media_store(MediaStore::new(
+        PathBuf::from(r"D:\ai-upcycler-temp").join("openai-attachment-budget"),
+    ))
+}
+
+fn image_part(byte_count: u64) -> ContentPart {
+    ContentPart::Image {
+        media_hash: "ab".repeat(32),
+        mime_type: "image/png".into(),
+        file_name: "synthetic.png".into(),
+        byte_count,
+    }
 }
 
 /// The request deliberately carries `tools` so the tests can prove that a
@@ -273,5 +297,157 @@ async fn kimi_uses_the_same_openai_compatible_shape() {
     assert_eq!(
         descriptor_for(ProviderId::Kimi).default_base_url,
         "https://api.moonshot.ai/v1"
+    );
+}
+
+#[tokio::test]
+async fn openai_media_adapter_preserves_optional_message_metadata() {
+    let captured = Arc::new(Mutex::new(None));
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(captured.clone(), OPENAI_SSE)).await;
+    let registry = registry_with_media(ProviderId::OpenAI, OPENAI_KEY, format!("{base_url}/v1"));
+    let route = CloudRoute {
+        provider: ProviderId::OpenAI,
+        model: "gpt-4o".to_string(),
+    };
+    let mut request = generation_request("gpt-4o");
+    request.messages[1].name = Some("analyst".into());
+
+    let _ = registry.stream(&route, request).collect::<Vec<_>>().await;
+    handle.abort();
+
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
+    assert_eq!(seen.body["messages"][1]["name"], json!("analyst"));
+    assert_eq!(seen.body["messages"][1]["content"], json!("Say hello."));
+}
+
+#[tokio::test]
+async fn openai_rejects_attachment_budget_violations_before_any_request() {
+    let mut oversized_file = generation_request("gpt-4o");
+    oversized_file.messages[1].content =
+        MessageContent::Parts(vec![image_part(10 * 1024 * 1024 + 1)]);
+
+    let mut too_many_images = generation_request("gpt-4o");
+    too_many_images.messages[1].content =
+        MessageContent::Parts((0..5).map(|_| image_part(1)).collect());
+
+    let mut too_much_turn_data = generation_request("gpt-4o");
+    too_much_turn_data.messages[1].content =
+        MessageContent::Parts((0..4).map(|_| image_part(10 * 1024 * 1024)).collect());
+    too_much_turn_data.messages.push(ChatMessage {
+        role: "user".into(),
+        content: MessageContent::Parts(vec![image_part(1)]),
+        ..Default::default()
+    });
+
+    let registry = registry_with_media(
+        ProviderId::OpenAI,
+        OPENAI_KEY,
+        "http://127.0.0.1:1/v1".to_string(),
+    );
+    let route = CloudRoute {
+        provider: ProviderId::OpenAI,
+        model: "gpt-4o".to_string(),
+    };
+    for (tag, request) in [
+        ("oversized file", oversized_file),
+        ("too many images", too_many_images),
+        ("too much turn data", too_much_turn_data),
+    ] {
+        let outcomes: Vec<Result<GenerationChunk, String>> =
+            registry.stream(&route, request).collect::<Vec<_>>().await;
+        assert_eq!(outcomes.len(), 1, "{tag}: expected only an error");
+        assert_eq!(
+            outcomes[0].as_ref().expect_err("budget must fail"),
+            "invalid_image_attachment",
+            "{tag}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openai_stream_without_completion_is_an_error() {
+    let captured = Arc::new(Mutex::new(None));
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(captured, OPENAI_UNTERMINATED_SSE)).await;
+    let registry = registry(ProviderId::OpenAI, OPENAI_KEY, format!("{base_url}/v1"));
+    let route = CloudRoute {
+        provider: ProviderId::OpenAI,
+        model: "gpt-4o".to_string(),
+    };
+
+    let outcomes: Vec<Result<GenerationChunk, String>> = registry
+        .stream(&route, generation_request("gpt-4o"))
+        .collect::<Vec<_>>()
+        .await;
+    handle.abort();
+
+    assert_eq!(outcomes.len(), 2, "content chunk plus an EOF error");
+    assert_eq!(outcomes[0].as_ref().expect("content").content, "Hello ");
+    assert_eq!(
+        outcomes[1].as_ref().expect_err("EOF must fail"),
+        "openai stream ended before completion"
+    );
+}
+
+#[tokio::test]
+async fn kimi_stream_without_completion_is_an_error() {
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(Arc::new(Mutex::new(None)), OPENAI_UNTERMINATED_SSE))
+            .await;
+    let registry = registry(ProviderId::Kimi, KIMI_KEY, format!("{base_url}/v1"));
+    let route = CloudRoute {
+        provider: ProviderId::Kimi,
+        model: "moonshot-v1-8k".to_string(),
+    };
+
+    let errors: Vec<String> = registry
+        .stream(&route, generation_request("kimi:moonshot-v1-8k"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    handle.abort();
+
+    assert_eq!(
+        errors,
+        vec!["kimi stream ended before completion".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn openai_oversized_sse_line_is_rejected_without_echoing_content() {
+    let body = format!("data: {}\n\n", "x".repeat(1024 * 1024 + 1));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let body = body.clone();
+            async move { ([(CONTENT_TYPE, "text/event-stream")], body) }
+        }),
+    );
+    let (base_url, handle) = common::spawn_mock_provider(app).await;
+    let registry = registry(ProviderId::OpenAI, OPENAI_KEY, format!("{base_url}/v1"));
+    let route = CloudRoute {
+        provider: ProviderId::OpenAI,
+        model: "gpt-4o".to_string(),
+    };
+
+    let errors: Vec<String> = registry
+        .stream(&route, generation_request("gpt-4o"))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    handle.abort();
+
+    assert_eq!(
+        errors,
+        vec!["openai returned an oversized response line".to_string()]
     );
 }

@@ -8,7 +8,7 @@
 //! clients holding a cert signed by this CA.
 
 use crate::rpc::engine::{WorkerTlsConfig, WorkerTransport, WorkerTransportSource};
-use crate::trust::TrustStore;
+use crate::trust::{TrustError, TrustStore};
 use base64::Engine as _;
 use rand::RngCore as _;
 use rcgen::{
@@ -493,18 +493,27 @@ impl EnrollmentRegistry {
 
     /// Records the hash of one worker's LAN token, replacing any previous hash
     /// for that id. Re-pairing therefore invalidates the old token.
-    pub fn set_lan_token(&self, node_id: &str, token: &str) {
-        let snapshot = {
-            let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
-            tokens.insert(node_id.to_string(), hash_lan_token(token));
-            self.store.as_ref().map(|_| tokens.clone())
-        };
-        let (Some(store), Some(tokens)) = (self.store.as_ref(), snapshot) else {
-            return;
-        };
-        if let Err(error) = store.save_lan_tokens(&hex_lan_tokens(&tokens)) {
-            tracing::warn!("could not persist the LAN token hash ({error})");
+    ///
+    /// The write-through happens under the same lock as the in-memory change:
+    /// a token that could not be persisted must not stay live, or a restart
+    /// would revoke a credential the caller was told had been issued.
+    pub fn set_lan_token(&self, node_id: &str, token: &str) -> Result<(), TrustError> {
+        let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
+        let previous = tokens.insert(node_id.to_string(), hash_lan_token(token));
+        if let Some(store) = self.store.as_ref() {
+            if let Err(error) = store.save_lan_tokens(&hex_lan_tokens(&tokens)) {
+                match previous {
+                    Some(hash) => {
+                        tokens.insert(node_id.to_string(), hash);
+                    }
+                    None => {
+                        tokens.remove(node_id);
+                    }
+                }
+                return Err(error);
+            }
         }
+        Ok(())
     }
 
     /// The stored hash for an id, if that id has a LAN token.
@@ -533,20 +542,36 @@ impl EnrollmentRegistry {
         bool::from(matched)
     }
 
-    /// Forgets one LAN token hash and persists the removal.
-    pub fn revoke_lan_token(&self, node_id: &str) -> bool {
-        let snapshot = {
-            let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
-            let removed = tokens.remove(node_id).is_some();
-            (removed, self.store.as_ref().map(|_| tokens.clone()))
+    /// Forgets the token hash for one id (and every alias sharing it), then
+    /// persists the removal.
+    ///
+    /// A device is enrolled under its mDNS name and its `adb:<serial>` alias
+    /// with the *same* token. Verification checks all hashes, so removing only
+    /// the named id would leave the credential live under the other alias.
+    /// A failed write-through is reported and rolled back: memory must keep
+    /// matching what a restart will load.
+    pub fn revoke_lan_token(&self, node_id: &str) -> Result<bool, TrustError> {
+        let mut tokens = self.lan_tokens.lock().expect("LAN token lock");
+        let Some(target) = tokens.get(node_id).copied() else {
+            return Ok(false);
         };
-        let (Some(store), Some(tokens)) = (self.store.as_ref(), snapshot.1) else {
-            return snapshot.0;
-        };
-        if let Err(error) = store.save_lan_tokens(&hex_lan_tokens(&tokens)) {
-            tracing::warn!("could not persist the LAN token revocation ({error})");
+        let aliases: Vec<(String, [u8; 32])> = tokens
+            .iter()
+            .filter(|(_, hash)| **hash == target)
+            .map(|(id, hash)| (id.clone(), *hash))
+            .collect();
+        for (id, _) in &aliases {
+            tokens.remove(id);
         }
-        snapshot.0
+        if let Some(store) = self.store.as_ref() {
+            if let Err(error) = store.save_lan_tokens(&hex_lan_tokens(&tokens)) {
+                for (id, hash) in aliases {
+                    tokens.insert(id, hash);
+                }
+                return Err(error);
+            }
+        }
+        Ok(true)
     }
 
     /// Loads the persisted hashes after the CA has been resolved. Hashes from
@@ -959,12 +984,14 @@ mod tests {
 
         assert_eq!(hash.len(), 32);
         assert!(!registry.verify_lan_token(&token));
-        registry.set_lan_token("phone-a", &token);
+        registry
+            .set_lan_token("phone-a", &token)
+            .expect("set token");
         assert_eq!(registry.get_lan_token("phone-a"), Some(hash));
         assert!(registry.verify_lan_token(&token));
-        assert!(registry.revoke_lan_token("phone-a"));
+        assert!(registry.revoke_lan_token("phone-a").expect("revoke"));
         assert!(!registry.verify_lan_token(&token));
-        assert!(!registry.revoke_lan_token("phone-a"));
+        assert!(!registry.revoke_lan_token("phone-a").expect("revoke"));
     }
 
     #[test]
@@ -983,6 +1010,28 @@ mod tests {
             !restarted.enrollments.is_enrolled("phone-a"),
             "a revocation that only lived in memory would let a revoked phone back in"
         );
+    }
+
+    #[test]
+    fn revoking_one_alias_revokes_every_alias_sharing_the_token() {
+        let registry = EnrollmentRegistry::new();
+        let token = generate_lan_token();
+        registry
+            .set_lan_token("phone.local.", &token)
+            .expect("set mDNS token");
+        registry
+            .set_lan_token("adb:16284c49", &token)
+            .expect("set USB alias token");
+        assert!(registry.verify_lan_token(&token));
+
+        assert!(registry
+            .revoke_lan_token("adb:16284c49")
+            .expect("revoke USB alias"));
+        assert!(
+            !registry.verify_lan_token(&token),
+            "the same hash under another alias would keep the token live"
+        );
+        assert_eq!(registry.get_lan_token("phone.local."), None);
     }
 
     fn temp_trust_dir() -> PathBuf {

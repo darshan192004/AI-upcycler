@@ -71,6 +71,13 @@ class ChatActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Pairing happens on the control screen; when that screen returns, the
+        // freshly written credentials must reach chat before the next turn.
+        viewModel.refreshPairing()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.hasExtra(AutoEnrollExtras.AUTO_ENROLL) ||

@@ -252,10 +252,14 @@ async fn executor_propagates_sink_failures() {
 }
 
 fn router_backend() -> RouterBackend {
+    router_backend_for_model("llama-8b")
+}
+
+fn router_backend_for_model(model: &str) -> RouterBackend {
     RouterBackend::new(
         Arc::new(StubBackend::new()),
         Arc::new(ProviderRegistry::new(Arc::new(UnconfiguredSecretStore))),
-        "llama-8b".into(),
+        model.into(),
         "wf-test".into(),
     )
 }
@@ -279,7 +283,7 @@ async fn router_backend_runs_an_explicit_local_step_through_the_backend() {
 
 #[tokio::test]
 async fn router_backend_refuses_an_unconfigured_cloud_step_without_network() {
-    let backend = router_backend();
+    let backend = router_backend_for_model("gpt-4o");
     let step = WorkflowStep {
         id: "cloud".into(),
         prompt: "Say hello".into(),
@@ -289,8 +293,23 @@ async fn router_backend_refuses_an_unconfigured_cloud_step_without_network() {
 
     let error = backend.run(&step).await.unwrap_err();
 
-    assert!(error.contains("openai"), "{error}");
-    assert!(error.contains("not configured"), "{error}");
+    assert_eq!(error, "openai is not configured");
+}
+
+#[tokio::test]
+async fn router_backend_rejects_a_model_with_a_conflicting_provider_prefix() {
+    let backend = router_backend_for_model("anthropic:claude-3-5-sonnet-latest");
+    let step = WorkflowStep {
+        id: "cloud".into(),
+        prompt: "Say hello".into(),
+        depends_on: vec![],
+        provider: Some("openai".into()),
+    };
+
+    let error = backend.run(&step).await.unwrap_err();
+
+    assert!(error.contains("belongs to provider 'anthropic'"), "{error}");
+    assert!(error.contains("not 'openai'"), "{error}");
 }
 
 #[tokio::test]

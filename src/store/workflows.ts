@@ -16,6 +16,9 @@ function deriveRunStatus(steps: WorkflowStepRow[]): WorkflowRunRow['status'] {
   return 'running';
 }
 
+/** Only the newest selection may write `selected`. */
+let latestRequestedRunId: string | null = null;
+
 interface WorkflowState {
   runs: WorkflowRunRow[];
   selected: WorkflowRunDetail | null;
@@ -41,10 +44,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   selectRun: async (runId) => {
+    latestRequestedRunId = runId;
     try {
       const selected = await getWorkflow(runId);
+      if (latestRequestedRunId !== runId) return;
       set({ selected, error: null });
     } catch (error) {
+      if (latestRequestedRunId !== runId) return;
       set({ error: error instanceof Error ? error.message : String(error) });
     }
   },
@@ -71,27 +77,56 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       return;
     }
     const { run_id: runId, step_id: stepId } = event.data;
-    const selected = get().selected;
-    if (!selected || selected.run.run_id !== runId) return;
-
     const status: WorkflowStepStatus =
       event.event === 'workflow_step_started' ? 'running' : event.data.status;
-    const steps = selected.steps.map((step): WorkflowStepRow => {
-      if (step.step_id !== stepId) return step;
-      if (event.event === 'workflow_step_started') return { ...step, status };
-      return {
-        ...step,
-        status,
-        output: event.data.output,
-        source: event.data.source,
-        error: event.data.error,
-      };
-    });
-    set({
-      selected: {
-        run: { ...selected.run, status: deriveRunStatus(steps) },
+    const runs = get().runs;
+    const selected = get().selected;
+    const hasHistoryRow = runs.some((run) => run.run_id === runId);
+    if (!hasHistoryRow && selected?.run.run_id !== runId) return;
+
+    let nextSelected = selected;
+    let selectedStatus: WorkflowRunRow['status'] | null = null;
+    if (selected?.run.run_id === runId) {
+      const steps = selected.steps.map((step): WorkflowStepRow => {
+        if (step.step_id !== stepId) return step;
+        if (event.event === 'workflow_step_started') return { ...step, status };
+        return {
+          ...step,
+          status,
+          output: event.data.output,
+          source: event.data.source,
+          error: event.data.error,
+        };
+      });
+      selectedStatus = deriveRunStatus(steps);
+      nextSelected = {
+        run: { ...selected.run, status: selectedStatus },
         steps,
-      },
+      };
+    }
+
+    const historyStatus: WorkflowRunRow['status'] | null =
+      selectedStatus ??
+      (event.event === 'workflow_step_started' || status === 'running'
+        ? 'running'
+        : status === 'failed' || status === 'blocked'
+          ? 'failed'
+          : null);
+    set({
+      ...(nextSelected ? { selected: nextSelected } : {}),
+      ...(hasHistoryRow && historyStatus
+        ? {
+            runs: runs.map((run) =>
+              run.run_id === runId ? { ...run, status: historyStatus } : run,
+            ),
+          }
+        : {}),
     });
+
+    // A completed step may finish the whole run; refresh the authoritative
+    // history even when the event belongs to a run that is not selected.
+    if (hasHistoryRow && event.event === 'workflow_step_completed') {
+      void get().refreshRuns();
+    }
   },
 }));

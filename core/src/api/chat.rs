@@ -19,8 +19,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::backend::{
-    ChatMessage, ContentPart, FunctionCall, GenerationChunk, GenerationRequest, MessageContent,
-    Stop, ToolCall, ToolCallDelta, ToolDef,
+    ChatMessage, FunctionCall, GenerationChunk, GenerationRequest, MessageContent, Stop, ToolCall,
+    ToolCallDelta, ToolDef,
 };
 use crate::api::{ApiError, ApiResult, AppState};
 use crate::discovery::mdns::NodeRegistry;
@@ -77,21 +77,6 @@ fn default_temperature() -> f32 {
 
 fn default_max_tokens() -> u32 {
     1024
-}
-
-/// Text used for token counting, titles and metrics. Image parts carry no
-/// inline bytes, so they contribute no text here.
-fn content_text(c: &MessageContent) -> &str {
-    match c {
-        MessageContent::Text(t) => t,
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .find_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .unwrap_or(""),
-    }
 }
 
 /// A single typed refusal chunk. The real chat handler refuses before session
@@ -345,7 +330,7 @@ pub async fn chat_completions(
             session_id: session_id.clone(),
             role: user.role.clone(),
             content: user.content.clone(),
-            token_count: approx_tokens(content_text(&user.content)),
+            token_count: approx_tokens(&user.content.content_text()),
             generation_time_sec: 0.0,
         })?;
     }
@@ -478,7 +463,7 @@ async fn buffered_response(
         generation
             .messages
             .iter()
-            .map(|m| approx_tokens(content_text(&m.content)))
+            .map(|m| approx_tokens(&m.content.content_text()))
             .sum::<i64>() as u64
     });
 
@@ -601,7 +586,7 @@ fn resolve_session(state: &AppState, request: &ChatCompletionRequest) -> ApiResu
         .messages
         .iter()
         .find(|m| m.role == "user")
-        .map(|m| truncate(content_text(&m.content), 48))
+        .map(|m| truncate(&m.content.content_text(), 48))
         .unwrap_or_else(|| "New chat".to_string());
 
     match &request.session_id {
@@ -945,6 +930,27 @@ mod tests {
         let session = state.store.get_session(&id).unwrap().unwrap();
         assert_eq!(session.title, "hello there");
         assert_eq!(session.model_id, "llama-8b");
+    }
+
+    #[test]
+    fn session_title_uses_every_text_part() {
+        use crate::api::backend::ContentPart;
+
+        let state = seeded_state();
+        let mut req = request(false);
+        req.session_id = Some("s-parts".into());
+        req.messages[0].content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Summarize ".into(),
+            },
+            ContentPart::Text {
+                text: "this report".into(),
+            },
+        ]);
+
+        let id = resolve_session(&state, &req).unwrap();
+        let session = state.store.get_session(&id).unwrap().unwrap();
+        assert_eq!(session.title, "Summarize this report");
     }
 
     #[tokio::test]

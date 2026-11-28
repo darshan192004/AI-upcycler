@@ -44,6 +44,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.aiupcycler.worker.images.ImageApi
@@ -60,6 +61,14 @@ private data class GalleryState(
     val images: List<ImageMetadata> = emptyList(),
     val loading: Boolean = true,
     val error: String? = null,
+)
+
+/** Per-image state, kept separate from gallery metadata so one failed byte
+ * request does not leave its card on the loading placeholder forever. */
+private data class GalleryImageState(
+    val loading: Boolean = true,
+    val error: String? = null,
+    val bitmap: ImageBitmap? = null,
 )
 
 /**
@@ -209,18 +218,35 @@ private fun GalleryLoadingPlaceholder(tag: String = "image-gallery-loading") {
 
 @Composable
 private fun GalleryImage(api: ImageApi, item: ImageMetadata) {
-    var bitmap by remember(item.imageId) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(api, item.imageId) {
-        bitmap = withContext(Dispatchers.IO) {
+    var state by remember(item.imageId) { mutableStateOf(GalleryImageState()) }
+    var retryKey by remember(item.imageId) { mutableIntStateOf(0) }
+
+    LaunchedEffect(api, item.imageId, retryKey) {
+        state = GalleryImageState(loading = true)
+        val result = withContext(Dispatchers.IO) {
             runCatching {
                 val bytes = api.imageBytes(item.imageId)
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-            }.getOrNull()
+            }
         }
+        state = result.fold(
+            onSuccess = { bitmap ->
+                if (bitmap != null) {
+                    GalleryImageState(loading = false, bitmap = bitmap)
+                } else {
+                    GalleryImageState(loading = false, error = "Image could not be decoded")
+                }
+            },
+            onFailure = { failure ->
+                if (failure is CancellationException) throw failure
+                GalleryImageState(loading = false, error = failure.message ?: "unknown error")
+            },
+        )
     }
-    val image = bitmap
-    if (image != null) {
-        Image(
+
+    val image = state.bitmap
+    when {
+        image != null -> Image(
             bitmap = image,
             contentDescription = item.prompt,
             modifier = Modifier
@@ -228,7 +254,36 @@ private fun GalleryImage(api: ImageApi, item: ImageMetadata) {
                 .height(160.dp),
             contentScale = ContentScale.Crop,
         )
-    } else {
-        GalleryLoadingPlaceholder(tag = "image-gallery-item-loading-${item.imageId}")
+
+        state.error != null -> Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(160.dp)
+                .background(GalleryCard, RoundedCornerShape(8.dp))
+                .padding(8.dp)
+                .testTag("image-gallery-item-error-${item.imageId}"),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = "Could not load image: ${state.error}",
+                style = MaterialTheme.typography.bodySmall,
+                color = GalleryError,
+            )
+            Button(
+                onClick = { retryKey += 1 },
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .semantics { contentDescription = "Retry image ${item.imageId}" }
+                    .testTag("image-gallery-item-retry-${item.imageId}"),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GalleryPressed,
+                    contentColor = GalleryText,
+                ),
+            ) {
+                Text(text = "Retry image")
+            }
+        }
+
+        else -> GalleryLoadingPlaceholder(tag = "image-gallery-item-loading-${item.imageId}")
     }
 }

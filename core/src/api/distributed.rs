@@ -350,11 +350,18 @@ impl DistributedBackend {
         if messages.iter().any(|m| m.content.has_images()) {
             return Err("image_attachments_require_vision_provider".into());
         }
+        // `content_text` concatenates every text part into an owned string, so
+        // render from that buffer instead of borrowing only the first part.
+        let rendered = messages
+            .iter()
+            .map(|m| m.content.content_text())
+            .collect::<Vec<_>>();
         let template: Vec<TemplateMessage> = messages
             .iter()
-            .map(|m| TemplateMessage {
+            .zip(rendered.iter())
+            .map(|(m, content)| TemplateMessage {
                 role: &m.role,
-                content: m.content.as_str(),
+                content,
             })
             .collect();
         let prompt = self
@@ -1397,6 +1404,37 @@ mod tests {
             chunks[0].prompt_tokens,
             Some(expected_prefill.len() as u32),
             "the chunk must carry the exact prefill length"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn prompt_ids_render_every_text_part() {
+        use crate::api::backend::ContentPart;
+
+        let driver = FakeDriver::new(vec![]);
+        let (tokenizer, dir) = tiny_tokenizer();
+        let backend = DistributedBackend::new("tiny", tokenizer, driver, "local");
+        let mut parts = request("s1", 1);
+        parts.messages[0].content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Summarize ".into(),
+            },
+            ContentPart::Text {
+                text: "this report".into(),
+            },
+        ]);
+        let mut plain = request("s1", 1);
+        plain.messages[0].content = MessageContent::Text("Summarize this report".into());
+
+        assert_eq!(
+            backend
+                .prompt_ids(&parts.messages)
+                .expect("parts prompt ids"),
+            backend
+                .prompt_ids(&plain.messages)
+                .expect("plain prompt ids"),
+            "every text part must reach the ChatML renderer"
         );
         drop(dir);
     }

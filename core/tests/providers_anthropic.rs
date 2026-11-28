@@ -204,6 +204,35 @@ async fn anthropic_sends_headers_and_contract_payload_then_reassembles_the_strea
         .all(|chunk| chunk.source.as_deref() == Some("anthropic")));
 }
 
+const ANTHROPIC_ERROR_SSE: &str = concat!(
+    "event: error\n",
+    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+    "\"message\":\"secret-body-sk-test-anthropic\"}}\n\n",
+);
+
+#[tokio::test]
+async fn anthropic_stream_error_event_stops_without_leaking_provider_details() {
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(Arc::new(Mutex::new(None)), ANTHROPIC_ERROR_SSE)).await;
+    let registry = registry(base_url);
+    let route = CloudRoute {
+        provider: ProviderId::Anthropic,
+        model: "claude-3-5-sonnet-latest".to_string(),
+    };
+
+    let outcomes: Vec<Result<GenerationChunk, String>> = registry
+        .stream(&route, generation_request())
+        .collect::<Vec<_>>()
+        .await;
+    handle.abort();
+
+    assert_eq!(outcomes.len(), 1, "stream must stop at the error event");
+    let message = outcomes[0].as_ref().expect_err("error event must fail");
+    assert_eq!(message, "anthropic stream reported an error");
+    assert!(!message.contains(ANTHROPIC_KEY), "key leaked: {message}");
+    assert!(!message.contains("secret-body"), "body leaked: {message}");
+}
+
 #[tokio::test]
 async fn anthropic_non_200_error_names_provider_and_status_without_key_or_body() {
     let app = Router::new().route(

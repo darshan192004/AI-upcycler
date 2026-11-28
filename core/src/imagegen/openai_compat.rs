@@ -12,6 +12,7 @@ use crate::imagegen::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 pub struct B64JsonImageBackend {
     provider: ImageProviderId,
@@ -26,7 +27,10 @@ struct WireRequest<'a> {
     prompt: &'a str,
     n: u8,
     size: &'a str,
-    response_format: &'static str,
+    /// Gemini's OpenAI-compatible images endpoint needs this hint; OpenAI's
+    /// native endpoint rejects it, so it is omitted for OpenAI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -45,7 +49,13 @@ impl B64JsonImageBackend {
         model: &'static str,
         endpoint: impl Into<String>,
     ) -> Self {
-        Self::with_client(provider, model, endpoint, reqwest::Client::new())
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("valid imagegen HTTP client configuration");
+        Self::with_client(provider, model, endpoint, client)
     }
 
     pub fn with_client(
@@ -84,7 +94,10 @@ impl ImageBackend for B64JsonImageBackend {
                     prompt: request.prompt.trim(),
                     n: 1,
                     size: request.size.as_str(),
-                    response_format: "b64_json",
+                    response_format: match self.provider {
+                        ImageProviderId::Gemini => Some("b64_json"),
+                        ImageProviderId::OpenAI | ImageProviderId::Local => None,
+                    },
                 })
                 .send()
                 .await

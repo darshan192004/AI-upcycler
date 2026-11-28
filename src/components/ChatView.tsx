@@ -83,6 +83,7 @@ export function ChatView() {
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [loadingSession, setLoadingSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<MediaRef[]>([]);
   const [multimodalEnabled, setMultimodalEnabled] = useState(false);
@@ -93,6 +94,8 @@ export function ChatView() {
   const [sessionTitleDraft, setSessionTitleDraft] = useState('');
 
   const localSeqRef = useRef(0);
+  const sessionIdRef = useRef(sessionId);
+  const sessionRequestRef = useRef(0);
   const firstTurnRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -107,6 +110,10 @@ export function ChatView() {
       // Offline: keep the last list we saw rather than inventing sessions.
     }
   }, []);
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
 
   useEffect(() => {
     if (models.length === 0) void refreshModels();
@@ -185,8 +192,9 @@ export function ChatView() {
     () =>
       (draft.trim().length > 0 || attachments.length > 0) &&
       !busy &&
+      !loadingSession &&
       selectedModel.length > 0,
-    [draft, attachments.length, busy, selectedModel],
+    [draft, attachments.length, busy, loadingSession, selectedModel],
   );
 
   function nextLocalId(): string {
@@ -205,18 +213,24 @@ export function ChatView() {
   }
 
   async function selectSession(id: string) {
+    const requestId = ++sessionRequestRef.current;
     setSessionId(id);
+    sessionIdRef.current = id;
     setError(null);
     setRenaming(false);
     firstTurnRef.current = false;
     abortRef.current?.abort();
+    abortRef.current = null;
     setBusy(false);
+    setMessages([]);
+    setLoadingSession(Boolean(id));
     if (!id) {
-      setMessages([]);
+      setLoadingSession(false);
       return;
     }
     try {
       const thread = await listSessionMessages(id);
+      if (requestId !== sessionRequestRef.current) return;
       setMessages(
         thread.messages.map((m) => ({
           id: `session-${m.message_id}`,
@@ -225,10 +239,29 @@ export function ChatView() {
         })),
       );
     } catch (err) {
+      if (requestId !== sessionRequestRef.current) return;
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
       setMessages([]);
+    } finally {
+      if (requestId === sessionRequestRef.current) setLoadingSession(false);
     }
+  }
+
+  function startNewSession() {
+    sessionRequestRef.current += 1;
+    const nextId = crypto.randomUUID();
+    sessionIdRef.current = nextId;
+    setSessionId(nextId);
+    setError(null);
+    setRenaming(false);
+    setSessionTitleDraft('');
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setBusy(false);
+    setLoadingSession(false);
+    setMessages([]);
+    firstTurnRef.current = false;
   }
 
   async function saveSessionTitle() {
@@ -258,12 +291,18 @@ export function ChatView() {
       setError(err instanceof Error ? err.message : String(err));
       return;
     }
-    abortRef.current?.abort();
     setSessions((prev) => prev.filter((s) => s.session_id !== removedId));
-    setSessionId(crypto.randomUUID());
+    if (sessionIdRef.current !== removedId) return;
+    sessionRequestRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    const nextId = crypto.randomUUID();
+    sessionIdRef.current = nextId;
+    setSessionId(nextId);
     setMessages([]);
     setRenaming(false);
     setSessionTitleDraft('');
+    setLoadingSession(false);
     firstTurnRef.current = false;
   }
 
@@ -280,7 +319,14 @@ export function ChatView() {
 
   async function send(text: string) {
     const prompt = text.trim();
-    if ((!prompt && attachments.length === 0) || busy || !selectedModel) return;
+    if (
+      (!prompt && attachments.length === 0) ||
+      busy ||
+      loadingSession ||
+      !selectedModel
+    ) {
+      return;
+    }
 
     // Zero attachments keeps the historical string payload; otherwise the
     // message becomes a part array matching the host's MessageContent union.
@@ -296,7 +342,7 @@ export function ChatView() {
     setDraft('');
     setAttachments([]);
     setAttachmentError(null);
-    const userMsg: DisplayMessage = { id: nextLocalId(), role: 'user', content: prompt };
+    const userMsg: DisplayMessage = { id: nextLocalId(), role: 'user', content: outgoing };
     const assistantId = nextLocalId();
     setMessages((prev) => [
       ...prev,
@@ -356,8 +402,10 @@ export function ChatView() {
             : m,
         ),
       );
-      setBusy(false);
-      abortRef.current = null;
+      if (abortRef.current === controller) {
+        setBusy(false);
+        abortRef.current = null;
+      }
     }
   }
 
@@ -453,6 +501,14 @@ export function ChatView() {
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
+                aria-label="New session"
+                onClick={startNewSession}
+                className="min-h-11 rounded-lg border border-[#475569] bg-[#1B2336] px-2 text-xs text-slate-200 transition-colors hover:border-emerald-400/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#22C55E]"
+              >
+                New
+              </button>
+              <button
+                type="button"
                 aria-label="Rename session"
                 disabled={!savedSession || renaming}
                 onClick={() => {
@@ -544,7 +600,7 @@ export function ChatView() {
         className="flex-1 space-y-4 overflow-y-auto px-5 py-5"
         role="log"
         aria-label="Chat messages"
-        aria-busy={busy}
+        aria-busy={busy || loadingSession}
       >
         {messages.length === 0 && (
           <div className="flex h-full flex-col items-center justify-center text-center">

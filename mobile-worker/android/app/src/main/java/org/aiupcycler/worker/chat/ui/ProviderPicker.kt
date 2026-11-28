@@ -35,6 +35,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.aiupcycler.worker.chat.ModelEntry
 import org.aiupcycler.worker.chat.ProviderChoice
+import org.aiupcycler.worker.chat.modelBelongsToProvider
 
 private data class ProviderOption(val choice: ProviderChoice, val label: String)
 
@@ -120,7 +121,7 @@ fun ProviderPicker(
                 expanded = modelExpanded,
                 onDismissRequest = { modelExpanded = false },
             ) {
-                models.forEach { model ->
+                models.filter { modelBelongsToProvider(it, selectedProvider) }.forEach { model ->
                     PressableRow(
                         label = model.id,
                         selected = model.id == selectedModel,

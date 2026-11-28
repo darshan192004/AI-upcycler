@@ -35,7 +35,7 @@ import org.aiupcycler.worker.pairing.CredentialStore
  */
 class ChatViewModel(
     private val application: Context,
-    private val credentialDirectory: File = application.noBackupFilesDir,
+    private val credentialDirectory: File = application.filesDir.resolve(PAIRING_DIR),
     private val secrets: SecretStore = KeystoreSecretStore(application),
     private val endpointStorage: LanEndpointStore = LanEndpointStore(SharedPreferencesLanEndpointStorage(
         application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
@@ -72,6 +72,15 @@ class ChatViewModel(
     private var fingerprint: String? = null
     private var hasCompletedTurn = false
 
+    /** Guards a session-list read against a newer selection (including A -> B -> A). */
+    private val selectionLock = Any()
+    private var selectionGeneration = 0L
+
+    /** A stream callback only changes turn state while it still owns the turn. */
+    private val turnLock = Any()
+    private var turnSequence = 0L
+    private var currentTurn: Long? = null
+
     /** A new session gets a fresh id, so each session is recommended at most once. */
     private val recommendedSessions = ConcurrentHashMap.newKeySet<String>()
 
@@ -103,6 +112,17 @@ class ChatViewModel(
         } else {
             startDiscovery()
         }
+    }
+
+    /**
+     * Re-reads credentials after pairing completes on the control screen. The
+     * Activity calls this on resume; once a node id and client exist there is
+     * nothing to redo. Directory and secret-store wiring stay unchanged.
+     */
+    fun refreshPairing() {
+        if (nodeIdValue.isNotBlank() && _lanClient.value != null) return
+        discovery?.stop()
+        initialize()
     }
 
     private fun startDiscovery() {
@@ -182,34 +202,57 @@ class ChatViewModel(
 
     fun newSession() {
         activeCall.getAndSet(null)?.cancel()
+        synchronized(turnLock) { currentTurn = null }
         streamActive.set(false)
         hasCompletedTurn = false
         _errorBanner.value = null
-        _uiState.update {
-            it.copy(
-                activeSessionId = UUID.randomUUID().toString(),
-                messages = emptyList(),
-                draft = "",
-                attachments = emptyList(),
-                busy = false,
-                source = null,
-                banner = null,
-            )
+        // Advance the selection generation under the same lock as the new id,
+        // so a listMessages read for a previous selection cannot fill it.
+        synchronized(selectionLock) {
+            selectionGeneration += 1
+            _uiState.update {
+                it.copy(
+                    activeSessionId = UUID.randomUUID().toString(),
+                    messages = emptyList(),
+                    draft = "",
+                    attachments = emptyList(),
+                    busy = false,
+                    source = null,
+                    banner = null,
+                )
+            }
         }
     }
 
     fun selectSession(sessionId: String) {
         if (sessionId.isBlank()) return
         activeCall.getAndSet(null)?.cancel()
+        synchronized(turnLock) { currentTurn = null }
         streamActive.set(false)
         hasCompletedTurn = false
-        _uiState.update { it.copy(activeSessionId = sessionId, messages = emptyList(), busy = false) }
+        // Selection and generation advance under one lock, so a read that was
+        // already in flight cannot apply to a newer selection.
+        val generation = synchronized(selectionLock) {
+            selectionGeneration += 1
+            _uiState.update { it.copy(activeSessionId = sessionId, messages = emptyList(), busy = false) }
+            selectionGeneration
+        }
 
         val client = _lanClient.value ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { client.listMessages(sessionId) }
-                .onSuccess { messages -> _uiState.update { it.copy(messages = messages) } }
-                .onFailure { reportThrowable(it) }
+                .onSuccess { messages ->
+                    synchronized(selectionLock) {
+                        if (generation == selectionGeneration) {
+                            _uiState.update { it.copy(messages = messages) }
+                        }
+                    }
+                }
+                .onFailure { error ->
+                    synchronized(selectionLock) {
+                        if (generation == selectionGeneration) reportThrowable(error)
+                    }
+                }
         }
     }
 
@@ -255,18 +298,31 @@ class ChatViewModel(
             )
         }
         _errorBanner.value = null
+        val turn = synchronized(turnLock) {
+            turnSequence += 1
+            currentTurn = turnSequence
+            turnSequence
+        }
         streamActive.set(true)
 
         val call = client.streamChat(
             request = request,
-            onDelta = { dispatch(ChatEvent.Delta(it)) },
-            onDone = { finishTurn(it) },
-            onError = { report(it, fromStream = true) },
+            onDelta = { text ->
+                synchronized(turnLock) {
+                    if (currentTurn == turn) dispatch(ChatEvent.Delta(text))
+                }
+            },
+            onDone = { source -> finishTurn(source, turn) },
+            onError = { error -> report(error, fromStream = true, turn = turn) },
         )
-        activeCall.set(call)
+        synchronized(turnLock) {
+            // A fast [DONE] can already have ended this turn before enqueue returns.
+            if (currentTurn == turn) activeCall.set(call)
+        }
     }
 
     fun stop() {
+        synchronized(turnLock) { currentTurn = null }
         if (!streamActive.getAndSet(false)) return
         activeCall.getAndSet(null)?.cancel()
         _uiState.update { it.copy(busy = false) }
@@ -341,21 +397,37 @@ class ChatViewModel(
         }
     }
 
-    private fun finishTurn(source: Source) {
-        activeCall.set(null)
-        streamActive.set(false)
-        dispatch(ChatEvent.StreamDone(source))
-        if (!hasCompletedTurn) {
-            hasCompletedTurn = true
-            refreshSessions()
+    private fun finishTurn(source: Source, turn: Long) {
+        synchronized(turnLock) {
+            if (currentTurn == turn) {
+                currentTurn = null
+                activeCall.set(null)
+                streamActive.set(false)
+                dispatch(ChatEvent.StreamDone(source))
+                if (!hasCompletedTurn) {
+                    hasCompletedTurn = true
+                    refreshSessions()
+                }
+            }
         }
     }
 
     // ---- named failures ---------------------------------------------------
 
-    private fun report(error: LanError, fromStream: Boolean = false) {
-        activeCall.set(null)
-        if (fromStream && !streamActive.getAndSet(false)) return
+    private fun report(error: LanError, fromStream: Boolean = false, turn: Long? = null) {
+        if (fromStream) {
+            val accepted = synchronized(turnLock) {
+                if (turn != null && currentTurn == turn) {
+                    currentTurn = null
+                    activeCall.set(null)
+                    streamActive.set(false)
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!accepted) return
+        }
 
         if (error is LanError.Unauthorized) {
             dispatch(ChatEvent.Unauthorized)
@@ -368,7 +440,9 @@ class ChatViewModel(
                 is LanError.Server -> Banner.MalformedResponse("LAN host returned HTTP ${error.code}")
             }
         }
-        _uiState.update { it.copy(busy = false) }
+        // A background failure (e.g. provisioning) still shows its banner but
+        // must not clear the state of a live stream.
+        if (fromStream) _uiState.update { it.copy(busy = false) }
     }
 
     private fun reportThrowable(throwable: Throwable) {
@@ -381,6 +455,7 @@ class ChatViewModel(
     }
 
     override fun onCleared() {
+        synchronized(turnLock) { currentTurn = null }
         streamActive.set(false)
         activeCall.getAndSet(null)?.cancel()
         discovery?.stop()
@@ -389,6 +464,7 @@ class ChatViewModel(
 
     companion object {
         private const val PREFS_NAME = "ai-upcycler-worker"
+        private const val PAIRING_DIR = "pairing"
 
         /** Optimistic rows need a non-null id for `Delta`, never a list index. */
         private fun optimisticId(): Long = UUID.randomUUID().mostSignificantBits or Long.MIN_VALUE

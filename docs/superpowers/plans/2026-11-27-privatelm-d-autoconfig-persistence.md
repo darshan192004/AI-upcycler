@@ -189,8 +189,8 @@ mod tests {
     fn ignores_non_compute_workers_and_clamps_to_the_floor() {
         let memory = FixedMemory(Some(HostMemoryUsage {
             total_bytes: 4 * 1024 * 1024 * 1024,
-            used_bytes: 1024 * 1024 * 1024,
-            available_bytes: 3 * 1024 * 1024 * 1024,
+            used_bytes: 4 * 1024 * 1024 * 1024 - 8 * 1024 * 1024,
+            available_bytes: 8 * 1024 * 1024,
         }));
         let workers = FixedWorkers(vec![worker("w1", 100 * 1024 * 1024 * 1024, false)]);
         let models = [ModelLayerInfo {

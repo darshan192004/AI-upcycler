@@ -10,6 +10,8 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fmt::{self, Write as _};
 use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 const MAX_BYTES: usize = 10 * 1024 * 1024;
 const ALLOWED_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
@@ -83,9 +85,50 @@ impl MediaStore {
                 .await
                 .map_err(|_| MediaError::Io)?;
         }
-        tokio::fs::write(&path, bytes)
-            .await
-            .map_err(|_| MediaError::Io)?;
+
+        // An existing object is immutable: verify it rather than truncating it.
+        match tokio::fs::read(&path).await {
+            Ok(existing) if existing == bytes => {}
+            Ok(_) => return Err(MediaError::BadHash),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(MediaError::Io),
+        }
+
+        // Write into a unique temp file in the same directory, then publish
+        // with a hard link that fails (instead of overwriting) if another
+        // writer won the race. The link is atomic on the local filesystem.
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "object".to_string());
+        let temp = path.with_file_name(format!("{name}.tmp-{}", Uuid::new_v4()));
+        let published = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .await
+                .map_err(|_| MediaError::Io)?;
+            file.write_all(bytes).await.map_err(|_| MediaError::Io)?;
+            file.flush().await.map_err(|_| MediaError::Io)?;
+            drop(file);
+
+            match std::fs::hard_link(&temp, &path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = tokio::fs::read(&path).await.map_err(|_| MediaError::Io)?;
+                    if existing == bytes {
+                        Ok(())
+                    } else {
+                        Err(MediaError::BadHash)
+                    }
+                }
+                Err(_) => Err(MediaError::Io),
+            }
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&temp).await;
+        published?;
 
         Ok(MediaRef {
             media_hash,
@@ -188,6 +231,40 @@ mod tests {
             store.put(&big, "image/png", "big.png").await,
             Err(MediaError::TooLarge)
         ));
+    }
+
+    fn platform_temp_root(tag: &str) -> PathBuf {
+        PathBuf::from(r"D:\ai-upcycler-temp").join(format!(
+            "ai-upcycler-media-{}-{}-{}",
+            tag,
+            std::process::id(),
+            Uuid::new_v4()
+        ))
+    }
+
+    #[tokio::test]
+    async fn duplicate_put_never_overwrites_an_existing_object() {
+        let store = MediaStore::new(platform_temp_root("no-overwrite"));
+        let bytes = b"\x89PNG\r\n\x1a\nfixture";
+        let first = store.put(bytes, "image/png", "a.png").await.unwrap();
+        let second = store.put(bytes, "image/png", "copy.png").await.unwrap();
+        assert_eq!(first.media_hash, second.media_hash);
+
+        let path = store.path_for(&first.media_hash).expect("path");
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("existing bytes"),
+            bytes.as_slice()
+        );
+
+        std::fs::write(&path, b"sentinel").expect("corrupt object");
+        assert!(matches!(
+            store.put(bytes, "image/png", "copy.png").await,
+            Err(MediaError::BadHash)
+        ));
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("preserved bytes"),
+            b"sentinel"
+        );
     }
 
     #[tokio::test]

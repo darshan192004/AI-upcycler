@@ -36,11 +36,12 @@ impl RouterBackend {
 
     fn route(&self, step: &WorkflowStep) -> Result<(RoutePolicy, Option<CloudRoute>), String> {
         let policy = RoutePolicy::parse(step.provider.as_deref())?;
-        // The explicit provider token has already been classified by
-        // `RoutePolicy`, so resolution stays model-driven. Passing the token
-        // again would reject a local model id as a catalog miss before an
-        // explicit cloud step can report that the provider has no route/key.
-        let cloud = self.providers.resolve(&self.model, None)?;
+        // Match chat routing: an explicit provider resolves a bare model id
+        // against that provider's catalog. `auto`/`local` are policies, so
+        // `resolve` keeps those model-driven; a conflicting prefix is rejected.
+        let cloud = self
+            .providers
+            .resolve(&self.model, step.provider.as_deref())?;
         Ok((policy, cloud))
     }
 }

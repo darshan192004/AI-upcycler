@@ -870,6 +870,7 @@ async fn the_dashboard_can_preflight_a_secret_put() {
                 .uri("/api/settings/secrets/openai")
                 .header("origin", "http://localhost:1420")
                 .header("access-control-request-method", "PUT")
+                .header("access-control-request-headers", "content-type")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -884,4 +885,20 @@ async fn the_dashboard_can_preflight_a_secret_put() {
         .unwrap()
         .to_string();
     assert!(allowed.contains("PUT"), "allowed methods: {allowed}");
+    let origin = response
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|value| value.to_str().ok())
+        .expect("CORS origin grant");
+    assert_eq!(origin, "http://localhost:1420");
+    let headers = response
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|value| value.to_str().ok())
+        .expect("CORS header grant")
+        .to_ascii_lowercase();
+    assert!(
+        headers.contains("content-type"),
+        "allowed headers: {headers}"
+    );
 }

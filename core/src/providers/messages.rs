@@ -11,13 +11,11 @@ use serde_json::Value;
 /// this shape. `data_url` is caller-supplied (`data:<mime>;base64,<payload>`);
 /// no image bytes ever pass through this mapper.
 pub fn to_openai_message(msg: &ChatMessage, data_url: &str) -> Value {
-    match &msg.content {
+    let content = match &msg.content {
         // Legacy text-only turns keep A's plain-string content shape.
-        MessageContent::Text(text) => {
-            serde_json::json!({"role": &msg.role, "content": text})
-        }
-        MessageContent::Parts(parts) => {
-            let content: Vec<Value> = parts
+        MessageContent::Text(text) => serde_json::json!(text),
+        MessageContent::Parts(parts) => Value::Array(
+            parts
                 .iter()
                 .map(|part| match part {
                     ContentPart::Text { text } => {
@@ -28,10 +26,20 @@ pub fn to_openai_message(msg: &ChatMessage, data_url: &str) -> Value {
                         "image_url": {"url": data_url},
                     }),
                 })
-                .collect();
-            serde_json::json!({"role": &msg.role, "content": content})
-        }
-    }
+                .collect(),
+        ),
+    };
+    with_openai_content(msg, content)
+}
+
+/// Replaces only `content` on a serialized chat message, preserving optional
+/// fields such as `name`, `tool_calls`, and `tool_call_id` that callers may
+/// need on the provider wire.
+pub(crate) fn with_openai_content(msg: &ChatMessage, content: Value) -> Value {
+    let mut mapped =
+        serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({"role": &msg.role}));
+    mapped["content"] = content;
+    mapped
 }
 
 /// Maps one chat message to Gemini `parts`. `base64_data` is caller-supplied
@@ -92,6 +100,21 @@ mod tests {
             }]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn openai_mapping_preserves_optional_message_metadata() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: MessageContent::Text("hello".into()),
+            name: Some("researcher".into()),
+            tool_call_id: Some("call-1".into()),
+            tool_calls: None,
+        };
+        let mapped = to_openai_message(&msg, "");
+        assert_eq!(mapped["content"], serde_json::json!("hello"));
+        assert_eq!(mapped["name"], serde_json::json!("researcher"));
+        assert_eq!(mapped["tool_call_id"], serde_json::json!("call-1"));
     }
 
     #[test]

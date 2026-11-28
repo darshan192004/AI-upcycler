@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { motion, useReducedMotion } from 'motion/react';
 import { listImages } from '../lib/api';
 import type { ImageMetadata } from '../lib/types';
@@ -10,6 +10,7 @@ export function ImagesView() {
   const [images, setImages] = useState<ImageMetadata[]>([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const generatedIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let active = true;
@@ -17,7 +18,14 @@ export function ImagesView() {
     void listImages(60, 0)
       .then((response) => {
         if (!active) return;
-        setImages(response.images);
+        setImages((current) => {
+          const generated = current.filter((image) =>
+            generatedIdsRef.current.has(image.image_id),
+          );
+          const fetched = new Map(response.images.map((image) => [image.image_id, image]));
+          for (const image of generated) fetched.delete(image.image_id);
+          return [...generated, ...fetched.values()];
+        });
         setError(null);
       })
       .catch((reason: unknown) => {
@@ -33,6 +41,7 @@ export function ImagesView() {
   }, []);
 
   const handleGenerated = (image: ImageMetadata) => {
+    generatedIdsRef.current.add(image.image_id);
     setImages((current) => [
       image,
       ...current.filter((existing) => existing.image_id !== image.image_id),

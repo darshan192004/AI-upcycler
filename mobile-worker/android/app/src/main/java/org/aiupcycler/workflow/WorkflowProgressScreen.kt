@@ -1,5 +1,6 @@
 package org.aiupcycler.workflow
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,7 +24,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 
 /**
  * B's Compose host owns navigation; E supplies this tab. It only reads runs:
@@ -35,13 +38,32 @@ fun WorkflowProgressScreen(api: WorkflowApi, modifier: Modifier = Modifier) {
     var detail by remember { mutableStateOf<WorkflowRunDetail?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var refreshKey by remember { mutableIntStateOf(0) }
+    var detailKey by remember { mutableIntStateOf(0) }
+    var selectedRunId by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(api, refreshKey) {
         try {
             val loaded = api.listRuns()
             runs = loaded
-            detail = loaded.firstOrNull()?.let { api.getRun(it.runId) }
+            // Refresh keeps a still-present selection; first run is only the default.
+            selectedRunId = loaded.firstOrNull { it.runId == selectedRunId }?.runId
+                ?: loaded.firstOrNull()?.runId
+            detailKey += 1
             error = null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            error = failure.message ?: "Unable to load workflow progress"
+        }
+    }
+
+    LaunchedEffect(api, selectedRunId, detailKey) {
+        val runId = selectedRunId ?: return@LaunchedEffect
+        try {
+            detail = api.getRun(runId)
+            error = null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (failure: Exception) {
             error = failure.message ?: "Unable to load workflow progress"
         }
@@ -65,10 +87,20 @@ fun WorkflowProgressScreen(api: WorkflowApi, modifier: Modifier = Modifier) {
             modifier = Modifier.fillMaxWidth(),
         ) {
             items(items = runs, key = { it.runId }) { run ->
-                Card(modifier = Modifier.fillMaxWidth()) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(role = Role.Button) {
+                            selectedRunId = run.runId
+                            detailKey += 1
+                        },
+                ) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text("${run.model} - ${displayStatus(run.status)}")
                         Text(run.runId, style = MaterialTheme.typography.bodySmall)
+                        if (run.runId == selectedRunId) {
+                            Text("Selected", style = MaterialTheme.typography.labelSmall)
+                        }
                     }
                 }
             }

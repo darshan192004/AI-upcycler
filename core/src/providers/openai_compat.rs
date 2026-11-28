@@ -74,13 +74,31 @@ fn payload(request: &GenerationRequest) -> Value {
     Value::Object(body)
 }
 
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct SseLineTooLong;
+
 /// Drains `chunk` into `buffer` and returns every complete SSE line. A line
 /// split across byte frames stays in the buffer until its `\n` arrives, so a
-/// JSON object is never parsed half-written.
-pub(crate) fn take_complete_lines(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+/// JSON object is never parsed half-written. Lines larger than
+/// [`MAX_SSE_LINE_BYTES`] are rejected so an unbounded provider response cannot
+/// grow the buffer without limit.
+pub(crate) fn take_complete_lines(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<Vec<String>, SseLineTooLong> {
     buffer.extend_from_slice(chunk);
     let mut lines = Vec::new();
-    while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+    loop {
+        let Some(position) = buffer.iter().position(|byte| *byte == b'\n') else {
+            if buffer.len() > MAX_SSE_LINE_BYTES {
+                return Err(SseLineTooLong);
+            }
+            break;
+        };
+        if position > MAX_SSE_LINE_BYTES {
+            return Err(SseLineTooLong);
+        }
         let mut raw: Vec<u8> = buffer.drain(..=position).collect();
         raw.pop();
         if raw.last() == Some(&b'\r') {
@@ -88,7 +106,7 @@ pub(crate) fn take_complete_lines(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<Str
         }
         lines.push(String::from_utf8_lossy(&raw).into_owned());
     }
-    lines
+    Ok(lines)
 }
 
 /// Streams one OpenAI-compatible chat turn.
@@ -135,6 +153,7 @@ pub(crate) fn openai_compat_stream(
 
         let mut bytes = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut completion_seen = false;
         while let Some(item) = bytes.next().await {
             let chunk = match item {
                 Ok(chunk) => chunk,
@@ -143,13 +162,21 @@ pub(crate) fn openai_compat_stream(
                     return;
                 }
             };
-            for line in take_complete_lines(&mut buffer, &chunk) {
+            let lines = match take_complete_lines(&mut buffer, &chunk) {
+                Ok(lines) => lines,
+                Err(_) => {
+                    yield Err(format!("{provider_name} returned an oversized response line"));
+                    return;
+                }
+            };
+            for line in lines {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
-                    continue;
+                    completion_seen = true;
+                    break;
                 }
                 let parsed: Value = match serde_json::from_str(data) {
                     Ok(parsed) => parsed,
@@ -167,6 +194,7 @@ pub(crate) fn openai_compat_stream(
                     .to_string();
                 let finish_reason = choice
                     .and_then(|item| item.get("finish_reason"))
+                    .filter(|reason| !reason.is_null())
                     .and_then(Value::as_str)
                     .map(str::to_string);
 
@@ -179,28 +207,37 @@ pub(crate) fn openai_compat_stream(
                     });
                 }
                 if let Some(finish_reason) = finish_reason {
+                    completion_seen = true;
                     yield Ok(GenerationChunk {
                         finish_reason: Some(finish_reason),
                         source: Some(provider_name.clone()),
                         ..Default::default()
                     });
+                    break;
                 }
             }
+            if completion_seen {
+                break;
+            }
+        }
+        if !completion_seen {
+            yield Err(format!("{provider_name} stream ended before completion"));
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::take_complete_lines;
+    use super::{take_complete_lines, MAX_SSE_LINE_BYTES};
 
     #[test]
     fn sse_lines_can_span_byte_frames_and_share_a_frame() {
         let mut buffer = Vec::new();
-        let first = take_complete_lines(&mut buffer, b"data: {\"a\":1}\n\nda");
+        let first = take_complete_lines(&mut buffer, b"data: {\"a\":1}\n\nda").unwrap();
         assert_eq!(first, vec!["data: {\"a\":1}".to_string(), String::new()]);
 
-        let second = take_complete_lines(&mut buffer, b"ta: {\"b\":2}\n\ndata: {\"c\":3}\n\n");
+        let second =
+            take_complete_lines(&mut buffer, b"ta: {\"b\":2}\n\ndata: {\"c\":3}\n\n").unwrap();
         assert_eq!(
             second,
             vec![
@@ -216,10 +253,24 @@ mod tests {
     #[test]
     fn crlf_and_partial_lines_are_handled() {
         let mut buffer = Vec::new();
-        assert!(take_complete_lines(&mut buffer, b"data: hel").is_empty());
+        assert!(take_complete_lines(&mut buffer, b"data: hel")
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            take_complete_lines(&mut buffer, b"lo\r\n"),
+            take_complete_lines(&mut buffer, b"lo\r\n").unwrap(),
             vec!["data: hello".to_string()]
         );
+    }
+
+    #[test]
+    fn oversized_sse_lines_are_rejected() {
+        let mut buffer = Vec::new();
+        let oversized = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        assert!(take_complete_lines(&mut buffer, &oversized).is_err());
+
+        let mut buffer = Vec::new();
+        let mut oversized = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        oversized.push(b'\n');
+        assert!(take_complete_lines(&mut buffer, &oversized).is_err());
     }
 }

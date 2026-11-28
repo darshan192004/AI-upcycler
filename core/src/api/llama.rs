@@ -223,6 +223,10 @@ fn build_host_body(request: &GenerationRequest) -> Value {
         .messages
         .iter()
         .map(|message| {
+            // Serialize the whole message so agent fields survive, then replace
+            // only `content` with the sanitized payload. Raw image bytes never
+            // enter the body; only their hashes are forwarded.
+            let mut value = serde_json::to_value(message).expect("chat message serializes");
             let content = match &message.content {
                 MessageContent::Text(text) => json!(text),
                 MessageContent::Parts(parts) => json!(parts
@@ -237,7 +241,8 @@ fn build_host_body(request: &GenerationRequest) -> Value {
                     })
                     .collect::<Vec<_>>()),
             };
-            json!({ "role": message.role, "content": content })
+            value["content"] = content;
+            value
         })
         .collect::<Vec<_>>();
 
@@ -718,6 +723,39 @@ mod tests {
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"type\":\"image\""));
         assert!(!s.contains("base64"));
+    }
+
+    #[test]
+    fn host_engine_body_preserves_agent_message_fields() {
+        let request: GenerationRequest = serde_json::from_value(json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": "file body",
+                    "tool_call_id": "call_1",
+                    "name": "read"
+                }
+            ],
+            "max_tokens": 64
+        }))
+        .unwrap();
+        let body = build_host_body(&request);
+        let messages = body["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["name"], "read");
+        assert_eq!(messages[1]["content"], "file body");
     }
 
     fn tool_request() -> GenerationRequest {

@@ -26,6 +26,11 @@ const GEMINI_SSE: &str = concat!(
     "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"!\"}]}}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":3}}\n\n",
 );
 
+const GEMINI_UNDERCOUNT_SSE: &str = concat!(
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello \"}]}}]}\n\n",
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Gemini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":5}}\n\n",
+);
+
 #[derive(Debug, Default, Clone)]
 struct Captured {
     api_key: String,
@@ -180,13 +185,105 @@ async fn gemini_sends_api_key_header_and_contents_then_reassembles_the_stream() 
     assert_eq!(text, "Hello from Gemini!");
     let final_chunk = chunks.last().expect("at least one chunk");
     assert_eq!(final_chunk.prompt_tokens, Some(11));
-    assert_eq!(final_chunk.tokens_emitted, 3);
+    assert_eq!(
+        final_chunk.tokens_emitted, 0,
+        "usage correction is zero when estimates already match"
+    );
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.tokens_emitted).sum::<u32>(),
+        3,
+        "text estimates plus the usage correction must equal the reported total"
+    );
     assert_eq!(final_chunk.finish_reason.as_deref(), Some("stop"));
     assert_eq!(final_chunk.source.as_deref(), Some("gemini"));
     assert!(chunks
         .iter()
         .filter(|chunk| !chunk.content.is_empty())
         .all(|chunk| chunk.source.as_deref() == Some("gemini")));
+}
+
+#[tokio::test]
+async fn gemini_usage_chunk_supplies_only_the_missing_token_count() {
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(Arc::new(Mutex::new(None)), GEMINI_UNDERCOUNT_SSE))
+            .await;
+    let registry = registry(base_url);
+    let route = CloudRoute {
+        provider: ProviderId::Gemini,
+        model: "gemini-2.5-flash".to_string(),
+    };
+
+    let chunks: Vec<GenerationChunk> = registry
+        .stream(&route, generation_request())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|chunk| chunk.expect("adapter stream must not fail"))
+        .collect();
+    handle.abort();
+
+    let final_chunk = chunks.last().expect("at least one chunk");
+    assert_eq!(final_chunk.tokens_emitted, 3, "usage count minus estimates");
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.tokens_emitted).sum::<u32>(),
+        5,
+        "total must match candidatesTokenCount"
+    );
+    assert_eq!(final_chunk.finish_reason.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn gemini_prefixes_the_first_user_turn_after_leading_assistant_turns() {
+    let captured = Arc::new(Mutex::new(None));
+    let (base_url, handle) =
+        common::spawn_mock_provider(sse_app(captured.clone(), GEMINI_SSE)).await;
+    let registry = registry(base_url);
+    let route = CloudRoute {
+        provider: ProviderId::Gemini,
+        model: "gemini-2.5-flash".to_string(),
+    };
+    let mut request = generation_request();
+    request.messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "Be brief.".into(),
+            ..Default::default()
+        },
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: "Earlier reply.".into(),
+            ..Default::default()
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: "Say hello.".into(),
+            ..Default::default()
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: "Now.".into(),
+            ..Default::default()
+        },
+    ];
+
+    let _ = registry.stream(&route, request).collect::<Vec<_>>().await;
+    handle.abort();
+
+    let seen = captured
+        .lock()
+        .expect("captured lock")
+        .clone()
+        .expect("request");
+    let contents = seen.body["contents"].as_array().expect("contents array");
+    assert_eq!(contents[0]["role"], json!("model"));
+    assert_eq!(contents[0]["parts"][0]["text"], json!("Earlier reply."));
+    assert_eq!(contents[1]["role"], json!("user"));
+    assert_eq!(
+        contents[1]["parts"][0]["text"],
+        json!("Be brief.\nSay hello."),
+        "system text must reach the first user turn even after an assistant turn"
+    );
+    assert_eq!(contents[2]["parts"][0]["text"], json!("Now."));
 }
 
 #[tokio::test]

@@ -11,17 +11,12 @@ use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use super::{ApiError, ApiResult, AppState};
+use super::{ApiError, ApiResult, AppState, LanApiConfig};
 use crate::security::{generate_lan_token, is_valid_certificate_address, PairingError};
 
 /// Subject alternative names used when a worker declares none: the ADB tunnel
 /// makes the master dial the phone's own loopback (`adb reverse`).
 const DEFAULT_ADDRESSES: [&str; 2] = ["127.0.0.1", "localhost"];
-
-/// LAN listener port advertised to the worker. Task 5 reads it from
-/// `LanApiConfig::port()` (default 8090); until that task lands the pairing
-/// response uses the same constant.
-const LAN_PORT: u16 = 8090;
 
 /// Upper bound on declared addresses, so one enrollment cannot mint a
 /// certificate with an unbounded SAN list.
@@ -109,7 +104,7 @@ pub struct EnrollResponse {
     /// Bearer credential for the master's LAN API. Returned only here, once;
     /// the host keeps only its SHA-256 hash.
     pub lan_token: String,
-    /// Port of the LAN listener (8090 until `LanApiConfig` lands in Task 5).
+    /// Effective port of the LAN listener, including an env override.
     pub lan_port: u16,
     /// The id this worker enrolled under, so it can report it to the master.
     pub node_id: String,
@@ -165,7 +160,14 @@ pub async fn enroll(
             .security
             .enrollments
             .enroll(id, device_name, addresses.clone());
-        state.security.enrollments.set_lan_token(id, &lan_token);
+        state
+            .security
+            .enrollments
+            .set_lan_token(id, &lan_token)
+            .map_err(|error| {
+                tracing::warn!("could not persist the LAN token hash: {error}");
+                ApiError::Internal("could not persist the LAN token hash".into())
+            })?;
     }
     // One phone reaches the master under two ids: its mDNS fullname over Wi-Fi
     // and `adb:<serial>` over USB. Enrolment is the only moment both are known
@@ -208,7 +210,7 @@ pub async fn enroll(
         server_key_pem: server.key_pem,
         fingerprint: state.security.ca.fingerprint().to_string(),
         lan_token,
-        lan_port: LAN_PORT,
+        lan_port: LanApiConfig::from_env().port,
         node_id: node_id.to_string(),
     }))
 }

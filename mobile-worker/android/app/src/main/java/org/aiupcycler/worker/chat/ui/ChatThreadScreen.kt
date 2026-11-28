@@ -3,6 +3,9 @@ package org.aiupcycler.worker.chat.ui
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -38,7 +41,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -49,9 +55,30 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.aiupcycler.worker.R
 import org.aiupcycler.worker.chat.ChatMessage
 import org.aiupcycler.worker.chat.MediaRef
+
+/** Bounded read: rejects oversized content before allocating the whole image. */
+private const val MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+
+private fun readBounded(input: InputStream, limit: Int): ByteArray? {
+    val output = ByteArrayOutputStream()
+    val chunk = ByteArray(8 * 1024)
+    var total = 0
+    while (true) {
+        val count = input.read(chunk)
+        if (count < 0) break
+        total += count
+        if (total > limit) return null
+        output.write(chunk, 0, count)
+    }
+    return output.toByteArray()
+}
 
 /**
  * Streaming thread. Every row is keyed by [ChatMessage.stableId], so a delta
@@ -75,11 +102,35 @@ fun ChatThreadScreen(
 ) {
     val canSend = (draft.isNotBlank() || attachments.isNotEmpty()) && !busy
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var attachmentError by remember { mutableStateOf<String?>(null) }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
-        val mime = context.contentResolver.getType(uri) ?: "image/png"
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        if (bytes != null) onAttachImage(displayName(context, uri), mime, bytes)
+        // Resolver reads can block on cloud-backed providers; keep the main
+        // thread free and deliver only the outcome back to the UI callback.
+        scope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                val mime = context.contentResolver.getType(uri) ?: "image/png"
+                val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+                    readBounded(input, MAX_ATTACHMENT_BYTES)
+                        ?: throw IOException("image exceeds attachment limit")
+                } ?: throw IOException("image is unavailable")
+                Triple(displayName(context, uri), mime, bytes)
+            }
+            withContext(Dispatchers.Main) {
+                result.fold(
+                    onSuccess = { (name, mime, bytes) ->
+                        attachmentError = null
+                        onAttachImage(name, mime, bytes)
+                    },
+                    onFailure = { failure ->
+                        if (failure is CancellationException) throw failure
+                        // Draft is untouched and another image can be picked.
+                        attachmentError = "Could not attach image; choose another"
+                    },
+                )
+            }
+        }
     }
     // The skeleton belongs only to the placeholder before the first delta.
     // Once an assistant row exists it owns its own skeleton (empty content) or
@@ -120,6 +171,20 @@ fun ChatThreadScreen(
                     Spacer(Modifier.width(8.dp))
                 }
             }
+        }
+
+        // A failed pick is reported next to the composer. The draft is left
+        // untouched, so the user can retry with another image.
+        attachmentError?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FiraSans),
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp)
+                    .semantics { contentDescription = "Attachment error" },
+            )
         }
 
         Row(

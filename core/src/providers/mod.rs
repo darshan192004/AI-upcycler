@@ -255,6 +255,17 @@ impl fmt::Debug for ProviderRegistry {
     }
 }
 
+/// Production transports never follow provider redirects and never downgrade
+/// to plain HTTP. Tests needing HTTP loopback mocks use
+/// [`ProviderRegistry::with_http_client`] to inject an explicit client.
+fn production_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("valid provider HTTP client configuration")
+}
+
 impl ProviderRegistry {
     /// Builds all four providers, reading `<ID>_BASE_URL` with a static
     /// fallback. No network call is made here.
@@ -274,7 +285,7 @@ impl ProviderRegistry {
         let mut registry = Self {
             secrets,
             base_urls,
-            client: reqwest::Client::new(),
+            client: production_http_client(),
             adapters: HashMap::new(),
             media: None,
         };

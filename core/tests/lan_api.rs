@@ -94,7 +94,10 @@ fn token_is_prefixed_32_random_bytes_base64url_without_padding() {
 fn verify_lan_token_accepts_exact_token_and_rejects_one_character_mutation() {
     let state = SecurityState::default();
     let token = generate_lan_token();
-    state.enrollments.set_lan_token("phone-a", &token);
+    state
+        .enrollments
+        .set_lan_token("phone-a", &token)
+        .expect("set token");
 
     assert!(state.enrollments.verify_lan_token(&token));
     assert!(state
@@ -122,7 +125,10 @@ fn lan_token_file_holds_only_a_lowercase_hex_hash() {
     let token = generate_lan_token();
     {
         let state = SecurityState::load_or_generate(&dir);
-        state.enrollments.set_lan_token("phone-a", &token);
+        state
+            .enrollments
+            .set_lan_token("phone-a", &token)
+            .expect("set token");
     }
 
     let raw = std::fs::read_to_string(dir.join(LAN_TOKENS_FILE)).expect("token store");
@@ -154,9 +160,15 @@ fn reenrolling_replaces_the_lan_token_hash() {
     let first = generate_lan_token();
     let second = generate_lan_token();
 
-    state.enrollments.set_lan_token("phone-a", &first);
+    state
+        .enrollments
+        .set_lan_token("phone-a", &first)
+        .expect("set first token");
     assert!(state.enrollments.verify_lan_token(&first));
-    state.enrollments.set_lan_token("phone-a", &second);
+    state
+        .enrollments
+        .set_lan_token("phone-a", &second)
+        .expect("set second token");
 
     assert!(
         !state.enrollments.verify_lan_token(&first),
@@ -177,7 +189,11 @@ async fn revoking_a_device_invalidates_its_lan_token() {
         .enrollments
         .enroll("phone-a", "Pixel 8", vec!["192.168.1.13".into()]);
     let token = generate_lan_token();
-    state.security.enrollments.set_lan_token("phone-a", &token);
+    state
+        .security
+        .enrollments
+        .set_lan_token("phone-a", &token)
+        .expect("set token");
     assert!(state.security.enrollments.verify_lan_token(&token));
 
     let security = state.security.clone();
@@ -200,7 +216,10 @@ fn an_unusable_ca_clears_lan_tokens_with_enrollments() {
         state
             .enrollments
             .enroll("phone-a", "Pixel 8", vec!["192.168.1.13".into()]);
-        state.enrollments.set_lan_token("phone-a", &token);
+        state
+            .enrollments
+            .set_lan_token("phone-a", &token)
+            .expect("set token");
     }
     std::fs::write(dir.join("ca-cert.pem"), "not a certificate").expect("corrupt the CA");
 
@@ -286,6 +305,36 @@ async fn pairing_response_carries_a_token_and_hashes_every_enrollment_id() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test]
+async fn pairing_response_reports_the_configured_lan_port() {
+    let _lock = LAN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _restore = RestoreLanEnv {
+        enabled: std::env::var_os(LAN_API_ENV),
+        port: std::env::var_os(LAN_PORT_ENV),
+    };
+    std::env::set_var(LAN_PORT_ENV, "8099");
+
+    let app = router(plain_state());
+    let (status, session) = send(app.clone(), "POST", "/api/pairing/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let pin = session["pin"].as_str().expect("pin").to_string();
+    let (status, body) = send(
+        app,
+        "POST",
+        "/api/pairing/enroll",
+        Some(json!({
+            "pin": pin,
+            "device_name": "Pixel 8",
+            "node_id": "phone.local.",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["lan_port"].as_u64(), Some(8099));
+}
+
 // ---- Task 4: LAN allowlist router and bearer middleware -----------------
 
 use ai_upcycler_core::api::lan::lan_router;
@@ -356,7 +405,11 @@ fn enrolled_lan_state() -> (AppState, String) {
         .security
         .enrollments
         .enroll("phone-a", "Pixel 8", vec!["192.168.1.13".into()]);
-    state.security.enrollments.set_lan_token("phone-a", &token);
+    state
+        .security
+        .enrollments
+        .set_lan_token("phone-a", &token)
+        .expect("set token");
     (state, token)
 }
 
@@ -543,11 +596,39 @@ async fn allowlist_valid_token_reaches_every_route() {
 }
 
 #[tokio::test]
+async fn allowlist_admits_token_authenticated_gallery_reads() {
+    let (state, token) = enrolled_lan_state();
+    let app = lan_router(state);
+    let auth = format!("Bearer {token}");
+
+    let (status, body) = send_lan(app.clone(), "GET", "/api/images", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, unauthorized_envelope());
+
+    let (status, body) = send_lan_json(app.clone(), "GET", "/api/images", None, Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["images"].is_array());
+
+    let (status, _) = send_lan_json(
+        app,
+        "GET",
+        "/api/images/missing/metadata",
+        None,
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn allowlist_revoked_token_is_unauthorized() {
     let (state, token) = enrolled_lan_state();
     let security = state.security.clone();
     let app = lan_router(state);
-    assert!(security.enrollments.revoke_lan_token("phone-a"));
+    assert!(security
+        .enrollments
+        .revoke_lan_token("phone-a")
+        .expect("revoke token"));
 
     let (status, body) = send_lan(
         app,

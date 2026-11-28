@@ -1,6 +1,7 @@
 package org.aiupcycler.worker.chat
 
 import android.content.SharedPreferences
+import java.net.URI
 
 /**
  * A manually entered or discovered master endpoint: host plus the LAN API port.
@@ -15,7 +16,8 @@ data class LanEndpoint(val host: String, val port: Int) {
         require(port in 1..65535) { "LAN endpoint port must be between 1 and 65535" }
     }
 
-    fun baseUrl(): String = "http://$host:$port"
+    /** URI's host-aware constructor brackets IPv6 literals, leaving IPv4/DNS as-is. */
+    fun baseUrl(): String = URI("http", null, host, port, null, null, null).toString()
 
     companion object {
         const val PREF_HOST = "lan_host"

@@ -38,6 +38,10 @@ pub enum StoreError {
 /// no GGUF to download or serve locally.
 pub const VIRTUAL_MODEL_PATH_PREFIX: &str = "virtual:";
 
+/// Marker for `content` values that hold serialized `MessageContent`.
+/// Unmarked values remain legacy plain text, including `[]` and quoted JSON.
+const MESSAGE_CONTENT_MARKER: &str = "mc1:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRow {
     pub node_id: String,
@@ -217,6 +221,7 @@ impl Store {
     fn from_connection(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        recover_interrupted_workflows(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -306,25 +311,7 @@ impl Store {
 
     pub fn upsert_model(&self, model: &NewModel) -> Result<(), StoreError> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO models (model_id, file_name, quantization_format, total_layers, weight_size_bytes, local_file_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(model_id) DO UPDATE SET
-                file_name = excluded.file_name,
-                quantization_format = excluded.quantization_format,
-                total_layers = excluded.total_layers,
-                weight_size_bytes = excluded.weight_size_bytes,
-                local_file_path = excluded.local_file_path",
-            params![
-                model.model_id,
-                model.file_name,
-                model.quantization_format,
-                model.total_layers,
-                model.weight_size_bytes,
-                model.local_file_path,
-            ],
-        )?;
-        Ok(())
+        upsert_model_in(&conn, model)
     }
 
     pub fn get_model(&self, model_id: &str) -> Result<Option<ModelRow>, StoreError> {
@@ -343,24 +330,34 @@ impl Store {
     /// rows are refreshed idempotently; a real local model with the same id is
     /// a conflict, so a cloud route can never shadow a downloaded GGUF.
     pub fn ensure_virtual_model(&self, model_id: &str, provider: &str) -> Result<(), StoreError> {
-        if let Some(existing) = self.get_model(model_id)? {
-            if !existing
-                .local_file_path
-                .starts_with(VIRTUAL_MODEL_PATH_PREFIX)
-            {
+        // Check and write under one lock: a local download completing in the
+        // gap between get_model and upsert_model could otherwise be replaced.
+        let conn = self.lock()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT local_file_path FROM models WHERE model_id = ?1",
+                params![model_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(path) = existing {
+            if !path.starts_with(VIRTUAL_MODEL_PATH_PREFIX) {
                 return Err(StoreError::Conflict(format!(
                     "model id '{model_id}' is already a local GGUF"
                 )));
             }
         }
-        self.upsert_model(&NewModel {
-            model_id: model_id.to_string(),
-            file_name: model_id.to_string(),
-            quantization_format: "cloud".to_string(),
-            total_layers: 0,
-            weight_size_bytes: 0,
-            local_file_path: format!("{VIRTUAL_MODEL_PATH_PREFIX}{provider}"),
-        })
+        upsert_model_in(
+            &conn,
+            &NewModel {
+                model_id: model_id.to_string(),
+                file_name: model_id.to_string(),
+                quantization_format: "cloud".to_string(),
+                total_layers: 0,
+                weight_size_bytes: 0,
+                local_file_path: format!("{VIRTUAL_MODEL_PATH_PREFIX}{provider}"),
+            },
+        )
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelRow>, StoreError> {
@@ -452,11 +449,7 @@ impl Store {
 
     pub fn append_message(&self, message: &NewChatMessage) -> Result<i64, StoreError> {
         let conn = self.lock()?;
-        // Text content still serializes to a JSON string, so existing rows and
-        // readers that treat the column as plain text keep working.
-        let content = serde_json::to_string(&message.content).map_err(|error| {
-            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })?;
+        let content = encode_message_content(&message.content)?;
         conn.execute(
             "INSERT INTO chat_messages (session_id, role, content, token_count, generation_time_sec)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -624,6 +617,29 @@ impl Store {
         Ok(())
     }
 
+    /// Marks every non-terminal step and the run itself failed after a sink
+    /// error. Completed steps are left untouched so their outputs stay valid.
+    pub fn fail_workflow_run_after_sink_error(
+        &self,
+        run_id: &str,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE workflow_steps SET status = 'failed', error = ?1 \
+             WHERE run_id = ?2 AND status IN ('pending', 'running')",
+            params![error, run_id],
+        )?;
+        tx.execute(
+            "UPDATE workflow_runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP \
+             WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Inserts a chat message and its attachment metadata in one transaction.
     /// Invalid attachment metadata aborts the whole message.
     pub async fn insert_message_with_attachments(
@@ -631,9 +647,7 @@ impl Store {
         msg: &NewChatMessage,
         attachments: &[(String, String, String, u64)],
     ) -> Result<i64, StoreError> {
-        let content = serde_json::to_string(&msg.content).map_err(|error| {
-            StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })?;
+        let content = encode_message_content(&msg.content)?;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let result = (|| -> Result<i64, StoreError> {
@@ -775,21 +789,18 @@ impl Store {
 
     pub fn get_settings(&self) -> Result<AppSettings, StoreError> {
         // Missing rows fall back to the application defaults, not to the
-        // primitive `Default` values (0/false).
+        // primitive `Default` values (0/false). All six keys are read under
+        // one connection lock so a concurrent write cannot mix generations.
         let defaults = AppSettings::default();
+        let conn = self.lock()?;
         Ok(AppSettings {
-            provider: self.setting("provider")?.unwrap_or(defaults.provider),
-            model: self.setting("model")?.unwrap_or(defaults.model),
-            context_tokens: self
-                .setting("context_tokens")?
-                .unwrap_or(defaults.context_tokens),
-            max_tokens: self.setting("max_tokens")?.unwrap_or(defaults.max_tokens),
-            show_source_badges: self
-                .setting("show_source_badges")?
+            provider: setting_in(&conn, "provider")?.unwrap_or(defaults.provider),
+            model: setting_in(&conn, "model")?.unwrap_or(defaults.model),
+            context_tokens: setting_in(&conn, "context_tokens")?.unwrap_or(defaults.context_tokens),
+            max_tokens: setting_in(&conn, "max_tokens")?.unwrap_or(defaults.max_tokens),
+            show_source_badges: setting_in(&conn, "show_source_badges")?
                 .unwrap_or(defaults.show_source_badges),
-            compact_mode: self
-                .setting("compact_mode")?
-                .unwrap_or(defaults.compact_mode),
+            compact_mode: setting_in(&conn, "compact_mode")?.unwrap_or(defaults.compact_mode),
         })
     }
 
@@ -797,12 +808,16 @@ impl Store {
         settings
             .validate()
             .map_err(|message| StoreError::InvalidSettings(message.into()))?;
-        self.put_setting_json("provider", &settings.provider)?;
-        self.put_setting_json("model", &settings.model)?;
-        self.put_setting_json("context_tokens", &settings.context_tokens)?;
-        self.put_setting_json("max_tokens", &settings.max_tokens)?;
-        self.put_setting_json("show_source_badges", &settings.show_source_badges)?;
-        self.put_setting_json("compact_mode", &settings.compact_mode)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let now = now_epoch_ms();
+        put_setting_json_in(&tx, "provider", &settings.provider, now)?;
+        put_setting_json_in(&tx, "model", &settings.model, now)?;
+        put_setting_json_in(&tx, "context_tokens", &settings.context_tokens, now)?;
+        put_setting_json_in(&tx, "max_tokens", &settings.max_tokens, now)?;
+        put_setting_json_in(&tx, "show_source_badges", &settings.show_source_badges, now)?;
+        put_setting_json_in(&tx, "compact_mode", &settings.compact_mode, now)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -836,6 +851,89 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn encode_message_content(content: &MessageContent) -> Result<String, StoreError> {
+    let json = serde_json::to_string(content).map_err(|error| {
+        StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    })?;
+    Ok(format!("{MESSAGE_CONTENT_MARKER}{json}"))
+}
+
+fn decode_message_content(raw: &str) -> MessageContent {
+    let Some(json) = raw.strip_prefix(MESSAGE_CONTENT_MARKER) else {
+        // Unmarked rows are legacy literal text, including `[]` and quoted JSON.
+        return MessageContent::Text(raw.to_string());
+    };
+    serde_json::from_str(json).unwrap_or_else(|_| MessageContent::Text(raw.to_string()))
+}
+
+fn upsert_model_in(conn: &Connection, model: &NewModel) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO models (model_id, file_name, quantization_format, total_layers, weight_size_bytes, local_file_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(model_id) DO UPDATE SET
+             file_name = excluded.file_name,
+             quantization_format = excluded.quantization_format,
+             total_layers = excluded.total_layers,
+             weight_size_bytes = excluded.weight_size_bytes,
+             local_file_path = excluded.local_file_path",
+        params![
+            model.model_id,
+            model.file_name,
+            model.quantization_format,
+            model.total_layers,
+            model.weight_size_bytes,
+            model.local_file_path,
+        ],
+    )?;
+    Ok(())
+}
+
+fn recover_interrupted_workflows(conn: &Connection) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE workflow_steps SET status = 'failed', \
+         error = COALESCE(error, 'interrupted by restart') \
+         WHERE status IN ('pending', 'running')",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE workflow_runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP \
+         WHERE status IN ('pending', 'running')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn setting_in<T: DeserializeOwned>(conn: &Connection, key: &str) -> Result<Option<T>, StoreError> {
+    conn.query_row(
+        "SELECT value_json FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()?
+    .map(|text: String| serde_json::from_str(&text).map_err(StoreError::SettingsJson))
+    .transpose()
+}
+
+fn put_setting_json_in<T: Serialize>(
+    conn: &Connection,
+    key: &str,
+    value: &T,
+    now: i64,
+) -> Result<(), StoreError> {
+    let text = serde_json::to_string(value).map_err(StoreError::SettingsJson)?;
+    conn.execute(
+        "INSERT INTO settings (key, value_json, updated_at_epoch_ms)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+             value_json = excluded.value_json,
+             updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+        params![key, text, now],
+    )?;
+    Ok(())
 }
 
 fn now_epoch_ms() -> i64 {
@@ -886,12 +984,7 @@ fn map_benchmark(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRow> {
 
 fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessageRow> {
     let raw: String = row.get(3)?;
-    // New rows hold serialized `MessageContent`; legacy rows held the raw text
-    // without JSON quotes. Falling back keeps old databases readable.
-    let content = match serde_json::from_str::<MessageContent>(&raw) {
-        Ok(content) => content,
-        Err(_) => MessageContent::Text(raw),
-    };
+    let content = decode_message_content(&raw);
     Ok(ChatMessageRow {
         message_id: row.get(0)?,
         session_id: row.get(1)?,
@@ -1189,6 +1282,125 @@ mod tests {
             store.get_settings().unwrap(),
             crate::settings::AppSettings::default()
         );
+    }
+
+    #[test]
+    fn new_content_is_marked_and_legacy_text_stays_text() {
+        let db = store();
+        db.upsert_model(&NewModel {
+            model_id: "m1".into(),
+            file_name: "m1.gguf".into(),
+            quantization_format: "Q4_K_M".into(),
+            total_layers: 1,
+            weight_size_bytes: 1,
+            local_file_path: "/m1.gguf".into(),
+        })
+        .unwrap();
+        db.create_session("s1", "s1", "m1").unwrap();
+        let id = db
+            .append_message(&NewChatMessage {
+                session_id: "s1".into(),
+                role: "user".into(),
+                content: MessageContent::Parts(vec![ContentPart::Text {
+                    text: "hello".into(),
+                }]),
+                token_count: 1,
+                generation_time_sec: 0.0,
+            })
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT content FROM chat_messages WHERE message_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw.starts_with(MESSAGE_CONTENT_MARKER));
+        for legacy in ["[]", "\"quoted text\""] {
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content) VALUES ('s1', 'user', ?1)",
+                params![legacy],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let rows = db.list_messages("s1").unwrap();
+        assert_eq!(
+            rows[0].content,
+            MessageContent::Parts(vec![ContentPart::Text {
+                text: "hello".into(),
+            }])
+        );
+        assert_eq!(rows[1].content, MessageContent::Text("[]".into()));
+        assert_eq!(
+            rows[2].content,
+            MessageContent::Text("\"quoted text\"".into())
+        );
+    }
+
+    #[test]
+    fn interrupted_workflows_reach_a_terminal_state_on_store_open() {
+        let dir = std::path::PathBuf::from(r"D:\ai-upcycler-temp")
+            .join(format!("ai-upcycler-wf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.sqlite");
+        {
+            let db = Store::open(&path).unwrap();
+            db.create_workflow_run(
+                "wf-1",
+                "m1",
+                &[NewWorkflowStep {
+                    step_id: "s1".into(),
+                    prompt: "hello".into(),
+                    depends_on_json: "[]".into(),
+                    provider: None,
+                    position: 0,
+                }],
+            )
+            .unwrap();
+            db.set_workflow_step_status("wf-1", "s1", "running", None, None, None)
+                .unwrap();
+        }
+
+        let db = Store::open(&path).unwrap();
+        let run = db.get_workflow_run("wf-1").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.finished_at.is_some());
+        let steps = db.list_workflow_steps("wf-1").unwrap();
+        assert_eq!(steps[0].status, "failed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sink_errors_fail_non_terminal_workflow_rows() {
+        let db = store();
+        db.create_workflow_run(
+            "wf-2",
+            "m1",
+            &[NewWorkflowStep {
+                step_id: "s1".into(),
+                prompt: "hello".into(),
+                depends_on_json: "[]".into(),
+                provider: None,
+                position: 0,
+            }],
+        )
+        .unwrap();
+        db.set_workflow_step_status("wf-2", "s1", "running", None, None, None)
+            .unwrap();
+
+        db.fail_workflow_run_after_sink_error("wf-2", "sink failed")
+            .unwrap();
+
+        let steps = db.list_workflow_steps("wf-2").unwrap();
+        assert_eq!(steps[0].status, "failed");
+        assert_eq!(steps[0].error.as_deref(), Some("sink failed"));
+        let run = db.get_workflow_run("wf-2").unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.finished_at.is_some());
     }
 
     #[test]

@@ -172,9 +172,22 @@ async fn run_workflow(state: AppState, run_id: String, model: String, steps: Vec
     };
     if let Err(error) = execute(&run_id, &steps, &router, &sink).await {
         tracing::error!("workflow {run_id} stopped before completion: {error}");
-        let _ = sink.emit(WorkflowEvent::RunFinished {
-            run_id,
+        if let Err(emit_error) = sink.emit(WorkflowEvent::RunFinished {
+            run_id: run_id.clone(),
             status: crate::workflows::RunStatus::Failed,
-        });
+        }) {
+            tracing::error!("workflow {run_id} could not persist its failed state: {emit_error}");
+        }
+        // A step can fail between its `running` write and its terminal write.
+        // Force every non-terminal row to `failed` so the run cannot look
+        // resumable after the task has actually ended.
+        if let Err(recover_error) = state
+            .store
+            .fail_workflow_run_after_sink_error(&run_id, &error)
+        {
+            tracing::error!(
+                "workflow {run_id} could not fail its remaining steps: {recover_error}"
+            );
+        }
     }
 }

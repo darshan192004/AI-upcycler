@@ -29,7 +29,7 @@
 - Dependency A: `docs/superpowers/plans/2026-11-27-cloud-provider-bridge.md` must land before Tasks 6–9. Dependency B: spec §7 Android Compose chat surface and `design-system/ai-upcycler/MASTER.md` must land before Task 11. If a dependency is absent, stop that task and report it; do not invent a substitute.
 - Text-only compatibility invariant: `{"role":"user","content":"hello"}` serializes to exactly the same JSON. Missing or `null` content becomes `MessageContent::Text(String::new())`.
 - Agent compatibility invariants: requests omitting `provider` keep using `RoutePolicy`; tool turns stay host-only; loopback stays unauthenticated.
-- The OpenAI-compatible `/v1` agent endpoint stays text-only per `docs/AGENTS.md` §8. Image parts sent to that surface return `400 {"error":"image_attachments_require_vision_provider"}` before any host-engine or tool call; no session or user turn is stored on that path.
+- The OpenAI-compatible `/v1` agent endpoint keeps its text-only compatibility per `docs/AGENTS.md` §8, but the image gate is route-dependent: image parts are accepted on a vision-capable cloud route (`supports_vision`). Local, cluster, and tool turns return `400 {"error":"image_attachments_require_vision_provider"}` before any host-engine or tool call; no session or user turn is stored on rejected paths.
 - Feature gate: `AI_UPCYCLER_MULTIMODAL=1`. `AppState.multimodal_enabled` defaults to `false`; `with_multimodal(bool)` sets it. Gate-off rejects image parts with `400 {"error":"multimodal_disabled"}` before session writes and returns `404` from `/api/media`.
 - Fail-closed error bodies (all HTTP 400): `image_attachments_require_vision_provider` (local/cluster/tool), `provider_lacks_vision_support` (resolved model has `supports_vision=false`), `no_vision_capable_model_loaded` (no vision route), `invalid_image_attachment` (MIME/magic/size/hash failure).
 - Streaming image failure emits exactly one `GenerationChunk` with `delta = ""`, `error = Some("<code>")`, then closes the stream.
@@ -191,7 +191,7 @@ Change `ChatMessage.content` to:
 pub content: MessageContent,
 ```
 
-Rewrite `null_as_empty` to deserialize through `Option<String>` and return `MessageContent::Text(String::new())` for `None`, otherwise `MessageContent::Text(s)`. Variant order `Parts` before `Text` is required.
+Rewrite `null_as_empty` to deserialize through `Option<MessageContent>` and return the deserialized content unchanged, including part arrays; map `None` to empty text (`MessageContent::Text(String::new())`). Variant order `Parts` before `Text` is required.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -481,7 +481,7 @@ git commit -m "feat: add content-addressed image media store"
 - Test: inline `#[cfg(test)]` in `core/src/store/mod.rs`
 
 **Interfaces:**
-- Consumes: `MessageContent`, `ContentPart` from Tasks 1–2; existing `test_db()` helper used by current store tests.
+- Consumes: `MessageContent`, `ContentPart` from Tasks 1–2; existing `store()` helper used by current store tests.
 - Produces: `AttachmentRow { message_id, media_hash, mime_type, file_name, byte_count, created_at }`, `Store::insert_message_with_attachments`, `Store::attachments_for_message`.
 
 **Dependencies:** Task 2 (content types in store).
@@ -493,14 +493,28 @@ git commit -m "feat: add content-addressed image media store"
 Add to `core/src/store/mod.rs` inline tests:
 
 ```rust
+use crate::api::backend::ContentPart;
+
 #[tokio::test]
 async fn insert_message_with_attachments_is_atomic() {
-    let db = test_db();
+    let db = store();
+    db.upsert_model(&NewModel {
+        model_id: "m1".into(),
+        file_name: "m1.gguf".into(),
+        quantization_format: "Q4_K_M".into(),
+        total_layers: 32,
+        weight_size_bytes: 1,
+        local_file_path: "/m1.gguf".into(),
+    })
+    .unwrap();
+    db.create_session("1", "s1", "m1").unwrap();
     let msg = NewChatMessage {
-        session_id: 1,
+        session_id: "1".into(),
         role: "user".into(),
         content: MessageContent::Parts(vec![
-            ContentPart::Text { text: "look".into() },
+            ContentPart::Text {
+                text: "look".into(),
+            },
             ContentPart::Image {
                 media_hash: "cd".repeat(32),
                 mime_type: "image/png".into(),
@@ -508,11 +522,15 @@ async fn insert_message_with_attachments_is_atomic() {
                 byte_count: 4,
             },
         ]),
+        token_count: 0,
+        generation_time_sec: 0.0,
     };
     db.insert_message_with_attachments(
         &msg,
         &[("cd".repeat(32), "image/png".into(), "a.png".into(), 4)],
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     let rows = db.attachments_for_message(1).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].mime_type, "image/png");
@@ -520,18 +538,32 @@ async fn insert_message_with_attachments_is_atomic() {
 
 #[tokio::test]
 async fn invalid_attachment_rolls_back_message() {
-    let db = test_db();
+    let db = store();
+    db.upsert_model(&NewModel {
+        model_id: "m1".into(),
+        file_name: "m1.gguf".into(),
+        quantization_format: "Q4_K_M".into(),
+        total_layers: 32,
+        weight_size_bytes: 1,
+        local_file_path: "/m1.gguf".into(),
+    })
+    .unwrap();
+    db.create_session("2", "s2", "m1").unwrap();
     let msg = NewChatMessage {
-        session_id: 2,
+        session_id: "2".into(),
         role: "user".into(),
         content: MessageContent::Text("x".into()),
+        token_count: 0,
+        generation_time_sec: 0.0,
     };
-    let res = db.insert_message_with_attachments(
-        &msg,
-        &[("bad-hash".into(), "image/png".into(), "a.png".into(), 4)],
-    ).await;
+    let res = db
+        .insert_message_with_attachments(
+            &msg,
+            &[("bad-hash".into(), "image/png".into(), "a.png".into(), 4)],
+        )
+        .await;
     assert!(res.is_err());
-    assert!(db.session_messages(2).await.unwrap().is_empty());
+    assert!(db.list_messages("2").unwrap().is_empty());
 }
 ```
 
@@ -549,7 +581,7 @@ Append exactly to `core/src/store/schema.sql`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS attachments (
-  message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+  message_id INTEGER NOT NULL REFERENCES chat_messages(message_id) ON DELETE CASCADE,
   media_hash TEXT NOT NULL,
   mime_type TEXT NOT NULL,
   file_name TEXT NOT NULL,
@@ -1410,7 +1442,7 @@ Record in the execution log (not a file):
 - §12: chip tokens, a11y labels, focus, reduced motion, 48 dp touch target.
 - §13: mock HTTP, real axum router, Playwright desktop, ADB Android checks executed.
 - §14: compat tests landed before UI; gate stayed off until Tasks 1–9 green.
-- Agent compatibility: no `provider` required, tool turns host-only, loopback unauthenticated, `/v1` endpoint text-only with image parts rejected before host/tool calls per `docs/AGENTS.md` §8.
+- Agent compatibility: no `provider` required, tool turns host-only, loopback unauthenticated, `/v1` text-only compatibility preserved; image parts accepted only on vision-capable cloud routes and rejected on local/cluster/tool paths before host/tool calls per `docs/AGENTS.md` §8.
 - Only files in the Files Map were modified.
 
 - [ ] **Step 4: Commit**

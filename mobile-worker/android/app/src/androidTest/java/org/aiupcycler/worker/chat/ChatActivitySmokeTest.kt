@@ -1,9 +1,11 @@
 package org.aiupcycler.worker.chat
 
+import androidx.compose.ui.test.assertDoesNotExist
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -53,6 +55,17 @@ class ChatActivitySmokeTest {
             .performClick()
         composeTestRule.onNodeWithText("Control & pairing").assertIsDisplayed()
     }
+}
+
+/**
+ * Isolated composable checks. Each test supplies its own content, so these run
+ * on a plain Compose rule: the activity-hosting rule's `onCreate` already sets
+ * content and rejects a second `setContent`.
+ */
+@RunWith(AndroidJUnit4::class)
+class ChatComposableTest {
+    @get:Rule
+    val composeTestRule = createComposeRule()
 
     /** Task 11 RED assertions: the chip must expose a separate file-name text node. */
     @Test

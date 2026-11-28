@@ -131,11 +131,11 @@ async fn gemini_payload(
         .join("\n");
 
     let mut contents: Vec<Value> = Vec::new();
-    for (index, message) in request
+    let mut system_prefixed = system.is_empty();
+    for message in request
         .messages
         .iter()
         .filter(|message| message.role != "system")
-        .enumerate()
     {
         let role = if message.role == "assistant" {
             "model"
@@ -143,13 +143,14 @@ async fn gemini_payload(
             "user"
         };
         let mut parts = mapped_parts(media, message).await?;
-        if index == 0 && role == "user" && !system.is_empty() {
+        if !system_prefixed && role == "user" {
             if let Some(text_part) = parts.iter_mut().find(|part| part.get("text").is_some()) {
                 let text = text_part["text"].as_str().unwrap_or_default().to_string();
                 text_part["text"] = json!(format!("{system}\n{text}"));
             } else {
                 parts.insert(0, json!({ "text": system }));
             }
+            system_prefixed = true;
         }
         contents.push(json!({
             "role": role,
@@ -225,6 +226,8 @@ fn gemini_stream(
 
         let mut bytes = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut estimated_text_chunks: u32 = 0;
+        let mut authoritative_tokens: Option<u32> = None;
         while let Some(item) = bytes.next().await {
             let chunk = match item {
                 Ok(chunk) => chunk,
@@ -233,7 +236,14 @@ fn gemini_stream(
                     return;
                 }
             };
-            for line in take_complete_lines(&mut buffer, &chunk) {
+            let lines = match take_complete_lines(&mut buffer, &chunk) {
+                Ok(lines) => lines,
+                Err(_) => {
+                    yield Err(format!("{provider_name} returned an oversized response line"));
+                    return;
+                }
+            };
+            for line in lines {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -271,9 +281,13 @@ fn gemini_stream(
                 }
 
                 if !text.is_empty() {
+                    let usage_seen = authoritative_tokens.is_some();
+                    if !usage_seen {
+                        estimated_text_chunks = estimated_text_chunks.saturating_add(1);
+                    }
                     yield Ok(GenerationChunk {
                         content: text,
-                        tokens_emitted: 1,
+                        tokens_emitted: if usage_seen { 0 } else { 1 },
                         source: Some(provider_name.clone()),
                         ..Default::default()
                     });
@@ -289,9 +303,13 @@ fn gemini_stream(
                         .and_then(Value::as_u64)
                         .map(|count| count as u32)
                         .unwrap_or(0);
+                    let correction = completion_tokens.saturating_sub(
+                        authoritative_tokens.unwrap_or(estimated_text_chunks),
+                    );
+                    authoritative_tokens = Some(completion_tokens);
                     yield Ok(GenerationChunk {
                         prompt_tokens,
-                        tokens_emitted: completion_tokens,
+                        tokens_emitted: correction,
                         finish_reason: Some(
                             finish_reason.unwrap_or_else(|| "stop".to_string()),
                         ),

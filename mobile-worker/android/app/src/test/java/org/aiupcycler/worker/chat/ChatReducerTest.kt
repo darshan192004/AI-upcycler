@@ -334,4 +334,42 @@ class ChatReducerTest {
         val empty = reduce(state, ChatEvent.ProviderSelected(ProviderChoice.Cloud("not-configured")))
         assertEquals("", empty.selectedModel)
     }
+
+    @Test
+    fun localProviderAcceptsHostLocalOwnershipAndRejectsCloudOwnedModels() {
+        val hostLocal = ModelEntry(id = "qwen3-local", ownedBy = "ai-upcycler-local")
+        val legacyLocal = ModelEntry(id = "legacy-local")
+        val cloud = ModelEntry(id = "openai:gpt-4o-mini", ownedBy = "openai")
+        val state = baseState.copy(models = listOf(hostLocal, legacyLocal, cloud))
+
+        assertEquals(
+            listOf("qwen3-local", "legacy-local"),
+            availableModelIds(state, ProviderChoice.Local),
+        )
+        assertEquals(
+            listOf("qwen3-local", "legacy-local", "openai:gpt-4o-mini"),
+            availableModelIds(state, ProviderChoice.Auto),
+        )
+
+        val localState = state.copy(selectedProvider = ProviderChoice.Local, selectedModel = "legacy-local")
+        assertEquals("qwen3-local", reduce(localState, ChatEvent.ModelSelected("qwen3-local")).selectedModel)
+        assertEquals("legacy-local", reduce(localState, ChatEvent.ModelSelected("openai:gpt-4o-mini")).selectedModel)
+    }
+
+    @Test
+    fun modelSelectedRejectsModelsOwnedByAnotherProvider() {
+        val openAi = ModelEntry(id = "openai:gpt-4o-mini", ownedBy = "openai")
+        val otherOpenAi = ModelEntry(id = "openai:gpt-4o", ownedBy = "openai")
+        val anthropic = ModelEntry(id = "anthropic:claude", ownedBy = "anthropic")
+        val state = baseState.copy(
+            models = listOf(openAi, otherOpenAi, anthropic),
+            selectedProvider = ProviderChoice.Cloud("openai"),
+            selectedModel = "openai:gpt-4o-mini",
+        )
+
+        assertEquals("openai:gpt-4o", reduce(state, ChatEvent.ModelSelected("openai:gpt-4o")).selectedModel)
+        val rejected = reduce(state, ChatEvent.ModelSelected("anthropic:claude"))
+        assertEquals("openai:gpt-4o-mini", rejected.selectedModel)
+        assertSame(state, rejected)
+    }
 }

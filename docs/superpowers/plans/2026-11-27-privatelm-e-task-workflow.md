@@ -547,7 +547,7 @@ Expected: compile failure naming `StepRunner`, `EventSink`, and `execute` as unr
 - [ ] **Step 3: Replace the Task 1 stub with the full `core/src/workflows/executor.rs`**
 
 ```rust
-use super::{RunStatus, StepOutput, StepStatus, WorkflowEvent, WorkflowStep};
+use super::{RunStatus, StepOutput, StepStatus, WorkflowStep};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -566,6 +566,28 @@ pub trait StepRunner: Send + Sync {
 /// tests collect events in a `Mutex<Vec<_>>`.
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: WorkflowEvent) -> Result<(), String>;
+}
+
+/// Progress emitted before a step starts, when it finishes, and when the run
+/// finishes. Events are emitted in execution order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowEvent {
+    StepStarted {
+        run_id: String,
+        step_id: String,
+    },
+    StepCompleted {
+        run_id: String,
+        step_id: String,
+        status: StepStatus,
+        output: Option<String>,
+        source: Option<String>,
+        error: Option<String>,
+    },
+    RunFinished {
+        run_id: String,
+        status: RunStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,33 +756,9 @@ where
 }
 ```
 
-- [ ] **Step 4: Add the event enum to `core/src/workflows/mod.rs`**
+- [ ] **Step 4: Re-export the event enum from `core/src/workflows/mod.rs`**
 
-Insert after the `RunStatus` impl:
-
-```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkflowEvent {
-    StepStarted {
-        run_id: String,
-        step_id: String,
-    },
-    StepCompleted {
-        run_id: String,
-        step_id: String,
-        status: StepStatus,
-        output: Option<String>,
-        source: Option<String>,
-        error: Option<String>,
-    },
-    RunFinished {
-        run_id: String,
-        status: RunStatus,
-    },
-}
-```
-
-Also add this re-export beside `pub use validation::validate_steps;` in `core/src/workflows/mod.rs` (do not re-export `topological_order`; it is crate-private):
+The `WorkflowEvent` enum is defined in `core/src/workflows/executor.rs` alongside `EventSink` (Step 3), not in `mod.rs`. Add this re-export beside `pub use validation::validate_steps;` in `core/src/workflows/mod.rs` (do not re-export `topological_order`; it is crate-private):
 
 ```rust
 pub use executor::{

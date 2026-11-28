@@ -204,10 +204,10 @@ real key is shown or returned.
 
 ### 2.6 Read-only shared session routes
 
-Chat completions create sessions through `session_id`; these routes only let a
+Chat completions create sessions through `session_id`; these routes let a
 phone or desktop client rediscover them and replay their messages. Neither
-client keeps a local session database. There are no write routes here —
-rename and delete belong to a later phase.
+client keeps a local session database. Session rename and delete are
+supported in §2.7.
 
 | Route | Response |
 |---|---|

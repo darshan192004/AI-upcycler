@@ -115,11 +115,20 @@ pub async fn revoke(
         // The LAN bearer token is the other credential for this device: both
         // must die in the same blocking step, or a revoked phone could still
         // reach the LAN API with a token it kept from pairing.
-        security.enrollments.revoke_lan_token(&id);
-        revoked
+        security
+            .enrollments
+            .revoke_lan_token(&id)
+            .map_err(|error| {
+                tracing::warn!("could not persist the LAN token revocation: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "LAN token revocation could not be persisted".into(),
+                )
+            })?;
+        Ok::<bool, ApiError>(revoked)
     })
     .await
-    .map_err(join_failure)?;
+    .map_err(join_failure)??;
 
     Ok(Json(RevokeResponse { revoked }))
 }

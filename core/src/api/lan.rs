@@ -6,7 +6,7 @@
 //! paired phone needs and checks a hashed token on every request. Pairing and
 //! device revocation are never reachable from this surface.
 
-use crate::api::{chat, models, providers, provisioning, sessions, ApiError, AppState};
+use crate::api::{chat, images, models, providers, provisioning, sessions, ApiError, AppState};
 use crate::security::hash_lan_token;
 use axum::body::Body;
 use axum::extract::State;
@@ -121,6 +121,9 @@ pub fn lan_router(state: AppState) -> Router {
         .route("/api/sessions", get(sessions::list))
         .route("/api/sessions/:id", get(sessions::get))
         .route("/api/sessions/:id/messages", get(sessions::messages))
+        .route("/api/images", get(images::list_images))
+        .route("/api/images/:id/metadata", get(images::get_image_metadata))
+        .route("/api/images/:id", get(images::get_image_bytes))
         .route("/api/devices/:id/provision", get(provisioning::status))
         .layer(from_fn_with_state(state.clone(), require_lan_token))
         .layer(

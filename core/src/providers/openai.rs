@@ -1,7 +1,7 @@
 //! OpenAI adapter. Its wire protocol is the shared OpenAI-compatible helper,
 //! with image parts resolved through the API's content-addressed media store.
 
-use super::messages::to_openai_message;
+use super::messages::{to_openai_message, with_openai_content};
 use super::openai_compat::take_complete_lines;
 use super::{bare_model, descriptor_for, CloudProvider, ProviderDescriptor, ProviderId};
 use crate::api::backend::{
@@ -81,6 +81,40 @@ pub(crate) fn compat_provider(
     super::openai_compat::OpenAiCompatProvider::new(id, client, base_url)
 }
 
+const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE: usize = 4;
+const MAX_TURN_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Enforces the recorded attachment budget before any bytes are read. Counts
+/// come from the API's metadata, so an oversized image cannot force a large
+/// read or a large provider request.
+fn check_attachment_budget(messages: &[ChatMessage]) -> Result<(), MediaError> {
+    let mut turn_bytes = 0u64;
+    for message in messages {
+        let MessageContent::Parts(parts) = &message.content else {
+            continue;
+        };
+        let mut images = 0usize;
+        for part in parts {
+            let ContentPart::Image { byte_count, .. } = part else {
+                continue;
+            };
+            images += 1;
+            if *byte_count > MAX_IMAGE_BYTES {
+                return Err(MediaError::TooLarge);
+            }
+            turn_bytes = turn_bytes.saturating_add(*byte_count);
+            if turn_bytes > MAX_TURN_IMAGE_BYTES {
+                return Err(MediaError::TooLarge);
+            }
+        }
+        if images > MAX_IMAGES_PER_MESSAGE {
+            return Err(MediaError::TooLarge);
+        }
+    }
+    Ok(())
+}
+
 /// Maps each message through the committed pure mapper. A message with several
 /// images is mapped one part at a time so every part gets its own data URL;
 /// no image bytes or encoded URLs are logged.
@@ -88,6 +122,7 @@ async fn messages_payload(
     media: Option<&Arc<MediaStore>>,
     messages: &[ChatMessage],
 ) -> Result<Vec<Value>, MediaError> {
+    check_attachment_budget(messages)?;
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
         if !message.content.has_images() {
@@ -108,9 +143,9 @@ async fn messages_payload(
                     ..
                 } => {
                     let store = media.ok_or(MediaError::Io)?;
-                    // Resolve the bytes first so a missing or drifting file
-                    // fails closed before any provider request is built.
-                    store.get(media_hash).await?;
+                    // `data_url` reads once and verifies the hash, so a
+                    // missing or drifting file fails closed without a second
+                    // read of the same bytes.
                     store.data_url(media_hash, mime_type).await?
                 }
             };
@@ -128,7 +163,7 @@ async fn messages_payload(
                 content.push(block.clone());
             }
         }
-        out.push(json!({ "role": &message.role, "content": content }));
+        out.push(with_openai_content(message, Value::Array(content)));
     }
     Ok(out)
 }
@@ -207,6 +242,7 @@ pub(crate) fn openai_compat_stream_with_media(
 
         let mut bytes = response.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut completion_seen = false;
         while let Some(item) = bytes.next().await {
             let chunk = match item {
                 Ok(chunk) => chunk,
@@ -215,13 +251,21 @@ pub(crate) fn openai_compat_stream_with_media(
                     return;
                 }
             };
-            for line in take_complete_lines(&mut buffer, &chunk) {
+            let lines = match take_complete_lines(&mut buffer, &chunk) {
+                Ok(lines) => lines,
+                Err(_) => {
+                    yield Err(format!("{provider_name} returned an oversized response line"));
+                    return;
+                }
+            };
+            for line in lines {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
-                    continue;
+                    completion_seen = true;
+                    break;
                 }
                 let parsed: Value = match serde_json::from_str(data) {
                     Ok(parsed) => parsed,
@@ -239,6 +283,7 @@ pub(crate) fn openai_compat_stream_with_media(
                     .to_string();
                 let finish_reason = choice
                     .and_then(|item| item.get("finish_reason"))
+                    .filter(|reason| !reason.is_null())
                     .and_then(Value::as_str)
                     .map(str::to_string);
 
@@ -251,13 +296,21 @@ pub(crate) fn openai_compat_stream_with_media(
                     });
                 }
                 if let Some(finish_reason) = finish_reason {
+                    completion_seen = true;
                     yield Ok(GenerationChunk {
                         finish_reason: Some(finish_reason),
                         source: Some(provider_name.clone()),
                         ..Default::default()
                     });
+                    break;
                 }
             }
+            if completion_seen {
+                break;
+            }
+        }
+        if !completion_seen {
+            yield Err(format!("{provider_name} stream ended before completion"));
         }
     })
 }

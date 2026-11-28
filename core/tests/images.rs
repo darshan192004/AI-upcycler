@@ -19,6 +19,15 @@ use serde_json::{json, Value};
 const PNG_1X1_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p8kAAAAASUVORK5CYII=";
 
+/// Loopback mocks need an explicit client; production imagegen backends are
+/// HTTPS-only and never follow redirects.
+fn no_proxy_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("no-proxy test client")
+}
+
 fn image_app(expected_authorization: &'static str) -> Router {
     Router::new().route(
         "/images/generations",
@@ -32,7 +41,10 @@ fn image_app(expected_authorization: &'static str) -> Router {
                 assert_eq!(body["prompt"], "a red bicycle");
                 assert_eq!(body["n"], 1);
                 assert_eq!(body["size"], "1024x1024");
-                assert_eq!(body["response_format"], "b64_json");
+                assert!(
+                    body.get("response_format").is_none(),
+                    "OpenAI's native endpoint must not receive response_format: {body}"
+                );
                 Json(json!({ "data": [{ "b64_json": PNG_1X1_BASE64 }] }))
             },
         ),
@@ -43,10 +55,11 @@ fn image_app(expected_authorization: &'static str) -> Router {
 async fn openai_adapter_decodes_png_from_b64_json() {
     let (base_url, handle) =
         common::spawn_mock_provider(image_app("Bearer sk-test-image-key")).await;
-    let backend = B64JsonImageBackend::new(
+    let backend = B64JsonImageBackend::with_client(
         ImageProviderId::OpenAI,
         DEFAULT_OPENAI_IMAGE_MODEL,
         format!("{base_url}/images/generations"),
+        no_proxy_client(),
     );
     let request = GenerateImageRequest {
         prompt: "a red bicycle".into(),
@@ -86,15 +99,17 @@ async fn gemini_adapter_posts_to_openai_compatible_gemini_endpoint() {
                     "Bearer sk-test-gemini-key"
                 );
                 assert_eq!(body["model"], DEFAULT_GEMINI_IMAGE_MODEL);
+                assert_eq!(body["response_format"], "b64_json");
                 Json(json!({ "data": [{ "b64_json": PNG_1X1_BASE64 }] }))
             },
         ),
     );
     let (base_url, handle) = common::spawn_mock_provider(app).await;
-    let backend = B64JsonImageBackend::new(
+    let backend = B64JsonImageBackend::with_client(
         ImageProviderId::Gemini,
         DEFAULT_GEMINI_IMAGE_MODEL,
         format!("{base_url}/images/generations"),
+        no_proxy_client(),
     );
     let request = GenerateImageRequest {
         prompt: "a red bicycle".into(),
@@ -115,10 +130,11 @@ async fn invalid_b64_json_is_reported() {
         post(|| async { Json(json!({ "data": [{ "b64_json": "not base64" }] })) }),
     );
     let (base_url, handle) = common::spawn_mock_provider(app).await;
-    let backend = B64JsonImageBackend::new(
+    let backend = B64JsonImageBackend::with_client(
         ImageProviderId::OpenAI,
         DEFAULT_OPENAI_IMAGE_MODEL,
         format!("{base_url}/images/generations"),
+        no_proxy_client(),
     );
     let request = GenerateImageRequest {
         prompt: "a red bicycle".into(),
@@ -197,11 +213,12 @@ async fn image_router_with_mock_provider() -> Router {
     )
     .with_media(MediaStore::new(test_temp_root("media")))
     .with_secrets(secrets.clone())
-    .with_image_backends(Arc::new(ImageBackendRegistry::new(
+    .with_image_backends(Arc::new(ImageBackendRegistry::new_with_client(
         secrets,
         format!("{base_url}/images/generations"),
         format!("{base_url}/images/generations"),
         true,
+        no_proxy_client(),
     )));
     router(state)
 }

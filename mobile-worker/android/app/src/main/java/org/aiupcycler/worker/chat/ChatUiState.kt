@@ -114,7 +114,7 @@ fun reduce(state: ChatUiState, event: ChatEvent): ChatUiState = when (event) {
     is ChatEvent.ProviderSelected -> selectProvider(state, event.choice)
 
     is ChatEvent.ModelSelected -> when (event.modelId) {
-        in state.models.map { it.id } -> state.copy(selectedModel = event.modelId)
+        in availableModelIds(state, state.selectedProvider) -> state.copy(selectedModel = event.modelId)
         else -> state
     }
 
@@ -217,17 +217,24 @@ fun provisioningText(state: ProvisionState): String = when (state) {
 /** The progress screen polls only while the host reports a running push. */
 fun shouldPollProvisioning(state: ProvisionState): Boolean = state is ProvisionState.Running
 
+/** Host value for rows served by the on-device engine. */
+private const val HOST_LOCAL_OWNER = "ai-upcycler-local"
+
 /**
- * Model ids that belong to [choice]. Local catalog rows keep their exact ids
- * even when one already contains a colon; virtual cloud rows carry [ModelEntry.ownedBy].
+ * Whether [model] may be selected while [choice] is active. Local catalog rows
+ * keep their exact ids even when one already contains a colon; virtual cloud
+ * rows carry [ModelEntry.ownedBy]. Blank ownership stays local for older hosts.
  */
-fun availableModelIds(state: ChatUiState, choice: ProviderChoice): List<String> = when (choice) {
-    ProviderChoice.Auto -> state.models.map { it.id }
-    ProviderChoice.Local -> state.models.filter { it.ownedBy.isBlank() }.map { it.id }
-    is ProviderChoice.Cloud -> state.models
-        .filter { it.ownedBy.equals(choice.providerId, ignoreCase = true) }
-        .map { it.id }
+fun modelBelongsToProvider(model: ModelEntry, choice: ProviderChoice): Boolean = when (choice) {
+    ProviderChoice.Auto -> true
+    ProviderChoice.Local -> model.ownedBy.isBlank() ||
+        model.ownedBy.equals(HOST_LOCAL_OWNER, ignoreCase = true)
+    is ProviderChoice.Cloud -> model.ownedBy.equals(choice.providerId, ignoreCase = true)
 }
+
+/** Model ids that belong to [choice], used by both the picker and the reducer. */
+fun availableModelIds(state: ChatUiState, choice: ProviderChoice): List<String> =
+    state.models.filter { modelBelongsToProvider(it, choice) }.map { it.id }
 
 /** Keeps a still-valid selection, otherwise moves to the first id in the new catalog. */
 private fun selectProvider(state: ChatUiState, choice: ProviderChoice): ChatUiState {
