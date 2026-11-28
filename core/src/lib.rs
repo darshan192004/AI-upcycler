@@ -1,5 +1,6 @@
 pub mod adb;
 pub mod api;
+pub mod autoconfig;
 pub mod discovery;
 pub mod mmap;
 pub mod onboarding;
@@ -10,6 +11,7 @@ pub mod rpc;
 pub mod scheduler;
 pub mod secrets;
 pub mod security;
+pub mod settings;
 pub mod store;
 pub mod telemetry;
 pub mod trust;
