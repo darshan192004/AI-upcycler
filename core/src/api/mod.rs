@@ -29,6 +29,8 @@ use crate::adb::PairingTunnelRegistry;
 use crate::api::backend::{GenerationBackend, StubBackend};
 use crate::api::downloads::{HfFetcher, ModelFetcher};
 use crate::discovery::mdns::{start_master_advert, MasterServiceInfo, NodeRegistry};
+use crate::imagegen::registry::ImageBackendRegistry;
+use crate::imagegen::{DEFAULT_GEMINI_IMAGES_URL, DEFAULT_OPENAI_IMAGES_URL};
 use crate::media::MediaStore;
 use crate::providers::ProviderRegistry;
 use crate::secrets::{KeyringSecretStore, SecretStore, UnconfiguredSecretStore};
@@ -102,6 +104,9 @@ pub struct AppState {
     /// Content-addressed image store shared by the upload route and cloud
     /// adapters. Never serialized into an API response.
     pub media: Arc<MediaStore>,
+    /// Cloud image backends. Rebuilt whenever the secret store is swapped so
+    /// generation calls cannot go out with stale credentials.
+    pub image_backends: Arc<ImageBackendRegistry>,
 }
 
 /// Master-host facts that cannot be discovered over mDNS.
@@ -138,6 +143,12 @@ impl AppState {
         let security = Arc::new(SecurityState::default());
         let secrets: Arc<dyn SecretStore> = Arc::new(UnconfiguredSecretStore);
         let providers = Arc::new(ProviderRegistry::new(secrets.clone()));
+        let image_backends = Arc::new(ImageBackendRegistry::new(
+            Arc::new(UnconfiguredSecretStore::default()),
+            DEFAULT_OPENAI_IMAGES_URL,
+            DEFAULT_GEMINI_IMAGES_URL,
+            false,
+        ));
         Self {
             cluster_id,
             registry,
@@ -159,6 +170,7 @@ impl AppState {
             providers,
             multimodal_enabled: false,
             media: Arc::new(MediaStore::new(default_media_root())),
+            image_backends,
         }
     }
 
@@ -220,12 +232,13 @@ impl AppState {
         self
     }
 
-    /// Installs a secret store and rebuilds the provider registry so status
-    /// queries always reflect the current credential source. The value itself
-    /// is never copied into app state.
+    /// Installs a secret store and rebuilds the provider and image backends
+    /// registries so credential lookups always use the current source. The
+    /// value itself is never copied into app state.
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
         self.providers =
             ProviderRegistry::new(secrets.clone()).with_media_store_shared(self.media.clone());
+        self.image_backends = Arc::new(ImageBackendRegistry::from_env(secrets.clone()));
         self.secrets = secrets;
         self
     }
@@ -234,6 +247,13 @@ impl AppState {
     /// base URL). The secret store is intentionally left untouched.
     pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
         self.providers = providers.with_media_store_shared(self.media.clone());
+        self
+    }
+
+    /// Installs a preconfigured image backend registry (tests inject mock
+    /// endpoints and the local flag). The secret store is left untouched.
+    pub fn with_image_backends(mut self, image_backends: Arc<ImageBackendRegistry>) -> Self {
+        self.image_backends = image_backends;
         self
     }
 
@@ -330,6 +350,8 @@ impl AppState {
             fallback,
             telemetry_cache.clone(),
         ));
+        // One keyring store backs both chat providers and image generation.
+        let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore);
         Self::new(
             cluster_id,
             registry,
@@ -341,7 +363,8 @@ impl AppState {
         .with_security(security)
         .with_telemetry_cache(telemetry_cache)
         .with_models_dir(models_dir)
-        .with_secrets(Arc::new(KeyringSecretStore))
+        .with_secrets(secrets.clone())
+        .with_image_backends(Arc::new(ImageBackendRegistry::from_env(secrets)))
         .with_onboarding(discover_onboarding())
     }
 }
