@@ -13,6 +13,7 @@ use std::sync::Arc;
 mod anthropic;
 mod gemini;
 mod kimi;
+pub mod messages;
 mod openai;
 pub(crate) mod openai_compat;
 
